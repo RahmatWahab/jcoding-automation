@@ -3,6 +3,9 @@ set -euo pipefail
 
 # Deterministic S001 evidence check. The Python checkout is read-only input;
 # this script never runs a workflow or invokes GitHub/Codex side effects.
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+JAVA_REPOSITORY=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+cd "$JAVA_REPOSITORY"
 REFERENCE=${PYTHON_REFERENCE:-/home/algo/codex-coding-automation}
 REVISION=c8eaaf2756df3e3dcaf946d995a1ed1db56e93bf
 TREE_HASH=bc438d564ecc01fd7d0ba5691aba4d3868843e4c
