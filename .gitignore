@@ -1,0 +1,12 @@
+.gradle/
+build/
+out/
+state/*
+!state/.gitkeep
+logs/*
+!logs/.gitkeep
+*.log
+.idea/
+*.iml
+.vscode/
+__pycache__/
