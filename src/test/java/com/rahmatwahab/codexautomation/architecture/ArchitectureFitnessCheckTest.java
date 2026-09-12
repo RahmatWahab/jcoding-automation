@@ -72,6 +72,42 @@ class ArchitectureFitnessCheckTest {
         ArchitectureFitnessCheck.main(new String[]{root.toString()});
     }
 
+    @Test
+    @DisplayName("Should reject direct filesystem access from domain packages")
+    void shouldRejectDirectFilesystemAccessFromDomainPackages(@TempDir Path root) throws Exception {
+        createRequiredPackageTree(root);
+        writeJava(root, "workflow/BadWorkflow.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+
+                import java.nio.file.Files;
+                import java.nio.file.Path;
+
+                final class BadWorkflow {
+                    String read(Path path) throws Exception { return Files.readString(path); }
+                }
+                """);
+
+        assertThatThrownBy(() -> ArchitectureFitnessCheck.main(new String[]{root.toString()}))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("direct filesystem access from domain package");
+    }
+
+    @Test
+    @DisplayName("Should ignore process APIs in comments and string literals")
+    void shouldIgnoreProcessApisInCommentsAndStringLiterals(@TempDir Path root) throws Exception {
+        createRequiredPackageTree(root);
+        writeJava(root, "workflow/DocumentedWorkflow.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+
+                /** ProcessBuilder and Runtime.getRuntime().exec are forbidden APIs. */
+                final class DocumentedWorkflow {
+                    String message = "ProcessBuilder Runtime.getRuntime().exec";
+                }
+                """);
+
+        ArchitectureFitnessCheck.main(new String[]{root.toString()});
+    }
+
     private static void createRequiredPackageTree(Path root) throws Exception {
         var base = root.resolve("src/main/java/com/rahmatwahab/codexautomation");
         for (var packageName : new String[]{

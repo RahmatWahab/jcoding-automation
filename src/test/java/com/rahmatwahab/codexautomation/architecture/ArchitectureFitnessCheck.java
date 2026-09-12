@@ -61,6 +61,7 @@ public final class ArchitectureFitnessCheck {
         verifyRequiredPackages(root);
         verifyNoPackageCycles(root);
         verifyDomainDoesNotDependOnInfrastructure(root);
+        verifyDomainDoesNotAccessFilesystem(root);
         verifyNoDirectProcessBuilderOutsideExecution(root);
         verifyNoSystemExitOutsideMain(root);
     }
@@ -79,11 +80,29 @@ public final class ArchitectureFitnessCheck {
     private static void verifyNoDirectProcessBuilderOutsideExecution(Path root) throws IOException {
         var offenders = javaFiles(root).stream()
                 .filter(path -> !path.toString().contains("/execution/"))
-                .filter(path -> contains(path, "ProcessBuilder") || contains(path, "Runtime.getRuntime().exec"))
+                .filter(path -> containsCode(path, "ProcessBuilder") || containsCode(path, "Runtime.getRuntime().exec"))
                 .toList();
         if (!offenders.isEmpty()) {
             throw new IllegalStateException("direct process execution outside execution package: " + offenders);
         }
+    }
+
+    private static void verifyDomainDoesNotAccessFilesystem(Path root) throws IOException {
+        var offenders = javaFiles(root).stream()
+                .filter(path -> isDomainPath(path))
+                .filter(path -> containsCode(path, "java.nio.file.")
+                        || containsCode(path, "java.io.File")
+                        || containsCode(path, "Files.")
+                        || containsCode(path, "Path.of(")
+                        || containsCode(path, "Paths.get("))
+                .toList();
+        if (!offenders.isEmpty()) {
+            throw new IllegalStateException("direct filesystem access from domain package: " + offenders);
+        }
+    }
+
+    private static boolean isDomainPath(Path path) {
+        return DOMAIN_PACKAGES.stream().anyMatch(packageName -> path.toString().contains("/" + packageName + "/"));
     }
 
     private static void verifyNoPackageCycles(Path root) throws IOException {
@@ -114,7 +133,7 @@ public final class ArchitectureFitnessCheck {
     private static void verifyNoSystemExitOutsideMain(Path root) throws IOException {
         var offenders = javaFiles(root).stream()
                 .filter(path -> !path.endsWith(Path.of("Main.java")))
-                .filter(path -> contains(path, "System.exit"))
+                .filter(path -> containsCode(path, "System.exit"))
                 .toList();
         if (!offenders.isEmpty()) {
             throw new IllegalStateException("System.exit outside Main: " + offenders);
@@ -201,11 +220,17 @@ public final class ArchitectureFitnessCheck {
         return relative.substring(0, relative.indexOf('/'));
     }
 
-    private static boolean contains(Path path, String value) {
+    private static boolean containsCode(Path path, String value) {
         try {
-            return Files.readString(path).contains(value);
+            return stripCommentsAndLiterals(Files.readString(path)).contains(value);
         } catch (IOException exception) {
             throw new IllegalStateException("cannot read " + path, exception);
         }
+    }
+
+    private static String stripCommentsAndLiterals(String source) {
+        return stripComments(source)
+                .replaceAll("(?s)\\\"(?:\\\\.|[^\\\"\\\\])*\\\"", "\\\"\\\"")
+                .replaceAll("'(?:\\\\.|[^'\\\\])'", "''");
     }
 }
