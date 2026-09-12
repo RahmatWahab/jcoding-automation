@@ -215,5 +215,5 @@ with tempfile.TemporaryDirectory() as directory:
 print("semantic replay evidence complete: job-control domain")
 PY
 
-python3 -m pytest -q "$snapshot/tests"
+PYTHONPATH="$snapshot/src" python3 -m pytest -q "$snapshot/tests"
 echo "S001 characterization evidence complete: $REVISION"

@@ -9,12 +9,17 @@ Two valid P1 findings exposed evidence-quality gaps:
 2. The baseline test command used the live Python checkout. Local edits could
    change the tests or imported source while the committed revision and tree
    hash still appeared correct.
+3. The semantic replay used the exported snapshot on `PYTHONPATH`, but the
+   final pytest process did not. If `codex_automation` was installed in the
+   validation environment, pytest could import mutable installed code while
+   running frozen tests.
 
 ## Root causes
 
 The original validation treated presence and metadata as evidence of behavior,
 and treated the checkout revision as equivalent to the files executed by the
-test command. Neither assumption is safe for a migration baseline.
+test command. It also assumed interpreter-local import settings carried across
+processes. Those assumptions are not safe for a migration baseline.
 
 ## Permanent controls
 
@@ -23,6 +28,8 @@ test command. Neither assumption is safe for a migration baseline.
 - The Python revision is exported from its immutable Git object into a
   temporary snapshot before tests run. Mutable operator files cannot affect
   baseline evidence.
+- Every Python process that imports the frozen automation source, including
+  pytest, is launched with the snapshot source path on `PYTHONPATH`.
 - Snapshot hashes, the revision/tree hash, fixture schemas, matrix coverage,
   and the complete frozen regression suite are checked on every run.
 - Any mismatch fails closed; it cannot be reported as successful evidence.
