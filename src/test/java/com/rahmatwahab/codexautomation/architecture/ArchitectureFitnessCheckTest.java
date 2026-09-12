@@ -108,6 +108,60 @@ class ArchitectureFitnessCheckTest {
         ArchitectureFitnessCheck.main(new String[]{root.toString()});
     }
 
+    @Test
+    @DisplayName("Should reject indirect runtime process execution")
+    void shouldRejectIndirectRuntimeProcessExecution(@TempDir Path root) throws Exception {
+        createRequiredPackageTree(root);
+        writeJava(root, "workflow/BadWorkflow.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+
+                final class BadWorkflow {
+                    void run(String command) {
+                        var runtime = Runtime.getRuntime();
+                        runtime.exec(command);
+                    }
+                }
+                """);
+
+        assertThatThrownBy(() -> ArchitectureFitnessCheck.main(new String[]{root.toString()}))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("direct process execution outside execution package");
+    }
+
+    @Test
+    @DisplayName("Should reject RandomAccessFile from domain packages")
+    void shouldRejectRandomAccessFileFromDomainPackages(@TempDir Path root) throws Exception {
+        createRequiredPackageTree(root);
+        writeJava(root, "workflow/BadWorkflow.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+
+                final class BadWorkflow {
+                    void open() throws Exception {
+                        new java.io.RandomAccessFile("state", "r");
+                    }
+                }
+                """);
+
+        assertThatThrownBy(() -> ArchitectureFitnessCheck.main(new String[]{root.toString()}))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("direct filesystem access from domain package");
+    }
+
+    @Test
+    @DisplayName("Should ignore package names in string literals")
+    void shouldIgnorePackageNamesInStringLiterals(@TempDir Path root) throws Exception {
+        createRequiredPackageTree(root);
+        writeJava(root, "workflow/DocumentedWorkflow.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+
+                final class DocumentedWorkflow {
+                    String diagnostic = "com.rahmatwahab.codexautomation.git.GitClient";
+                }
+                """);
+
+        ArchitectureFitnessCheck.main(new String[]{root.toString()});
+    }
+
     private static void createRequiredPackageTree(Path root) throws Exception {
         var base = root.resolve("src/main/java/com/rahmatwahab/codexautomation");
         for (var packageName : new String[]{

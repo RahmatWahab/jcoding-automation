@@ -80,7 +80,9 @@ public final class ArchitectureFitnessCheck {
     private static void verifyNoDirectProcessBuilderOutsideExecution(Path root) throws IOException {
         var offenders = javaFiles(root).stream()
                 .filter(path -> !path.toString().contains("/execution/"))
-                .filter(path -> containsCode(path, "ProcessBuilder") || containsCode(path, "Runtime.getRuntime().exec"))
+                .filter(path -> containsCode(path, "ProcessBuilder")
+                        || containsCode(path, "Runtime.getRuntime().exec")
+                        || containsCode(path, ".exec("))
                 .toList();
         if (!offenders.isEmpty()) {
             throw new IllegalStateException("direct process execution outside execution package: " + offenders);
@@ -92,6 +94,7 @@ public final class ArchitectureFitnessCheck {
                 .filter(path -> isDomainPath(path))
                 .filter(path -> containsCode(path, "java.nio.file.")
                         || containsCode(path, "java.io.File")
+                        || containsCode(path, "java.io.RandomAccessFile")
                         || containsCode(path, "Files.")
                         || containsCode(path, "Path.of(")
                         || containsCode(path, "Paths.get("))
@@ -152,7 +155,7 @@ public final class ArchitectureFitnessCheck {
         for (var path : javaFiles(root)) {
             var packageName = packageName(path);
             result.computeIfAbsent(packageName, ignored -> new HashSet<>());
-            var text = stripComments(Files.readString(path));
+            var text = stripCommentsAndLiterals(Files.readString(path));
             var normalized = text.replaceAll("\\s+", "");
             for (var candidate : REQUIRED_PACKAGES) {
                 if (!candidate.equals(packageName) && referencesPackage(normalized, candidate)) {
@@ -231,6 +234,7 @@ public final class ArchitectureFitnessCheck {
     private static String stripCommentsAndLiterals(String source) {
         return stripComments(source)
                 .replaceAll("(?s)\\\"(?:\\\\.|[^\\\"\\\\])*\\\"", "\\\"\\\"")
-                .replaceAll("'(?:\\\\.|[^'\\\\])'", "''");
+                .replaceAll("'(?:\\\\.|[^'\\\\])'", "''")
+                .replaceAll("\\s+", "");
     }
 }
