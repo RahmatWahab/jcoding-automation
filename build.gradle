@@ -97,10 +97,13 @@ tasks.register("dependencySecurityCheck") {
     group = "verification"
     description = "Fails on dynamic, changing, or unapproved dependency coordinates."
     doLast {
-        configurations.each { configuration ->
+    configurations.each { configuration ->
             if (configuration.canBeDeclared) {
                 configuration.dependencies.each { dependency ->
                     validateDependencyDeclaration(dependency, configuration.name)
+                }
+                configuration.dependencyConstraints.each { constraint ->
+                    validateDependencyDeclaration(constraint, "${configuration.name} constraints")
                 }
             }
         }
@@ -129,6 +132,15 @@ tasks.register("dependencySecuritySelfTest") {
                 if (!exception.message.contains(expected)) {
                     throw exception
                 }
+            }
+        }
+        def constraint = dependencies.constraints.create("org.slf4j:slf4j-api:latest.release")
+        try {
+            validateDependencyDeclaration(constraint, "selfTest constraint")
+            throw new GradleException("dependencySecurityCheck failed to reject a dynamic constraint")
+        } catch (GradleException exception) {
+            if (!exception.message.contains("Unsafe dependency version")) {
+                throw exception
             }
         }
     }

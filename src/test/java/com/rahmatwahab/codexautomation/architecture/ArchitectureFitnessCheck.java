@@ -79,7 +79,7 @@ public final class ArchitectureFitnessCheck {
 
     private static void verifyNoDirectProcessBuilderOutsideExecution(Path root) throws IOException {
         var offenders = javaFiles(root).stream()
-                .filter(path -> !path.toString().contains("/execution/"))
+                .filter(path -> !normalizedPath(path).contains("/execution/"))
                 .filter(path -> containsCode(path, "ProcessBuilder")
                         || containsCode(path, "Runtime.getRuntime().exec")
                         || containsCode(path, ".exec("))
@@ -105,7 +105,11 @@ public final class ArchitectureFitnessCheck {
     }
 
     private static boolean isDomainPath(Path path) {
-        return DOMAIN_PACKAGES.stream().anyMatch(packageName -> path.toString().contains("/" + packageName + "/"));
+        return DOMAIN_PACKAGES.stream().anyMatch(packageName -> normalizedPath(path).contains("/" + packageName + "/"));
+    }
+
+    private static String normalizedPath(Path path) {
+        return path.toString().replace('\\', '/');
     }
 
     private static void verifyNoPackageCycles(Path root) throws IOException {
@@ -232,9 +236,34 @@ public final class ArchitectureFitnessCheck {
     }
 
     private static String stripCommentsAndLiterals(String source) {
-        return stripComments(source)
-                .replaceAll("(?s)\\\"(?:\\\\.|[^\\\"\\\\])*\\\"", "\\\"\\\"")
-                .replaceAll("'(?:\\\\.|[^'\\\\])'", "''")
-                .replaceAll("\\s+", "");
+        var output = new StringBuilder(source.length());
+        var state = ScanState.CODE;
+        for (var index = 0; index < source.length(); index++) {
+            var current = source.charAt(index);
+            var next = index + 1 < source.length() ? source.charAt(index + 1) : '\0';
+            if (state == ScanState.CODE) {
+                if (current == '/' && next == '/') { state = ScanState.LINE_COMMENT; index++; output.append(' '); }
+                else if (current == '/' && next == '*') { state = ScanState.BLOCK_COMMENT; index++; output.append(' '); }
+                else if (current == '"') { state = ScanState.STRING; output.append("\"\""); }
+                else if (current == '\'') { state = ScanState.CHARACTER; output.append("''"); }
+                else { output.append(current); }
+            } else if (state == ScanState.LINE_COMMENT) {
+                if (current == '\n' || current == '\r') { state = ScanState.CODE; output.append(current); }
+            } else if (state == ScanState.BLOCK_COMMENT) {
+                if (current == '*' && next == '/') { state = ScanState.CODE; index++; }
+                else if (current == '\n' || current == '\r') { output.append(current); }
+            } else if (state == ScanState.STRING) {
+                if (current == '\\') { index++; }
+                else if (current == '"') { state = ScanState.CODE; }
+            } else {
+                if (current == '\\') { index++; }
+                else if (current == '\'') { state = ScanState.CODE; }
+            }
+        }
+        return output.toString().replaceAll("\\s+", "");
+    }
+
+    private enum ScanState {
+        CODE, LINE_COMMENT, BLOCK_COMMENT, STRING, CHARACTER
     }
 }
