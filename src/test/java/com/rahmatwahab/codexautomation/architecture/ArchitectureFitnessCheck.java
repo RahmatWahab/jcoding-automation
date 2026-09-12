@@ -79,10 +79,8 @@ public final class ArchitectureFitnessCheck {
 
     private static void verifyNoDirectProcessBuilderOutsideExecution(Path root) throws IOException {
         var offenders = javaFiles(root).stream()
-                .filter(path -> !normalizedPath(path).contains("/execution/"))
-                .filter(path -> containsCode(path, "ProcessBuilder")
-                        || containsCode(path, "Runtime.getRuntime().exec")
-                        || containsCode(path, ".exec("))
+                .filter(path -> !topLevelPackage(path).equals("execution"))
+                .filter(ArchitectureFitnessCheck::containsForbiddenProcessExecution)
                 .toList();
         if (!offenders.isEmpty()) {
             throw new IllegalStateException("direct process execution outside execution package: " + offenders);
@@ -97,7 +95,8 @@ public final class ArchitectureFitnessCheck {
                         || containsCode(path, "java.io.RandomAccessFile")
                         || containsCode(path, "Files.")
                         || containsCode(path, "Path.of(")
-                        || containsCode(path, "Paths.get("))
+                        || containsCode(path, "Paths.get(")
+                        || (containsCode(path, "importjava.io.*") && containsKnownJavaIoType(path)))
                 .toList();
         if (!offenders.isEmpty()) {
             throw new IllegalStateException("direct filesystem access from domain package: " + offenders);
@@ -105,11 +104,35 @@ public final class ArchitectureFitnessCheck {
     }
 
     private static boolean isDomainPath(Path path) {
-        return DOMAIN_PACKAGES.stream().anyMatch(packageName -> normalizedPath(path).contains("/" + packageName + "/"));
+        return DOMAIN_PACKAGES.stream().anyMatch(packageName -> topLevelPackage(path).equals(packageName));
     }
 
     private static String normalizedPath(Path path) {
         return path.toString().replace('\\', '/');
+    }
+
+    private static String topLevelPackage(Path path) {
+        var value = normalizedPath(path);
+        var marker = "/com/rahmatwahab/codexautomation/";
+        var remainder = value.substring(value.lastIndexOf(marker) + marker.length());
+        var separator = remainder.indexOf('/');
+        return separator < 0 ? "" : remainder.substring(0, separator);
+    }
+
+    private static boolean containsForbiddenProcessExecution(Path path) {
+        var source = code(path);
+        if (source.contains("ProcessBuilder") || source.contains("Runtime.getRuntime().exec(")) return true;
+        var matcher = java.util.regex.Pattern.compile("(?:var|Runtime|java.lang.Runtime)([A-Za-z_$][A-Za-z0-9_$]*)=(?:Runtime|java.lang.Runtime)\\.getRuntime\\(\\)").matcher(source);
+        while (matcher.find()) {
+            if (source.matches("(?s).*\\b" + java.util.regex.Pattern.quote(matcher.group(1)) + "\\.exec\\(.*")) return true;
+        }
+        return false;
+    }
+
+    private static boolean containsKnownJavaIoType(Path path) {
+        var source = code(path);
+        return Set.of("File", "FileInputStream", "FileOutputStream", "FileReader", "FileWriter", "RandomAccessFile", "BufferedReader", "BufferedWriter")
+                .stream().anyMatch(source::contains);
     }
 
     private static void verifyNoPackageCycles(Path root) throws IOException {
@@ -139,7 +162,7 @@ public final class ArchitectureFitnessCheck {
 
     private static void verifyNoSystemExitOutsideMain(Path root) throws IOException {
         var offenders = javaFiles(root).stream()
-                .filter(path -> !path.endsWith(Path.of("Main.java")))
+                .filter(path -> !normalizedPath(path).endsWith("/com/rahmatwahab/codexautomation/Main.java"))
                 .filter(path -> containsCode(path, "System.exit"))
                 .toList();
         if (!offenders.isEmpty()) {
@@ -228,8 +251,12 @@ public final class ArchitectureFitnessCheck {
     }
 
     private static boolean containsCode(Path path, String value) {
+        return code(path).contains(value);
+    }
+
+    private static String code(Path path) {
         try {
-            return stripCommentsAndLiterals(Files.readString(path)).contains(value);
+            return stripCommentsAndLiterals(Files.readString(path));
         } catch (IOException exception) {
             throw new IllegalStateException("cannot read " + path, exception);
         }

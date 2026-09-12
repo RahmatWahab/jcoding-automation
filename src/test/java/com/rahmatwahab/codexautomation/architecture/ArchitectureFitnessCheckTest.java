@@ -162,6 +162,47 @@ class ArchitectureFitnessCheckTest {
         ArchitectureFitnessCheck.main(new String[]{root.toString()});
     }
 
+    @Test
+    void shouldNotRejectUnrelatedExecAndShouldRejectWildcardFilesystem(@TempDir Path root) throws Exception {
+        createRequiredPackageTree(root);
+        writeJava(root, "workflow/Query.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+                final class Query { interface Q { void exec(); } Q q; void run() { q.exec(); } }
+                """);
+        ArchitectureFitnessCheck.main(new String[]{root.toString()});
+        writeJava(root, "workflow/Bad.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+                import java.io.*;
+                final class Bad { void open() throws Exception { new FileInputStream("state"); } }
+                """);
+        assertThatThrownBy(() -> ArchitectureFitnessCheck.main(new String[]{root.toString()}))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("direct filesystem access from domain package");
+    }
+
+    @Test
+    void shouldUseTopLevelExecutionAndExactMainBoundaries(@TempDir Path root) throws Exception {
+        createRequiredPackageTree(root);
+        writeJava(root, "workflow/execution/Bad.java", """
+                package com.rahmatwahab.codexautomation.workflow.execution;
+                final class Bad { void run() { new ProcessBuilder("sh"); } }
+                """);
+        assertThatThrownBy(() -> ArchitectureFitnessCheck.main(new String[]{root.toString()}))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("direct process execution outside execution package");
+        writeJava(root, "workflow/execution/Bad.java", """
+                package com.rahmatwahab.codexautomation.workflow.execution;
+                final class Bad { }
+                """);
+        writeJava(root, "workflow/Main.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+                final class Main { void stop() { System.exit(1); } }
+                """);
+        assertThatThrownBy(() -> ArchitectureFitnessCheck.main(new String[]{root.toString()}))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("System.exit outside Main");
+    }
+
     private static void createRequiredPackageTree(Path root) throws Exception {
         var base = root.resolve("src/main/java/com/rahmatwahab/codexautomation");
         for (var packageName : new String[]{
