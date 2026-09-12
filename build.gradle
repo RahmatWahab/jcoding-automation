@@ -1,6 +1,7 @@
 plugins {
     id "java"
     id "application"
+    id "jacoco"
 }
 
 group = "com.rahmatwahab"
@@ -16,8 +17,8 @@ application {
     mainClass = "com.rahmatwahab.codexautomation.Main"
 }
 
-repositories {
-    mavenCentral()
+dependencyLocking {
+    lockAllConfigurations()
 }
 
 dependencies {
@@ -29,8 +30,93 @@ dependencies {
     testImplementation platform("org.junit:junit-bom:5.11.4")
     testImplementation "org.junit.jupiter:junit-jupiter"
     testImplementation "org.assertj:assertj-core:3.26.3"
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher"
 }
 
 tasks.named("test") {
     useJUnitPlatform()
+    finalizedBy tasks.named("jacocoTestReport")
+}
+
+tasks.named("jar") {
+    manifest {
+        attributes(
+                "Implementation-Title": "jcoding-automation",
+                "Implementation-Version": project.version
+        )
+    }
+}
+
+tasks.register("dependencyGovernance") {
+    group = "verification"
+    description = "Verifies S002 dependency governance inputs are present."
+    doLast {
+        def wrapper = file("gradle/wrapper/gradle-wrapper.properties").text
+        if (!wrapper.contains("distributionSha256Sum=")) {
+            throw new GradleException("Gradle wrapper distribution checksum is required")
+        }
+        def lockfile = file("gradle.lockfile")
+        if (!lockfile.isFile()) {
+            throw new GradleException("gradle.lockfile is required; run ./gradlew dependencies --write-locks")
+        }
+    }
+}
+
+tasks.register("dependencySecurityCheck") {
+    group = "verification"
+    description = "Fails on dynamic, changing, or unapproved dependency coordinates."
+    doLast {
+        def approved = [
+                "ch.qos.logback:logback-classic",
+                "com.fasterxml.jackson.core:jackson-databind",
+                "org.assertj:assertj-core",
+                "org.jacoco:org.jacoco.agent",
+                "org.jacoco:org.jacoco.ant",
+                "org.junit:junit-bom",
+                "org.junit.jupiter:junit-jupiter",
+                "org.junit.platform:junit-platform-launcher",
+                "org.slf4j:slf4j-api",
+                "org.xerial:sqlite-jdbc"
+        ] as Set
+        configurations.each { configuration ->
+            if (configuration.canBeDeclared) {
+                configuration.dependencies.each { dependency ->
+                    if (!dependency.group || !dependency.name) {
+                        throw new GradleException("Dependency in ${configuration.name} must declare group and name: ${dependency}")
+                    }
+                    def coordinate = "${dependency.group}:${dependency.name}".toString()
+                    if (!approved.contains(coordinate)) {
+                        throw new GradleException("Unapproved dependency coordinate: ${coordinate}")
+                    }
+                    def version = dependency.version
+                    if (version && (version.contains("+") || version.equalsIgnoreCase("latest.release")
+                            || version.equalsIgnoreCase("latest.integration") || version.endsWith("-SNAPSHOT"))) {
+                        throw new GradleException("Unsafe dependency version for ${coordinate}: ${version}")
+                    }
+                }
+            }
+        }
+    }
+}
+
+tasks.register("architectureFitness", JavaExec) {
+    group = "verification"
+    description = "Runs lightweight architecture boundary checks from the source tree."
+    dependsOn tasks.named("testClasses")
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = "com.rahmatwahab.codexautomation.architecture.ArchitectureFitnessCheck"
+    args project.layout.projectDirectory.asFile.absolutePath
+}
+
+tasks.named("check") {
+    dependsOn tasks.named("dependencyGovernance")
+    dependsOn tasks.named("dependencySecurityCheck")
+    dependsOn tasks.named("architectureFitness")
+}
+
+tasks.named("jacocoTestReport") {
+    reports {
+        xml.required = true
+        html.required = true
+    }
 }
