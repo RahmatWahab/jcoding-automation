@@ -96,7 +96,7 @@ public final class ArchitectureFitnessCheck {
                         || containsCode(path, "Files.")
                         || containsCode(path, "Path.of(")
                         || containsCode(path, "Paths.get(")
-                        || (containsCode(path, "importjava.io.*") && containsKnownJavaIoType(path)))
+                        || containsKnownJavaIoType(path))
                 .toList();
         if (!offenders.isEmpty()) {
             throw new IllegalStateException("direct filesystem access from domain package: " + offenders);
@@ -132,7 +132,9 @@ public final class ArchitectureFitnessCheck {
     private static boolean containsKnownJavaIoType(Path path) {
         var source = code(path);
         return Set.of("File", "FileInputStream", "FileOutputStream", "FileReader", "FileWriter", "RandomAccessFile", "BufferedReader", "BufferedWriter")
-                .stream().anyMatch(source::contains);
+                .stream().anyMatch(type -> source.contains("new" + type + "(")
+                        || source.contains("." + type + "(")
+                        || source.contains("importjava.io." + type + ";"));
     }
 
     private static boolean containsFilesystemFileType(Path path) {

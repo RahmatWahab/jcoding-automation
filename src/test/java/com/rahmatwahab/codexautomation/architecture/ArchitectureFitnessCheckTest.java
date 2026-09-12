@@ -214,6 +214,19 @@ class ArchitectureFitnessCheckTest {
         ArchitectureFitnessCheck.main(new String[]{root.toString()});
     }
 
+    @Test
+    void shouldRejectExplicitlyImportedFilesystemStream(@TempDir Path root) throws Exception {
+        createRequiredPackageTree(root);
+        writeJava(root, "workflow/Stream.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+                import java.io.FileInputStream;
+                final class Stream { void open() throws Exception { new FileInputStream("state"); } }
+                """);
+        assertThatThrownBy(() -> ArchitectureFitnessCheck.main(new String[]{root.toString()}))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("direct filesystem access from domain package");
+    }
+
     private static void createRequiredPackageTree(Path root) throws Exception {
         var base = root.resolve("src/main/java/com/rahmatwahab/codexautomation");
         for (var packageName : new String[]{
