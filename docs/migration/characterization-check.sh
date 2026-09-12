@@ -144,7 +144,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 root = Path(sys.argv[1])
-from codex_automation.controller import acquire_lock, release_lock
+from codex_automation.controller import acquire_lock, read_job_control, release_lock
 from codex_automation.engine import apply_codex_result, classify_pr, reconcile, select_story
 
 def load(name):
@@ -185,7 +185,7 @@ with tempfile.TemporaryDirectory() as directory:
             path.mkdir()
             (path / "owner.json").write_text("not-json")
         acquired = acquire_lock(path, 900, watchdog_observations=3, watchdog_grace_seconds=0)
-        actual = "ACQUIRE" if case["lock"] == "absent" else ("SKIP" if acquired is None else "RECONCILE_STALE")
+        actual = "SKIP" if acquired is None else ("ACQUIRE" if case["lock"] == "absent" else "RECONCILE_STALE")
         if actual != case["expected"]:
             raise SystemExit(f"locks replay mismatch: {case}")
         if acquired is not None:
@@ -196,6 +196,23 @@ for case in load("workflow-gates")["cases"]:
     if actual != case["expected"]:
         raise SystemExit(f"workflow-gates replay mismatch: {case}")
 print("semantic replay evidence complete: locks/workflow-gates domains")
+
+with tempfile.TemporaryDirectory() as directory:
+    for index, case in enumerate(load("job-control")["cases"]):
+        path = Path(directory) / f"job-control-{index}.toml"
+        if "job_start" in case:
+            value = case["job_start"]
+            if isinstance(value, bool):
+                literal = "true" if value else "false"
+            elif isinstance(value, str):
+                literal = json.dumps(value)
+            else:
+                literal = json.dumps(value)
+            path.write_text(f"job_start = {literal}\n")
+        actual = "RUN" if read_job_control(path) else "SKIP"
+        if actual != case["expected"]:
+            raise SystemExit(f"job-control replay mismatch: {case}")
+print("semantic replay evidence complete: job-control domain")
 PY
 
 python3 -m pytest -q "$snapshot/tests"
