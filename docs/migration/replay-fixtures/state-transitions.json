@@ -1,0 +1,9 @@
+{
+  "fixture": "state-transitions",
+  "cases": [
+    {"pr": null, "feedback": false, "expected": ["IMPLEMENTING", "RUN_CODEX"]},
+    {"pr": {"merged": true}, "feedback": false, "expected": ["MERGED", "ADVANCE_STORY"]},
+    {"pr": {"ci": "PENDING"}, "feedback": false, "expected": ["WAITING_FOR_CI", "WAIT"]},
+    {"pr": {"open": true}, "feedback": true, "expected": ["FIXING_FEEDBACK", "RUN_FEEDBACK"]}
+  ]
+}

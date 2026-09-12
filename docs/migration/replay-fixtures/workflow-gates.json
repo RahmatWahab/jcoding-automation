@@ -1,0 +1,9 @@
+{
+  "fixture": "workflow-gates",
+  "cases": [
+    {"pr": "open", "merged": false, "expected": "DO_NOT_ADVANCE"},
+    {"pr": "waiting_manual_merge", "merged": false, "expected": "DO_NOT_ADVANCE"},
+    {"pr": "merged", "merged": true, "expected": "ADVANCE"},
+    {"pr": "unknown", "merged": null, "expected": "BLOCK"}
+  ]
+}

@@ -10,11 +10,12 @@ This baseline is the behavioral reference for the Java migration.
 | Revision subject | `fix: recover stale story selection blockers` |
 | Captured | 2026-09-12 (Europe/Berlin) |
 | Java target baseline | `b58bf1f2d2bdc9593927542e234c13fc71aeff16` |
-| Python status | clean worktree, `main` tracking `origin/main` |
+| Python status | immutable committed baseline; live runtime overrides are excluded |
 | Runtime contract | Python project metadata in `pyproject.toml`; TOML configuration; SQLite state |
 
-The revision, configuration snapshot, prompts, scripts, source modules, and
-tests listed in `parity-matrix.csv` are the characterization scope. Java
+The revision, configuration/prompt snapshot manifest, environment snapshot,
+behavior inventory, scripts, source modules, and tests listed in
+`parity-matrix.csv` are the characterization scope. Java
 implementation status is intentionally `PENDING` until the owning story adds
 the compatible implementation and evidence. No Python behavior is changed by
 this baseline.

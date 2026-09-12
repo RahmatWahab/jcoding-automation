@@ -1,0 +1,9 @@
+{
+  "fixture": "github-review-ci",
+  "cases": [
+    {"merged": true, "ci": "SUCCESS", "threads": [], "decision": "APPROVED", "expected": "MERGED"},
+    {"merged": false, "ci": "PENDING", "threads": [], "decision": null, "expected": "WAITING_FOR_CI"},
+    {"merged": false, "ci": "SUCCESS", "threads": [{"resolved": false}], "decision": null, "expected": "CHANGES_REQUESTED"},
+    {"merged": false, "ci": "SUCCESS", "threads": [], "decision": "APPROVED", "expected": "READY_TO_MERGE"}
+  ]
+}

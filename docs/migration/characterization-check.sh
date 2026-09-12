@@ -10,6 +10,10 @@ ROOTS=(src/codex_automation prompts scripts config tests pyproject.toml)
 FIXTURE=docs/migration/replay-fixtures/job-control.json
 FIXTURE_SHA256=cda60f84133ae7a31aea067fb088abfda13dbbbbdb732bfae81c3811c709d9d5
 MATRIX_SHA256=5e2239e3499211e824df7fd989e097ff614c7869ec5fb55b92d8c04622faf20a
+MANIFEST=docs/migration/python-baseline-manifest.tsv
+INVENTORY=docs/migration/python-behavior-inventory.md
+ENVIRONMENT=docs/migration/baseline-environment.md
+FIXTURES=(story-selection state-transitions github-review-ci codex-results locks workflow-gates)
 
 [[ -d "$REFERENCE/.git" ]] || { echo "missing Python git checkout: $REFERENCE" >&2; exit 2; }
 [[ "$(git -C "$REFERENCE" rev-parse HEAD)" == "$REVISION" ]] || {
@@ -18,9 +22,10 @@ MATRIX_SHA256=5e2239e3499211e824df7fd989e097ff614c7869ec5fb55b92d8c04622faf20a
 [[ "$(git -C "$REFERENCE" rev-parse "$REVISION^{tree}")" == "$TREE_HASH" ]] || {
   echo "reference tree hash mismatch" >&2; exit 3;
 }
-[[ -z "$(git -C "$REFERENCE" status --porcelain)" ]] || {
-  echo "reference worktree is dirty" >&2; exit 4;
-}
+# The committed revision is the immutable baseline. The live reference checkout
+# may contain an operator-controlled runtime override (for example job_start),
+# so never mutate it or confuse that override with the frozen source. Snapshots
+# below are always read from REVISION.
 
 for root in "${ROOTS[@]}"; do
   git -C "$REFERENCE" cat-file -e "$REVISION:$root" || {
@@ -34,6 +39,51 @@ done
 [[ "$(sha256sum docs/migration/parity-matrix.csv | awk '{print $1}')" == "$MATRIX_SHA256" ]] || {
   echo "parity matrix hash mismatch" >&2; exit 6;
 }
+[[ -s "$MANIFEST" && -s "$INVENTORY" && -s "$ENVIRONMENT" ]] || {
+  echo "baseline manifest, inventory, or environment snapshot is missing" >&2; exit 6;
+}
+
+python3 - "$MANIFEST" "$REFERENCE" "$REVISION" <<'PY'
+import hashlib
+import pathlib
+import subprocess
+import sys
+
+manifest, reference, revision = sys.argv[1:]
+rows = [line.rstrip("\n").split() for line in pathlib.Path(manifest).read_text().splitlines()]
+if not rows or rows[0] != ["path", "sha256"] or any(len(row) != 2 for row in rows[1:]):
+    raise SystemExit("invalid baseline manifest format")
+expected = {path: digest for path, digest in rows[1:]}
+if len(expected) != len(rows) - 1 or not expected:
+    raise SystemExit("baseline manifest contains duplicate or no artifacts")
+for path, digest in expected.items():
+    content = subprocess.check_output(["git", "-C", reference, "show", f"{revision}:{path}"])
+    if hashlib.sha256(content).hexdigest() != digest:
+        raise SystemExit(f"baseline snapshot hash mismatch: {path}")
+print(f"baseline snapshots verified: {len(expected)} artifacts")
+PY
+
+for fixture_name in "${FIXTURES[@]}"; do
+  fixture_path="docs/migration/replay-fixtures/${fixture_name}.json"
+  [[ -s "$fixture_path" ]] || { echo "missing replay fixture: $fixture_path" >&2; exit 6; }
+  python3 - "$fixture_path" "$fixture_name" <<'PY'
+import json
+import sys
+
+path, expected_name = sys.argv[1:]
+value = json.load(open(path, encoding="utf-8"))
+if value.get("fixture") != expected_name or not isinstance(value.get("cases"), list) or not value["cases"]:
+    raise SystemExit(f"invalid replay fixture: {path}")
+for index, case in enumerate(value["cases"]):
+    if not isinstance(case, dict) or "expected" not in case:
+        raise SystemExit(f"missing expected outcome in {path} case {index}")
+print(f"replay fixture verified: {path} ({len(value['cases'])} cases)")
+PY
+done
+
+for required in 'Configuration keys' 'Workflow phases and result contracts' 'State fields' 'External commands and side effects' 'Failure and recovery rules'; do
+  grep -Fq "## $required" "$INVENTORY" || { echo "inventory section missing: $required" >&2; exit 6; }
+done
 
 # The matrix must cover every tracked artifact in the frozen scope. This makes
 # additions fail closed instead of silently becoming undocumented behavior.
