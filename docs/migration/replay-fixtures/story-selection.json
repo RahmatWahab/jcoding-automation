@@ -1,9 +1,9 @@
 {
   "fixture": "story-selection",
   "cases": [
-    {"stories": [{"number": 2, "state": "OPEN", "dependencies": [], "labels": []}], "completed": [], "expected": 2},
-    {"stories": [{"number": 2, "state": "OPEN", "dependencies": [3], "labels": []}, {"number": 3, "state": "OPEN", "dependencies": [], "labels": []}], "completed": [], "expected": 3},
-    {"stories": [{"number": 2, "state": "OPEN", "dependencies": [], "labels": ["blocked"]}], "completed": [], "expected": null},
-    {"stories": [{"number": 2, "state": "CLOSED", "dependencies": [], "labels": []}], "completed": [], "expected": null}
+    {"stories": [{"number": 2, "state": "OPEN", "body": "", "labels": []}], "completed": [], "expected": 2},
+    {"stories": [{"number": 2, "state": "OPEN", "body": "Depends on #3", "labels": []}, {"number": 3, "state": "OPEN", "body": "", "labels": []}], "completed": [], "expected": 3},
+    {"stories": [{"number": 2, "state": "OPEN", "body": "", "labels": [{"name": "blocked"}]}], "completed": [], "expected": null},
+    {"stories": [{"number": 2, "state": "CLOSED", "body": "", "labels": []}], "completed": [], "expected": null}
   ]
 }

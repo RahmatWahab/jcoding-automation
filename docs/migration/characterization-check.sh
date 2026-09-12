@@ -126,5 +126,61 @@ if not any(case.get("job_start") is not True and case.get("expected") == "SKIP" 
 print(f"job-control replay evidence complete: {len(cases)} cases")
 PY
 
-python3 -m pytest -q "$REFERENCE/tests"
+snapshot=$(mktemp -d)
+trap 'rm -f "$expected" "$actual"; rm -rf "$snapshot"' EXIT
+git -C "$REFERENCE" archive "$REVISION" | tar -x -C "$snapshot"
+
+# Replay the fixtures against the pinned source export, never against the live
+# reference worktree. The expected values are therefore checked semantically,
+# not merely accepted as well-formed JSON.
+PYTHONPATH="$snapshot/src" python3 - "$JAVA_REPOSITORY" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+from codex_automation.engine import classify_pr, next_action, reconcile, select_story, apply_codex_result
+
+def load(name):
+    return json.loads((root / "docs/migration/replay-fixtures" / f"{name}.json").read_text())
+
+for case in load("story-selection")["cases"]:
+    actual = select_story(case["stories"], set(case["completed"]))
+    actual = actual["number"] if actual else None
+    if actual != case["expected"]:
+        raise SystemExit(f"story-selection replay mismatch: {case}")
+for case in load("state-transitions")["cases"]:
+    actual = list(reconcile({}, case["pr"], case["feedback"]))
+    if actual != case["expected"]:
+        raise SystemExit(f"state-transitions replay mismatch: {case}")
+for case in load("github-review-ci")["cases"]:
+    if classify_pr(case) != case["expected"]:
+        raise SystemExit(f"github-review-ci replay mismatch: {case}")
+for case in load("codex-results")["cases"]:
+    actual = apply_codex_result({}, case["exit_code"], case["output"], retry_seconds=1)["phase"]
+    if actual != case["expected"]:
+        raise SystemExit(f"codex-results replay mismatch: {case}")
+print("semantic replay evidence complete: story/state/GitHub/Codex domains")
+PY
+
+python3 - "$JAVA_REPOSITORY/docs/migration/replay-fixtures/locks.json" "$JAVA_REPOSITORY/docs/migration/replay-fixtures/workflow-gates.json" <<'PY'
+import json
+import sys
+
+locks, gates = (json.load(open(path, encoding="utf-8")) for path in sys.argv[1:])
+for case in locks["cases"]:
+    actual = ("ACQUIRE" if case["lock"] == "absent" else
+              "SKIP" if case["lock"] == "owned" and case["heartbeat_age_seconds"] < 900 else
+              "RECONCILE_STALE" if case["lock"] == "owned" else "BLOCK")
+    if actual != case["expected"]:
+        raise SystemExit(f"locks replay mismatch: {case}")
+for case in gates["cases"]:
+    actual = ("ADVANCE" if case["merged"] is True else
+              "BLOCK" if case["merged"] is None else "DO_NOT_ADVANCE")
+    if actual != case["expected"]:
+        raise SystemExit(f"workflow-gates replay mismatch: {case}")
+print("semantic replay evidence complete: locks/workflow-gates domains")
+PY
+
+python3 -m pytest -q "$snapshot/tests"
 echo "S001 characterization evidence complete: $REVISION"
