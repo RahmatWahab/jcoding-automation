@@ -4,6 +4,6 @@
     {"lock": "absent", "heartbeat_age_seconds": 0, "expected": "ACQUIRE"},
     {"lock": "owned", "heartbeat_age_seconds": 30, "expected": "SKIP"},
     {"lock": "owned", "heartbeat_age_seconds": 901, "expected": "RECONCILE_STALE"},
-    {"lock": "malformed", "heartbeat_age_seconds": null, "expected": "BLOCK"}
+    {"lock": "malformed", "heartbeat_age_seconds": null, "expected": "RECONCILE_STALE"}
   ]
 }

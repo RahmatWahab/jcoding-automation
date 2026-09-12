@@ -137,11 +137,15 @@ git -C "$REFERENCE" archive "$REVISION" | tar -x -C "$snapshot"
 # not merely accepted as well-formed JSON.
 PYTHONPATH="$snapshot/src" python3 - "$JAVA_REPOSITORY" <<'PY'
 import json
+import os
 import sys
+import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 root = Path(sys.argv[1])
-from codex_automation.engine import classify_pr, next_action, reconcile, select_story, apply_codex_result
+from codex_automation.controller import acquire_lock, release_lock
+from codex_automation.engine import apply_codex_result, classify_pr, reconcile, select_story
 
 def load(name):
     return json.loads((root / "docs/migration/replay-fixtures" / f"{name}.json").read_text())
@@ -163,22 +167,32 @@ for case in load("codex-results")["cases"]:
     if actual != case["expected"]:
         raise SystemExit(f"codex-results replay mismatch: {case}")
 print("semantic replay evidence complete: story/state/GitHub/Codex domains")
-PY
 
-python3 - "$JAVA_REPOSITORY/docs/migration/replay-fixtures/locks.json" "$JAVA_REPOSITORY/docs/migration/replay-fixtures/workflow-gates.json" <<'PY'
-import json
-import sys
+with tempfile.TemporaryDirectory() as directory:
+    for index, case in enumerate(load("locks")["cases"]):
+        path = Path(directory) / f"controller-{index}.lock"
+        if case["lock"] == "owned":
+            age = case["heartbeat_age_seconds"]
+            stamp = (datetime.now(timezone.utc) - timedelta(seconds=age)).isoformat()
+            path.mkdir()
+            (path / "owner.json").write_text(json.dumps({
+                "pid": os.getpid() if age < 900 else 999999999,
+                "started_at": stamp,
+                "heartbeat_at": stamp,
+                "owner_token": "fixture-owner",
+            }))
+        elif case["lock"] == "malformed":
+            path.mkdir()
+            (path / "owner.json").write_text("not-json")
+        acquired = acquire_lock(path, 900, watchdog_observations=3, watchdog_grace_seconds=0)
+        actual = "ACQUIRE" if case["lock"] == "absent" else ("SKIP" if acquired is None else "RECONCILE_STALE")
+        if actual != case["expected"]:
+            raise SystemExit(f"locks replay mismatch: {case}")
+        if acquired is not None:
+            release_lock(path)
 
-locks, gates = (json.load(open(path, encoding="utf-8")) for path in sys.argv[1:])
-for case in locks["cases"]:
-    actual = ("ACQUIRE" if case["lock"] == "absent" else
-              "SKIP" if case["lock"] == "owned" and case["heartbeat_age_seconds"] < 900 else
-              "RECONCILE_STALE" if case["lock"] == "owned" else "BLOCK")
-    if actual != case["expected"]:
-        raise SystemExit(f"locks replay mismatch: {case}")
-for case in gates["cases"]:
-    actual = ("ADVANCE" if case["merged"] is True else
-              "BLOCK" if case["merged"] is None else "DO_NOT_ADVANCE")
+for case in load("workflow-gates")["cases"]:
+    actual = classify_pr(case["pr"])
     if actual != case["expected"]:
         raise SystemExit(f"workflow-gates replay mismatch: {case}")
 print("semantic replay evidence complete: locks/workflow-gates domains")

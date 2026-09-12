@@ -1,9 +1,9 @@
 {
   "fixture": "workflow-gates",
   "cases": [
-    {"pr": "open", "merged": false, "expected": "DO_NOT_ADVANCE"},
-    {"pr": "waiting_manual_merge", "merged": false, "expected": "DO_NOT_ADVANCE"},
-    {"pr": "merged", "merged": true, "expected": "ADVANCE"},
-    {"pr": "unknown", "merged": null, "expected": "BLOCK"}
+    {"pr": {"state": "OPEN", "headRefOid": "h", "statusCheckRollup": [], "reviewThreads": [], "reviewDecision": null}, "expected": "WAITING_FOR_CODEX_REVIEW"},
+    {"pr": {"state": "OPEN", "headRefOid": "h", "statusCheckRollup": [{"status": "PENDING"}], "reviewThreads": [], "reviewDecision": null}, "expected": "WAITING_FOR_CI"},
+    {"pr": {"mergedAt": "2026-01-01T00:00:00Z", "headRefOid": "h", "statusCheckRollup": [], "reviewThreads": [], "reviewDecision": "APPROVED"}, "expected": "MERGED"},
+    {"pr": {"state": "CLOSED", "headRefOid": "h", "statusCheckRollup": [], "reviewThreads": [], "reviewDecision": null}, "expected": "BLOCKED_EXTERNAL"}
   ]
 }
