@@ -18,7 +18,9 @@ INVENTORY=docs/migration/python-behavior-inventory.md
 ENVIRONMENT=docs/migration/baseline-environment.md
 FIXTURES=(story-selection state-transitions github-review-ci codex-results locks workflow-gates)
 
-[[ -d "$REFERENCE/.git" ]] || { echo "missing Python git checkout: $REFERENCE" >&2; exit 2; }
+git -C "$REFERENCE" rev-parse --git-dir >/dev/null 2>&1 || {
+  echo "missing Python git checkout: $REFERENCE" >&2; exit 2;
+}
 [[ "$(git -C "$REFERENCE" rev-parse HEAD)" == "$REVISION" ]] || {
   echo "reference revision mismatch" >&2; exit 3;
 }
