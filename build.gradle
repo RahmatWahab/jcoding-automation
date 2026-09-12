@@ -55,8 +55,8 @@ ext.validateDependencyDeclaration = { dependency, configurationName ->
         throw new GradleException("Unapproved dependency coordinate: ${coordinate}")
     }
     def version = dependency.version
-    if (version && (version.contains("+") || version.equalsIgnoreCase("latest.release")
-            || version.equalsIgnoreCase("latest.integration") || version.endsWith("-SNAPSHOT"))) {
+    if (version && (version.contains("+") || version ==~ /.*[\[\]()].*/
+            || version ==~ /(?i)latest(?:\..+)?/ || version.endsWith("-SNAPSHOT"))) {
         throw new GradleException("Unsafe dependency version for ${coordinate}: ${version}")
     }
     if (dependency instanceof org.gradle.api.artifacts.ExternalModuleDependency && dependency.changing) {
@@ -111,15 +111,24 @@ tasks.register("dependencySecuritySelfTest") {
     group = "verification"
     description = "Verifies dependency security rejects changing dependencies."
     doLast {
-        def changingDependency = dependencies.create("org.slf4j:slf4j-api:2.0.16") {
-            changing = true
-        }
-        try {
-            validateDependencyDeclaration(changingDependency, "selfTest")
-            throw new GradleException("dependencySecurityCheck failed to reject a changing dependency")
-        } catch (GradleException exception) {
-            if (!exception.message.contains("Changing dependency is not allowed")) {
-                throw exception
+        [
+                ["org.slf4j:slf4j-api:2.0.16", "changing"],
+                ["org.slf4j:slf4j-api:[2.0,2.1)", "range"],
+                ["org.slf4j:slf4j-api:latest.milestone", "latest selector"]
+        ].each { declaration, label ->
+            def candidate = dependencies.create(declaration) {
+                if (label == "changing") {
+                    changing = true
+                }
+            }
+            try {
+                validateDependencyDeclaration(candidate, "selfTest")
+                throw new GradleException("dependencySecurityCheck failed to reject a ${label} dependency")
+            } catch (GradleException exception) {
+                def expected = label == "changing" ? "Changing dependency is not allowed" : "Unsafe dependency version"
+                if (!exception.message.contains(expected)) {
+                    throw exception
+                }
             }
         }
     }

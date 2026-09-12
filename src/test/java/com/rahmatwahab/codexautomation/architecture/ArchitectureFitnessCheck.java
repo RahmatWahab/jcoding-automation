@@ -133,7 +133,7 @@ public final class ArchitectureFitnessCheck {
         for (var path : javaFiles(root)) {
             var packageName = packageName(path);
             result.computeIfAbsent(packageName, ignored -> new HashSet<>());
-            var text = Files.readString(path);
+            var text = stripComments(Files.readString(path));
             var normalized = text.replaceAll("\\s+", "");
             for (var candidate : REQUIRED_PACKAGES) {
                 if (!candidate.equals(packageName) && referencesPackage(normalized, candidate)) {
@@ -149,6 +149,12 @@ public final class ArchitectureFitnessCheck {
         return normalizedSource.contains("import" + prefix)
                 || normalizedSource.contains("importstatic" + prefix)
                 || normalizedSource.contains(prefix);
+    }
+
+    private static String stripComments(String source) {
+        return source
+                .replaceAll("(?s)/\\*.*?\\*/", "")
+                .replaceAll("(?m)//.*$", "");
     }
 
     private static List<String> findCycle(String start, Map<String, Set<String>> graph) {

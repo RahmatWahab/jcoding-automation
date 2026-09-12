@@ -56,6 +56,22 @@ class ArchitectureFitnessCheckTest {
                 .hasMessageContaining("package cycle detected");
     }
 
+    @Test
+    @DisplayName("Should ignore fully qualified names in comments")
+    void shouldIgnoreFullyQualifiedNamesInComments(@TempDir Path root) throws Exception {
+        createRequiredPackageTree(root);
+        writeJava(root, "workflow/DocumentedWorkflow.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+
+                /** Do not depend on com.rahmatwahab.codexautomation.git.GitClient here. */
+                final class DocumentedWorkflow {
+                    // com.rahmatwahab.codexautomation.github.GitHubClient is infrastructure.
+                }
+                """);
+
+        ArchitectureFitnessCheck.main(new String[]{root.toString()});
+    }
+
     private static void createRequiredPackageTree(Path root) throws Exception {
         var base = root.resolve("src/main/java/com/rahmatwahab/codexautomation");
         for (var packageName : new String[]{
