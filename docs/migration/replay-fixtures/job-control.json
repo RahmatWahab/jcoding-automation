@@ -1,0 +1,11 @@
+{
+  "fixture": "job-control-gate",
+  "reference_revision": "c8eaaf2756df3e3dcaf946d995a1ed1db56e93bf",
+  "cases": [
+    {"job_start": true, "expected": "RUN"},
+    {"job_start": false, "expected": "SKIP"},
+    {"job_start": "true", "expected": "SKIP"},
+    {"job_start": null, "expected": "SKIP"},
+    {"expected": "SKIP"}
+  ]
+}

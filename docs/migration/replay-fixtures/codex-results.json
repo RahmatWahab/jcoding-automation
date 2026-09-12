@@ -1,0 +1,9 @@
+{
+  "fixture": "codex-results",
+  "cases": [
+    {"exit_code": 0, "output": "RESULT_STATUS: SUCCESS\nRESULT_NEXT_PHASE: VERIFYING\nRESULT_BLOCKER: NONE\nRESULT_EVIDENCE: COMPLETE", "expected": "VERIFYING"},
+    {"exit_code": 1, "output": "weekly usage limit reached", "expected": "PAUSED_QUOTA"},
+    {"exit_code": 124, "output": "", "expected": "FAILED_RECOVERABLE"},
+    {"exit_code": 0, "output": "RESULT_STATUS: BLOCKED\nRESULT_NEXT_PHASE: BLOCKED\nRESULT_BLOCKER: decision\nRESULT_EVIDENCE: BLOCKED", "expected": "BLOCKED_REQUIREMENTS"}
+  ]
+}
