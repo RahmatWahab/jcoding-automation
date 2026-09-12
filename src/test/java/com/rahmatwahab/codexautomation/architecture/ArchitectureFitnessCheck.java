@@ -91,7 +91,7 @@ public final class ArchitectureFitnessCheck {
         var offenders = javaFiles(root).stream()
                 .filter(path -> isDomainPath(path))
                 .filter(path -> containsCode(path, "java.nio.file.")
-                        || containsCode(path, "java.io.File")
+                        || containsFilesystemFileType(path)
                         || containsCode(path, "java.io.RandomAccessFile")
                         || containsCode(path, "Files.")
                         || containsCode(path, "Path.of(")
@@ -122,7 +122,7 @@ public final class ArchitectureFitnessCheck {
     private static boolean containsForbiddenProcessExecution(Path path) {
         var source = code(path);
         if (source.contains("ProcessBuilder") || source.contains("Runtime.getRuntime().exec(")) return true;
-        var matcher = java.util.regex.Pattern.compile("(?:var|Runtime|java.lang.Runtime)([A-Za-z_$][A-Za-z0-9_$]*)=(?:Runtime|java.lang.Runtime)\\.getRuntime\\(\\)").matcher(source);
+        var matcher = java.util.regex.Pattern.compile("(?:var)?([A-Za-z_$][A-Za-z0-9_$]*)=(?:Runtime|java.lang.Runtime)\\.getRuntime\\(\\)").matcher(source);
         while (matcher.find()) {
             if (source.matches("(?s).*\\b" + java.util.regex.Pattern.quote(matcher.group(1)) + "\\.exec\\(.*")) return true;
         }
@@ -133,6 +133,12 @@ public final class ArchitectureFitnessCheck {
         var source = code(path);
         return Set.of("File", "FileInputStream", "FileOutputStream", "FileReader", "FileWriter", "RandomAccessFile", "BufferedReader", "BufferedWriter")
                 .stream().anyMatch(source::contains);
+    }
+
+    private static boolean containsFilesystemFileType(Path path) {
+        var source = code(path);
+        return source.contains("java.io.File;") || source.contains("java.io.File(")
+                || source.contains("importjava.io.File;") || source.contains("newFile(");
     }
 
     private static void verifyNoPackageCycles(Path root) throws IOException {
@@ -179,12 +185,15 @@ public final class ArchitectureFitnessCheck {
 
     private static Map<String, Set<String>> packageDependencies(Path root) throws IOException {
         var result = new HashMap<String, Set<String>>();
-        for (var path : javaFiles(root)) {
+        var sourceFiles = javaFiles(root);
+        var discoveredPackages = sourceFiles.stream().map(ArchitectureFitnessCheck::packageName)
+                .filter(packageName -> !packageName.isEmpty()).collect(Collectors.toSet());
+        for (var path : sourceFiles) {
             var packageName = packageName(path);
             result.computeIfAbsent(packageName, ignored -> new HashSet<>());
             var text = stripCommentsAndLiterals(Files.readString(path));
             var normalized = text.replaceAll("\\s+", "");
-            for (var candidate : REQUIRED_PACKAGES) {
+            for (var candidate : discoveredPackages) {
                 if (!candidate.equals(packageName) && referencesPackage(normalized, candidate)) {
                     result.computeIfAbsent(packageName, ignored -> new HashSet<>()).add(candidate);
                 }

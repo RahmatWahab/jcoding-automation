@@ -54,9 +54,12 @@ ext.validateDependencyDeclaration = { dependency, configurationName ->
     if (!approvedDependencyCoordinates.contains(coordinate)) {
         throw new GradleException("Unapproved dependency coordinate: ${coordinate}")
     }
-    def version = dependency.version
-    if (version && (version.contains("+") || version ==~ /.*[\[\]()].*/
-            || version ==~ /(?i)latest(?:\..+)?/ || version.endsWith("-SNAPSHOT"))) {
+    def selectors = [dependency.version, dependency.versionConstraint?.requiredVersion,
+                     dependency.versionConstraint?.preferredVersion,
+                     dependency.versionConstraint?.strictVersion].findAll { it }
+    if (selectors.any { version -> version.contains("+") || version ==~ /.*[\[\]()].*/
+            || version ==~ /(?i)latest(?:\..+)?/ || version.endsWith("-SNAPSHOT") }) {
+        def version = selectors.join(", ")
         throw new GradleException("Unsafe dependency version for ${coordinate}: ${version}")
     }
     if (dependency instanceof org.gradle.api.artifacts.ExternalModuleDependency && dependency.changing) {

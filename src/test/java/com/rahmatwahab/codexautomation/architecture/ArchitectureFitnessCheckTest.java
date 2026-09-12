@@ -203,6 +203,17 @@ class ArchitectureFitnessCheckTest {
                 .hasMessageContaining("System.exit outside Main");
     }
 
+    @Test
+    void shouldNotRejectFileNotFoundExceptionTypeAlone(@TempDir Path root) throws Exception {
+        createRequiredPackageTree(root);
+        writeJava(root, "workflow/Exception.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+                import java.io.FileNotFoundException;
+                final class Exception { void handle() { FileNotFoundException ignored = null; } }
+                """);
+        ArchitectureFitnessCheck.main(new String[]{root.toString()});
+    }
+
     private static void createRequiredPackageTree(Path root) throws Exception {
         var base = root.resolve("src/main/java/com/rahmatwahab/codexautomation");
         for (var packageName : new String[]{
