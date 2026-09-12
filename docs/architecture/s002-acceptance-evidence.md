@@ -11,7 +11,14 @@ Story: https://github.com/RahmatWahab/jcoding-automation/issues/3
 | Bootstrap, dependency wiring, graceful shutdown, version output, installDist launcher | `Main`, `BootstrapApplication`, `ApplicationContext`, `ShutdownCoordinator`, `VersionProvider`, bootstrap tests |
 | Package boundaries for EPIC-required modules | Packages under `src/main/java/com/rahmatwahab/codexautomation/*` and `package-info.java` responsibility docs |
 | ADRs and C4 documentation for modular monolith and dependency inversion | `docs/architecture/adr-0001-java-21-gradle-foundation.md`, `adr-0002-modular-monolith-boundaries.md`, `c4.md` |
-| Architecture fitness checks preventing cycles, forbidden direct commands, and domain/infrastructure coupling | `ArchitectureFitnessCheck`, `architectureFitness` Gradle task wired into `check` |
+| Architecture fitness checks preventing cycles, forbidden direct commands, and domain/infrastructure coupling | `ArchitectureFitnessCheck`, `architectureFitness` Gradle task wired into `check`; regression tests cover fully qualified references without imports |
+
+## Review Feedback Controls
+
+The PR #17 connector feedback is recorded in
+`docs/architecture/s002-review-lessons.md`. The fixes preserve exact frozen
+workflow phases, detect fully qualified package dependencies, and reject Gradle
+dependencies marked as changing.
 
 ## Out of Scope Preserved
 

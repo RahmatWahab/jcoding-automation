@@ -33,6 +33,37 @@ dependencies {
     testRuntimeOnly "org.junit.platform:junit-platform-launcher"
 }
 
+ext.approvedDependencyCoordinates = [
+        "ch.qos.logback:logback-classic",
+        "com.fasterxml.jackson.core:jackson-databind",
+        "org.assertj:assertj-core",
+        "org.jacoco:org.jacoco.agent",
+        "org.jacoco:org.jacoco.ant",
+        "org.junit:junit-bom",
+        "org.junit.jupiter:junit-jupiter",
+        "org.junit.platform:junit-platform-launcher",
+        "org.slf4j:slf4j-api",
+        "org.xerial:sqlite-jdbc"
+] as Set
+
+ext.validateDependencyDeclaration = { dependency, configurationName ->
+    if (!dependency.group || !dependency.name) {
+        throw new GradleException("Dependency in ${configurationName} must declare group and name: ${dependency}")
+    }
+    def coordinate = "${dependency.group}:${dependency.name}".toString()
+    if (!approvedDependencyCoordinates.contains(coordinate)) {
+        throw new GradleException("Unapproved dependency coordinate: ${coordinate}")
+    }
+    def version = dependency.version
+    if (version && (version.contains("+") || version.equalsIgnoreCase("latest.release")
+            || version.equalsIgnoreCase("latest.integration") || version.endsWith("-SNAPSHOT"))) {
+        throw new GradleException("Unsafe dependency version for ${coordinate}: ${version}")
+    }
+    if (dependency instanceof org.gradle.api.artifacts.ExternalModuleDependency && dependency.changing) {
+        throw new GradleException("Changing dependency is not allowed for ${coordinate}")
+    }
+}
+
 tasks.named("test") {
     useJUnitPlatform()
     finalizedBy tasks.named("jacocoTestReport")
@@ -66,34 +97,29 @@ tasks.register("dependencySecurityCheck") {
     group = "verification"
     description = "Fails on dynamic, changing, or unapproved dependency coordinates."
     doLast {
-        def approved = [
-                "ch.qos.logback:logback-classic",
-                "com.fasterxml.jackson.core:jackson-databind",
-                "org.assertj:assertj-core",
-                "org.jacoco:org.jacoco.agent",
-                "org.jacoco:org.jacoco.ant",
-                "org.junit:junit-bom",
-                "org.junit.jupiter:junit-jupiter",
-                "org.junit.platform:junit-platform-launcher",
-                "org.slf4j:slf4j-api",
-                "org.xerial:sqlite-jdbc"
-        ] as Set
         configurations.each { configuration ->
             if (configuration.canBeDeclared) {
                 configuration.dependencies.each { dependency ->
-                    if (!dependency.group || !dependency.name) {
-                        throw new GradleException("Dependency in ${configuration.name} must declare group and name: ${dependency}")
-                    }
-                    def coordinate = "${dependency.group}:${dependency.name}".toString()
-                    if (!approved.contains(coordinate)) {
-                        throw new GradleException("Unapproved dependency coordinate: ${coordinate}")
-                    }
-                    def version = dependency.version
-                    if (version && (version.contains("+") || version.equalsIgnoreCase("latest.release")
-                            || version.equalsIgnoreCase("latest.integration") || version.endsWith("-SNAPSHOT"))) {
-                        throw new GradleException("Unsafe dependency version for ${coordinate}: ${version}")
-                    }
+                    validateDependencyDeclaration(dependency, configuration.name)
                 }
+            }
+        }
+    }
+}
+
+tasks.register("dependencySecuritySelfTest") {
+    group = "verification"
+    description = "Verifies dependency security rejects changing dependencies."
+    doLast {
+        def changingDependency = dependencies.create("org.slf4j:slf4j-api:2.0.16") {
+            changing = true
+        }
+        try {
+            validateDependencyDeclaration(changingDependency, "selfTest")
+            throw new GradleException("dependencySecurityCheck failed to reject a changing dependency")
+        } catch (GradleException exception) {
+            if (!exception.message.contains("Changing dependency is not allowed")) {
+                throw exception
             }
         }
     }
@@ -111,6 +137,7 @@ tasks.register("architectureFitness", JavaExec) {
 tasks.named("check") {
     dependsOn tasks.named("dependencyGovernance")
     dependsOn tasks.named("dependencySecurityCheck")
+    dependsOn tasks.named("dependencySecuritySelfTest")
     dependsOn tasks.named("architectureFitness")
 }
 

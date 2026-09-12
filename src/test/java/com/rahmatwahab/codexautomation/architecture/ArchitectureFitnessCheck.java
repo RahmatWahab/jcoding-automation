@@ -134,14 +134,21 @@ public final class ArchitectureFitnessCheck {
             var packageName = packageName(path);
             result.computeIfAbsent(packageName, ignored -> new HashSet<>());
             var text = Files.readString(path);
+            var normalized = text.replaceAll("\\s+", "");
             for (var candidate : REQUIRED_PACKAGES) {
-                if (!candidate.equals(packageName)
-                        && text.contains("import com.rahmatwahab.codexautomation." + candidate + ".")) {
+                if (!candidate.equals(packageName) && referencesPackage(normalized, candidate)) {
                     result.computeIfAbsent(packageName, ignored -> new HashSet<>()).add(candidate);
                 }
             }
         }
         return result;
+    }
+
+    private static boolean referencesPackage(String normalizedSource, String candidate) {
+        var prefix = "com.rahmatwahab.codexautomation." + candidate + ".";
+        return normalizedSource.contains("import" + prefix)
+                || normalizedSource.contains("importstatic" + prefix)
+                || normalizedSource.contains(prefix);
     }
 
     private static List<String> findCycle(String start, Map<String, Set<String>> graph) {
