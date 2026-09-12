@@ -227,6 +227,24 @@ class ArchitectureFitnessCheckTest {
                 .hasMessageContaining("direct filesystem access from domain package");
     }
 
+    @Test
+    void shouldRejectPrintWriterAndAllowUnrelatedFilesApi(@TempDir Path root) throws Exception {
+        createRequiredPackageTree(root);
+        writeJava(root, "workflow/Api.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+                final class Api { static final class Files { static void refresh() {} } void ok() { Files.refresh(); } }
+                """);
+        ArchitectureFitnessCheck.main(new String[]{root.toString()});
+        writeJava(root, "workflow/Writer.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+                import java.io.PrintWriter;
+                final class Writer { void open() { new PrintWriter("state"); } }
+                """);
+        assertThatThrownBy(() -> ArchitectureFitnessCheck.main(new String[]{root.toString()}))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("direct filesystem access from domain package");
+    }
+
     private static void createRequiredPackageTree(Path root) throws Exception {
         var base = root.resolve("src/main/java/com/rahmatwahab/codexautomation");
         for (var packageName : new String[]{

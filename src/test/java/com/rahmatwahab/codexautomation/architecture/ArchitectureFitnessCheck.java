@@ -93,7 +93,7 @@ public final class ArchitectureFitnessCheck {
                 .filter(path -> containsCode(path, "java.nio.file.")
                         || containsFilesystemFileType(path)
                         || containsCode(path, "java.io.RandomAccessFile")
-                        || containsCode(path, "Files.")
+                        || containsJdkFilesType(path)
                         || containsCode(path, "Path.of(")
                         || containsCode(path, "Paths.get(")
                         || containsKnownJavaIoType(path))
@@ -131,10 +131,18 @@ public final class ArchitectureFitnessCheck {
 
     private static boolean containsKnownJavaIoType(Path path) {
         var source = code(path);
-        return Set.of("File", "FileInputStream", "FileOutputStream", "FileReader", "FileWriter", "RandomAccessFile", "BufferedReader", "BufferedWriter")
+        return Set.of("File", "FileInputStream", "FileOutputStream", "FileReader", "FileWriter", "RandomAccessFile",
+                "BufferedReader", "BufferedWriter", "DataInputStream", "DataOutputStream", "ObjectInputStream",
+                "ObjectOutputStream", "PrintStream", "PrintWriter", "Scanner")
                 .stream().anyMatch(type -> source.contains("new" + type + "(")
                         || source.contains("." + type + "(")
                         || source.contains("importjava.io." + type + ";"));
+    }
+
+    private static boolean containsJdkFilesType(Path path) {
+        var source = code(path);
+        return source.contains("java.nio.file.Files.")
+                || (source.contains("importjava.nio.file.Files;") && source.contains("Files."));
     }
 
     private static boolean containsFilesystemFileType(Path path) {
