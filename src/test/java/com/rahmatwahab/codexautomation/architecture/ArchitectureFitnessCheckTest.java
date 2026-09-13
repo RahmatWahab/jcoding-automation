@@ -284,6 +284,25 @@ class ArchitectureFitnessCheckTest {
         ArchitectureFitnessCheck.main(new String[]{root.toString()});
     }
 
+    @Test
+    void shouldAllowPathDataBoundaryAndRejectVariableFilePath(@TempDir Path root) throws Exception {
+        createRequiredPackageTree(root);
+        writeJava(root, "workflow/PathModel.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+                import java.nio.file.Path;
+                final class PathModel { Path path; Path getPath() { return path; } }
+                """);
+        ArchitectureFitnessCheck.main(new String[]{root.toString()});
+        writeJava(root, "workflow/FileModel.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+                import java.io.FileInputStream;
+                final class FileModel { void open(String filename) throws Exception { new FileInputStream(filename); } }
+                """);
+        assertThatThrownBy(() -> ArchitectureFitnessCheck.main(new String[]{root.toString()}))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("direct filesystem access from domain package");
+    }
+
     private static void createRequiredPackageTree(Path root) throws Exception {
         var base = root.resolve("src/main/java/com/rahmatwahab/codexautomation");
         for (var packageName : new String[]{

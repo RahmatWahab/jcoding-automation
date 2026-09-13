@@ -90,8 +90,7 @@ public final class ArchitectureFitnessCheck {
     private static void verifyDomainDoesNotAccessFilesystem(Path root) throws IOException {
         var offenders = javaFiles(root).stream()
                 .filter(path -> isDomainPath(path))
-                .filter(path -> containsCode(path, "java.nio.file.")
-                        || containsFilesystemFileType(path)
+                .filter(path -> containsFilesystemFileType(path)
                         || containsCode(path, "java.io.RandomAccessFile")
                         || containsJdkFilesType(path)
                         || containsCode(path, "Path.of(")
@@ -144,7 +143,9 @@ public final class ArchitectureFitnessCheck {
                         || source.contains("new" + type + "(java.nio.file.Path")
                         || source.contains("new" + type + "(File")
                         || source.contains("new" + type + "(Path")
-                        || source.contains("java.util.zip." + type));
+                        || source.contains("java.util.zip." + type)
+                        || (Set.of("FileInputStream", "FileOutputStream", "FileReader", "FileWriter", "RandomAccessFile", "ZipFile", "JarFile").contains(type)
+                            && source.matches("(?s).*new" + type + "\\([A-Za-z_$][A-Za-z0-9_$]*\\).*")));
     }
 
     private static boolean containsJdkFilesType(Path path) {
