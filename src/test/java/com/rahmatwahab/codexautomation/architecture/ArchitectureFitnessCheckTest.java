@@ -265,6 +265,25 @@ class ArchitectureFitnessCheckTest {
                 .hasMessageContaining("direct filesystem access from domain package");
     }
 
+    @Test
+    void shouldRejectRuntimeParameterAndAllowInMemoryWriter(@TempDir Path root) throws Exception {
+        createRequiredPackageTree(root);
+        writeJava(root, "workflow/Bad.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+                final class Bad { void run(Runtime runtime) { runtime.exec("tool"); } }
+                """);
+        assertThatThrownBy(() -> ArchitectureFitnessCheck.main(new String[]{root.toString()}))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("direct process execution outside execution package");
+        writeJava(root, "workflow/Bad.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+                import java.io.PrintWriter;
+                import java.io.StringWriter;
+                final class Bad { void write() { new PrintWriter(new StringWriter()); } }
+                """);
+        ArchitectureFitnessCheck.main(new String[]{root.toString()});
+    }
+
     private static void createRequiredPackageTree(Path root) throws Exception {
         var base = root.resolve("src/main/java/com/rahmatwahab/codexautomation");
         for (var packageName : new String[]{

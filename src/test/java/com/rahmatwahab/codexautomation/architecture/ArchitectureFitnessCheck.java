@@ -123,6 +123,10 @@ public final class ArchitectureFitnessCheck {
         var source = code(path);
         if (source.contains("ProcessBuilder") || source.contains("Runtime.getRuntime().exec(")
                 || source.contains("getRuntime().exec(")) return true;
+        var runtimeType = java.util.regex.Pattern.compile("Runtime([A-Za-z_$][A-Za-z0-9_$]*)(?:\\)|,|;)").matcher(source);
+        while (runtimeType.find()) {
+            if (source.contains(runtimeType.group(1) + ".exec(")) return true;
+        }
         var matcher = java.util.regex.Pattern.compile("(?:var)?([A-Za-z_$][A-Za-z0-9_$]*)=(?:Runtime|java.lang.Runtime)\\.getRuntime\\(\\)").matcher(source);
         while (matcher.find()) {
             if (source.matches("(?s).*\\b" + java.util.regex.Pattern.quote(matcher.group(1)) + "\\.exec\\(.*")) return true;
@@ -135,9 +139,12 @@ public final class ArchitectureFitnessCheck {
         return Set.of("File", "FileInputStream", "FileOutputStream", "FileReader", "FileWriter", "RandomAccessFile",
                 "BufferedReader", "BufferedWriter", "DataInputStream", "DataOutputStream", "ObjectInputStream",
                 "ObjectOutputStream", "PrintStream", "PrintWriter", "Scanner", "ZipFile", "JarFile")
-                .stream().anyMatch(type -> source.contains("new" + type + "(")
-                        || source.contains("." + type + "(")
-                        || source.contains("importjava.io." + type + ";"));
+                .stream().anyMatch(type -> source.contains("new" + type + "(\"")
+                        || source.contains("new" + type + "(java.io.File")
+                        || source.contains("new" + type + "(java.nio.file.Path")
+                        || source.contains("new" + type + "(File")
+                        || source.contains("new" + type + "(Path")
+                        || source.contains("java.util.zip." + type));
     }
 
     private static boolean containsJdkFilesType(Path path) {
