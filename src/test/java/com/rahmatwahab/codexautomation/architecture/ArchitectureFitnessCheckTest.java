@@ -245,6 +245,26 @@ class ArchitectureFitnessCheckTest {
                 .hasMessageContaining("direct filesystem access from domain package");
     }
 
+    @Test
+    void shouldRejectStaticRuntimeExecAndZipFile(@TempDir Path root) throws Exception {
+        createRequiredPackageTree(root);
+        writeJava(root, "workflow/Bad.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+                import static java.lang.Runtime.getRuntime;
+                final class Bad { void run() { getRuntime().exec("tool"); } }
+                """);
+        assertThatThrownBy(() -> ArchitectureFitnessCheck.main(new String[]{root.toString()}))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("direct process execution outside execution package");
+        writeJava(root, "workflow/Bad.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+                final class Bad { void open() throws Exception { new java.util.zip.ZipFile("state.zip"); } }
+                """);
+        assertThatThrownBy(() -> ArchitectureFitnessCheck.main(new String[]{root.toString()}))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("direct filesystem access from domain package");
+    }
+
     private static void createRequiredPackageTree(Path root) throws Exception {
         var base = root.resolve("src/main/java/com/rahmatwahab/codexautomation");
         for (var packageName : new String[]{

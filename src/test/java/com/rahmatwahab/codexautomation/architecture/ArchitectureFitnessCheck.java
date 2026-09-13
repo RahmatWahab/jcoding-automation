@@ -121,7 +121,8 @@ public final class ArchitectureFitnessCheck {
 
     private static boolean containsForbiddenProcessExecution(Path path) {
         var source = code(path);
-        if (source.contains("ProcessBuilder") || source.contains("Runtime.getRuntime().exec(")) return true;
+        if (source.contains("ProcessBuilder") || source.contains("Runtime.getRuntime().exec(")
+                || source.contains("getRuntime().exec(")) return true;
         var matcher = java.util.regex.Pattern.compile("(?:var)?([A-Za-z_$][A-Za-z0-9_$]*)=(?:Runtime|java.lang.Runtime)\\.getRuntime\\(\\)").matcher(source);
         while (matcher.find()) {
             if (source.matches("(?s).*\\b" + java.util.regex.Pattern.quote(matcher.group(1)) + "\\.exec\\(.*")) return true;
@@ -133,7 +134,7 @@ public final class ArchitectureFitnessCheck {
         var source = code(path);
         return Set.of("File", "FileInputStream", "FileOutputStream", "FileReader", "FileWriter", "RandomAccessFile",
                 "BufferedReader", "BufferedWriter", "DataInputStream", "DataOutputStream", "ObjectInputStream",
-                "ObjectOutputStream", "PrintStream", "PrintWriter", "Scanner")
+                "ObjectOutputStream", "PrintStream", "PrintWriter", "Scanner", "ZipFile", "JarFile")
                 .stream().anyMatch(type -> source.contains("new" + type + "(")
                         || source.contains("." + type + "(")
                         || source.contains("importjava.io." + type + ";"));
