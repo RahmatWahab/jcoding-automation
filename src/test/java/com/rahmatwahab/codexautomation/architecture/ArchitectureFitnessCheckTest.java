@@ -321,6 +321,34 @@ class ArchitectureFitnessCheckTest {
                 .hasMessageContaining("direct filesystem access from domain package");
     }
 
+    @Test
+    void shouldRejectQualifiedFileConstructorAndNioWildcardAndStaticImports(@TempDir Path root) throws Exception {
+        createRequiredPackageTree(root);
+        writeJava(root, "workflow/Qualified.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+                final class Qualified { void open(String filename) throws Exception { new java.io.FileInputStream(filename); } }
+                """);
+        assertThatThrownBy(() -> ArchitectureFitnessCheck.main(new String[]{root.toString()}))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("direct filesystem access from domain package");
+        writeJava(root, "workflow/Qualified.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+                import java.nio.file.*;
+                final class Qualified { void open(Path path) throws Exception { Files.readString(path); } }
+                """);
+        assertThatThrownBy(() -> ArchitectureFitnessCheck.main(new String[]{root.toString()}))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("direct filesystem access from domain package");
+        writeJava(root, "workflow/Qualified.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+                import static java.nio.file.Files.readString;
+                final class Qualified { void open(java.nio.file.Path path) throws Exception { readString(path); } }
+                """);
+        assertThatThrownBy(() -> ArchitectureFitnessCheck.main(new String[]{root.toString()}))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("direct filesystem access from domain package");
+    }
+
     private static void createRequiredPackageTree(Path root) throws Exception {
         var base = root.resolve("src/main/java/com/rahmatwahab/codexautomation");
         for (var packageName : new String[]{

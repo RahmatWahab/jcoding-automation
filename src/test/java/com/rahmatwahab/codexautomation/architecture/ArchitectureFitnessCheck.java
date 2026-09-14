@@ -144,6 +144,8 @@ public final class ArchitectureFitnessCheck {
                         || source.contains("new" + type + "(File")
                         || source.contains("new" + type + "(Path")
                         || source.contains("java.util.zip." + type)
+                        || source.contains("newjava.io." + type + "(")
+                        || source.contains("newjava.util.zip." + type + "(")
                         || (Set.of("FileInputStream", "FileOutputStream", "FileReader", "FileWriter", "RandomAccessFile", "ZipFile", "JarFile", "PrintWriter", "PrintStream").contains(type)
                             && source.matches("(?s).*new" + type + "\\([A-Za-z_$][A-Za-z0-9_$]*\\).*")));
     }
@@ -151,7 +153,9 @@ public final class ArchitectureFitnessCheck {
     private static boolean containsJdkFilesType(Path path) {
         var source = code(path);
         return source.contains("java.nio.file.Files.")
-                || (source.contains("importjava.nio.file.Files;") && source.contains("Files."));
+                || (source.contains("importjava.nio.file.Files;") && source.contains("Files."))
+                || (source.contains("importjava.nio.file.*;") && source.contains("Files."))
+                || (source.contains("importstaticjava.nio.file.Files.") && source.matches("(?s).*(readString|writeString|newInputStream|newOutputStream|delete|move|copy)\\(.*"));
     }
 
     private static boolean containsFilesystemFileType(Path path) {
