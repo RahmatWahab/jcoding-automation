@@ -137,7 +137,7 @@ public final class ArchitectureFitnessCheck {
         var source = code(path);
         return Set.of("File", "FileInputStream", "FileOutputStream", "FileReader", "FileWriter", "RandomAccessFile",
                 "BufferedReader", "BufferedWriter", "DataInputStream", "DataOutputStream", "ObjectInputStream",
-                "ObjectOutputStream", "PrintStream", "PrintWriter", "Scanner", "ZipFile", "JarFile")
+                "ObjectOutputStream", "Scanner", "ZipFile", "JarFile", "PrintWriter", "PrintStream")
                 .stream().anyMatch(type -> source.contains("new" + type + "(\"")
                         || source.contains("new" + type + "(java.io.File")
                         || source.contains("new" + type + "(java.nio.file.Path")
@@ -146,8 +146,9 @@ public final class ArchitectureFitnessCheck {
                         || source.contains("java.util.zip." + type)
                         || source.contains("newjava.io." + type + "(")
                         || source.contains("newjava.util.zip." + type + "(")
-                        || (Set.of("FileInputStream", "FileOutputStream", "FileReader", "FileWriter", "RandomAccessFile", "ZipFile", "JarFile", "PrintWriter", "PrintStream").contains(type)
-                            && source.matches("(?s).*new" + type + "\\([A-Za-z_$][A-Za-z0-9_$]*\\).*")));
+                        || (Set.of("FileInputStream", "FileOutputStream", "FileReader", "FileWriter", "RandomAccessFile", "ZipFile", "JarFile").contains(type)
+                            && source.matches("(?s).*new" + type + "\\([A-Za-z_$][A-Za-z0-9_$]*\\).*"))
+                        || containsStringPathWriter(source, type));
     }
 
     private static boolean containsJdkFilesType(Path path) {
@@ -155,7 +156,20 @@ public final class ArchitectureFitnessCheck {
         return source.contains("java.nio.file.Files.")
                 || (source.contains("importjava.nio.file.Files;") && source.contains("Files."))
                 || (source.contains("importjava.nio.file.*;") && source.contains("Files."))
-                || (source.contains("importstaticjava.nio.file.Files.") && source.matches("(?s).*(readString|writeString|newInputStream|newOutputStream|delete|move|copy)\\(.*"));
+                || (source.contains("importstaticjava.nio.file.Files.") && source.matches("(?s).*(readString|writeString|newInputStream|newOutputStream|delete|move|copy)\\(.*"))
+                || source.contains("java.nio.channels.FileChannel.open(")
+                || (source.contains("importjava.nio.channels.FileChannel;") && source.contains("FileChannel.open("))
+                || (source.contains("importjava.nio.channels.*;") && source.contains("FileChannel.open("));
+    }
+
+    private static boolean containsStringPathWriter(String source, String type) {
+        if (!Set.of("PrintWriter", "PrintStream").contains(type)) return false;
+        if (source.contains("new" + type + "(\"")) return true;
+        var stringVariable = java.util.regex.Pattern.compile("String([A-Za-z_$][A-Za-z0-9_$]*)").matcher(source);
+        while (stringVariable.find()) {
+            if (source.contains("new" + type + "(" + stringVariable.group(1) + ")")) return true;
+        }
+        return false;
     }
 
     private static boolean containsFilesystemFileType(Path path) {

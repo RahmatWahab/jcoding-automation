@@ -322,6 +322,27 @@ class ArchitectureFitnessCheckTest {
     }
 
     @Test
+    void shouldAllowInjectedWriterAndRejectFileChannel(@TempDir Path root) throws Exception {
+        createRequiredPackageTree(root);
+        writeJava(root, "workflow/Writer.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+                import java.io.PrintWriter;
+                import java.io.Writer;
+                final class Writer { void write(Writer output) { new PrintWriter(output); } }
+                """);
+        ArchitectureFitnessCheck.main(new String[]{root.toString()});
+        writeJava(root, "workflow/Channel.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+                import java.nio.channels.FileChannel;
+                import java.nio.file.Path;
+                final class Channel { void open(Path path) throws Exception { FileChannel.open(path); } }
+                """);
+        assertThatThrownBy(() -> ArchitectureFitnessCheck.main(new String[]{root.toString()}))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("direct filesystem access from domain package");
+    }
+
+    @Test
     void shouldRejectQualifiedFileConstructorAndNioWildcardAndStaticImports(@TempDir Path root) throws Exception {
         createRequiredPackageTree(root);
         writeJava(root, "workflow/Qualified.java", """
