@@ -303,6 +303,24 @@ class ArchitectureFitnessCheckTest {
                 .hasMessageContaining("direct filesystem access from domain package");
     }
 
+    @Test
+    void shouldRejectVariablePrintWriterPathAndIgnoreTextBlockContent(@TempDir Path root) throws Exception {
+        createRequiredPackageTree(root);
+        writeJava(root, "workflow/Prompt.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+                final class Prompt { String text = \"\"\"ProcessBuilder // com.rahmatwahab.codexautomation.git.GitClient\"\"\"; }
+                """);
+        ArchitectureFitnessCheck.main(new String[]{root.toString()});
+        writeJava(root, "workflow/Writer.java", """
+                package com.rahmatwahab.codexautomation.workflow;
+                import java.io.PrintWriter;
+                final class Writer { void open(String filename) { new PrintWriter(filename); } }
+                """);
+        assertThatThrownBy(() -> ArchitectureFitnessCheck.main(new String[]{root.toString()}))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("direct filesystem access from domain package");
+    }
+
     private static void createRequiredPackageTree(Path root) throws Exception {
         var base = root.resolve("src/main/java/com/rahmatwahab/codexautomation");
         for (var packageName : new String[]{

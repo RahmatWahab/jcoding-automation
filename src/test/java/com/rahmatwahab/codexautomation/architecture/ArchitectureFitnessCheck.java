@@ -144,7 +144,7 @@ public final class ArchitectureFitnessCheck {
                         || source.contains("new" + type + "(File")
                         || source.contains("new" + type + "(Path")
                         || source.contains("java.util.zip." + type)
-                        || (Set.of("FileInputStream", "FileOutputStream", "FileReader", "FileWriter", "RandomAccessFile", "ZipFile", "JarFile").contains(type)
+                        || (Set.of("FileInputStream", "FileOutputStream", "FileReader", "FileWriter", "RandomAccessFile", "ZipFile", "JarFile", "PrintWriter", "PrintStream").contains(type)
                             && source.matches("(?s).*new" + type + "\\([A-Za-z_$][A-Za-z0-9_$]*\\).*")));
     }
 
@@ -299,6 +299,7 @@ public final class ArchitectureFitnessCheck {
             if (state == ScanState.CODE) {
                 if (current == '/' && next == '/') { state = ScanState.LINE_COMMENT; index++; output.append(' '); }
                 else if (current == '/' && next == '*') { state = ScanState.BLOCK_COMMENT; index++; output.append(' '); }
+                else if (current == '"' && next == '"' && index + 2 < source.length() && source.charAt(index + 2) == '"') { state = ScanState.TEXT_BLOCK; index += 2; output.append("\"\""); }
                 else if (current == '"') { state = ScanState.STRING; output.append("\"\""); }
                 else if (current == '\'') { state = ScanState.CHARACTER; output.append("''"); }
                 else { output.append(current); }
@@ -310,6 +311,9 @@ public final class ArchitectureFitnessCheck {
             } else if (state == ScanState.STRING) {
                 if (current == '\\') { index++; }
                 else if (current == '"') { state = ScanState.CODE; }
+            } else if (state == ScanState.TEXT_BLOCK) {
+                if (current == '"' && next == '"' && index + 2 < source.length() && source.charAt(index + 2) == '"') { state = ScanState.CODE; index += 2; }
+                else if (current == '\n' || current == '\r') { output.append(current); }
             } else {
                 if (current == '\\') { index++; }
                 else if (current == '\'') { state = ScanState.CODE; }
@@ -319,6 +323,6 @@ public final class ArchitectureFitnessCheck {
     }
 
     private enum ScanState {
-        CODE, LINE_COMMENT, BLOCK_COMMENT, STRING, CHARACTER
+        CODE, LINE_COMMENT, BLOCK_COMMENT, STRING, TEXT_BLOCK, CHARACTER
     }
 }
