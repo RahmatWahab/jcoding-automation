@@ -67,6 +67,49 @@ class GitHubTest {
         assertThat(gh.hasExactCommentAfter(pr, "@codex review", "2026-01-01T00:00:02+00:00")).isFalse();
     }
 
+    // -- create_pr (no --json on gh pr create) ------------------------------
+
+    @Test
+    void createPrDoesNotPassJsonFlagAndFetchesDetails() {
+        List<List<String>> calls = new ArrayList<>();
+        GitHub.CommandRunner runner = (command, timeout) -> {
+            calls.add(command);
+            // gh pr create prints the PR URL to stdout (no --json support).
+            if (command.contains("create")) {
+                return new GitHub.CommandResult(0,
+                        "Creating pull request...\nhttps://github.com/owner/repo/pull/181\n", "");
+            }
+            // gh pr view --json returns structured detail.
+            if (command.contains("view")) {
+                return new GitHub.CommandResult(0,
+                        "{\"number\":181,\"url\":\"https://github.com/owner/repo/pull/181\","
+                        + "\"state\":\"OPEN\",\"headRefName\":\"story/180-x\","
+                        + "\"headRefOid\":\"1f8860d\",\"reviewThreads\":{\"nodes\":[]}}", "");
+            }
+            return new GitHub.CommandResult(0, "{}", "");
+        };
+        GitHub gh = withRunner(runner);
+
+        Object created = gh.createPr("feat: implement story #180", "Closes #180",
+                "main", "story/180-x");
+
+        // The create command must NOT contain --json (unsupported on gh pr create).
+        List<String> createCall = calls.stream().filter(c -> c.contains("create")).findFirst().orElseThrow();
+        assertThat(createCall).doesNotContain("--json");
+        // The result is the fetched detail with the parsed number.
+        @SuppressWarnings("unchecked")
+        Map<String, Object> pr = (Map<String, Object>) created;
+        assertThat(pr.get("number")).isEqualTo(181);
+        assertThat(pr.get("headRefName")).isEqualTo("story/180-x");
+    }
+
+    @Test
+    void parsePrNumberFromUrlTakesTrailingNumber() {
+        assertThat(GitHub.parsePrNumberFromUrl(
+                "https://github.com/owner/repo/pull/181")).isEqualTo(181);
+        assertThat(GitHub.parsePrNumberFromUrl("no url here")).isEqualTo(-1);
+    }
+
     // -- reply_thread GraphQL field  -----------------
 
     @Test

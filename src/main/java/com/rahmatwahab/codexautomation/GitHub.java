@@ -303,10 +303,39 @@ public class GitHub {
         return false;
     }
 
+    /**
+     * Create a pull request and return its authoritative detail map.
+     *
+     * <p>{@code gh pr create} does not support {@code --json} on all supported
+     * gh versions, so we create the PR (which prints the PR URL to stdout) and
+     * then fetch the structured detail with {@code gh pr view --json}. This
+     * avoids the "unknown flag: --json" failure on {@code gh pr create}.</p>
+     */
     public Object createPr(String title, String body, String base, String head) {
-        return run("pr", "create", "--repo", repo, "--base", base, "--head", head,
-                "--title", title, "--body", body,
-                "--json", "number,url,state,isDraft,headRefName,headRefOid");
+        Object result = run("pr", "create", "--repo", repo, "--base", base, "--head", head,
+                "--title", title, "--body", body);
+        String output = result instanceof Map ? String.valueOf(((Map<?, ?>) result).get("url"))
+                : String.valueOf(result);
+        int number = parsePrNumberFromUrl(output);
+        if (number <= 0) {
+            throw new GitHubError("PR created but its number could not be parsed from gh output: "
+                    + output);
+        }
+        return pr(number);
+    }
+
+    /** Extract the trailing PR number from a gh pr create URL/output. */
+    static int parsePrNumberFromUrl(String output) {
+        if (output == null) {
+            return -1;
+        }
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("/pull/(\\d+)").matcher(output);
+        int number = -1;
+        while (m.find()) {
+            number = Integer.parseInt(m.group(1));
+        }
+        return number;
     }
 
     @SuppressWarnings("unchecked")

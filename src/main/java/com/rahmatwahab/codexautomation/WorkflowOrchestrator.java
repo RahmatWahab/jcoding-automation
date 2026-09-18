@@ -518,8 +518,9 @@ final class WorkflowOrchestrator {
                 GitOperations recoveryGit = gitFactory.create();
                 try {
                     recoveryGit.checkoutStoryBranch(Engine.asString(state.get("branch")));
-                } catch (RuntimeException ignored) {
-                    // best-effort; createStoryPr re-derives the branch
+                } catch (RuntimeException exc) {
+                    log.error("SUPERVISOR RECOVERY: could not check out story branch {}: {}",
+                            state.get("branch"), exc.getMessage());
                 }
                 log.info("SUPERVISOR RECOVERY: story #{} committed but no PR (phase {}, attempt {}); "
                         + "creating PR and deferring to CI", current,
@@ -534,6 +535,15 @@ final class WorkflowOrchestrator {
                         recoveryGit, current, null, "", new ArrayList<>(), true);
                 state.put("run_finished_at", Controller.now());
                 save();
+                // Report the concrete outcome so a persistent failure is visible
+                // in the logs instead of appearing to silently loop.
+                if (state.get("current_pr") != null) {
+                    log.info("SUPERVISOR RECOVERY COMPLETE: story #{} PR #{} created; phase={}",
+                            current, state.get("current_pr"), state.get("phase"));
+                } else {
+                    log.error("SUPERVISOR RECOVERY DID NOT CREATE A PR: story #{} phase={} error={}",
+                            current, state.get("phase"), state.get("error"));
+                }
                 return deliveryResult == Integer.MIN_VALUE ? 0 : deliveryResult;
             }
 
@@ -983,6 +993,8 @@ final class WorkflowOrchestrator {
             } catch (RuntimeException exc) {
                 state.put("phase", "BLOCKED_EXTERNAL");
                 state.put("error", "Unable to commit/push Codex changes: " + exc.getMessage());
+                save();
+                log.error("DELIVERY FAILED (commit/push): {}", exc.getMessage());
             }
         }
 
@@ -1053,7 +1065,10 @@ final class WorkflowOrchestrator {
             if (!Engine.asBool(workflow.get("allow_push"), false)
                     || !Engine.asBool(workflow.get("allow_pr_creation"), false)) {
                 state.put("phase", "BLOCKED_EXTERNAL");
-                state.put("error", "PR creation is disabled by configuration");
+                state.put("error", "PR creation is disabled by configuration "
+                        + "(requires workflow.allow_push=true and allow_pr_creation=true)");
+                save();
+                log.error("DELIVERY BLOCKED: {}", state.get("error"));
             } else {
                 try {
                     Map<String, Object> created = castMap(
@@ -1064,6 +1079,7 @@ final class WorkflowOrchestrator {
                     // After opening the PR, wait for CI/Codex review to run
                     // against the new PR head rather than assuming readiness.
                     state.put("phase", "WAITING_FOR_CI");
+                    save();
                     log.info("PR CREATED: story #{} PR #{} (first delivery)",
                             current, created.get("number"));
                     Map<String, Object> createdDetail = github.pr(Engine.asInt(created.get("number")));
@@ -1071,6 +1087,8 @@ final class WorkflowOrchestrator {
                 } catch (RuntimeException exc) {
                     state.put("phase", "BLOCKED_EXTERNAL");
                     state.put("error", "Unable to create PR: " + exc.getMessage());
+                    save();
+                    log.error("PR CREATION FAILED: story #{} — {}", current, exc.getMessage());
                 }
             }
         }
