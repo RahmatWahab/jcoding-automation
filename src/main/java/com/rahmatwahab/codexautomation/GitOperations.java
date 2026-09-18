@@ -187,11 +187,36 @@ public final class GitOperations {
         // remote ref is not fatal when the branch already exists locally.
         runner.run(repo, List.of("fetch", "origin", branch));
         String existingLocal = checkedStdout("branch", "--list", branch).strip();
-        if (!existingLocal.isEmpty()) {
-            checked("switch", branch);
-        } else {
-            // Create a local branch tracking origin/<branch>.
-            checked("checkout", "-B", branch, "origin/" + branch);
+        List<String> switchArgs = existingLocal.isEmpty()
+                ? List.of("checkout", "-B", branch, "origin/" + branch)
+                : List.of("switch", branch);
+        GitResult first = runner.run(repo, switchArgs);
+        if (first.exitCode() == 0) {
+            return true;
+        }
+        // A checkout can be blocked by local changes that "would be overwritten"
+        // — typically a stray/uncommitted file left by an interrupted run. Rather
+        // than fail hard (which loops the controller), stash the changes
+        // non-destructively, retry the switch, and leave the stash for recovery.
+        // git stash is recoverable via `git stash list` / `git stash pop`.
+        String err = first.stderr() == null ? "" : first.stderr();
+        boolean blockedByLocalChanges = err.contains("would be overwritten")
+                || err.contains("commit your changes or stash them");
+        if (!blockedByLocalChanges) {
+            throw new IllegalStateException("git " + String.join(" ", switchArgs)
+                    + " failed: " + err);
+        }
+        GitResult stash = runner.run(repo, List.of(
+                "stash", "push", "--include-untracked", "-m",
+                "codex-automation: auto-stash before checkout " + branch));
+        if (stash.exitCode() != 0) {
+            throw new IllegalStateException("unable to stash blocking local changes before "
+                    + "checking out " + branch + ": " + stash.stderr());
+        }
+        GitResult retry = runner.run(repo, switchArgs);
+        if (retry.exitCode() != 0) {
+            throw new IllegalStateException("git " + String.join(" ", switchArgs)
+                    + " still failed after stashing local changes: " + retry.stderr());
         }
         return true;
     }

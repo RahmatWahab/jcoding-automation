@@ -226,6 +226,45 @@ class GitOperationsTest {
                 .hasMessageContaining("default branch");
     }
 
+    @Test
+    void checkoutStoryBranchStashesBlockingChangesAndRetries() {
+        // A checkout blocked by "changes would be overwritten" must be recovered
+        // by a non-destructive stash + retry, not a hard failure.
+        List<List<String>> calls = new ArrayList<>();
+        GitOperations.GitRunner runner = (repo, args) -> {
+            calls.add(args);
+            String key = String.join(" ", args);
+            if (key.equals("branch --show-current")) {
+                return new GitOperations.GitResult(0, "main\n", "");
+            }
+            if (key.startsWith("branch --list")) {
+                return new GitOperations.GitResult(0, "story/47-x\n", "");
+            }
+            if (key.equals("switch story/47-x")) {
+                // First attempt fails (blocked), second attempt (after stash) ok.
+                long priorSwitches = calls.stream()
+                        .filter(c -> String.join(" ", c).equals("switch story/47-x")).count();
+                if (priorSwitches <= 1) {
+                    return new GitOperations.GitResult(1, "",
+                            "error: Your local changes to the following files would be overwritten "
+                            + "by checkout:\n\tMakefile\nPlease commit your changes or stash them");
+                }
+                return new GitOperations.GitResult(0, "", "");
+            }
+            if (key.startsWith("stash push")) {
+                return new GitOperations.GitResult(0, "Saved working directory", "");
+            }
+            return new GitOperations.GitResult(0, "", "");
+        };
+        GitOperations ops = new GitOperations(Path.of("/repo"), runner);
+        assertThat(ops.checkoutStoryBranch("story/47-x")).isTrue();
+        // It stashed and retried the switch.
+        assertThat(calls.stream().anyMatch(c -> String.join(" ", c).startsWith("stash push"))).isTrue();
+        long switches = calls.stream()
+                .filter(c -> String.join(" ", c).equals("switch story/47-x")).count();
+        assertThat(switches).isEqualTo(2);
+    }
+
     // -- classify_worktree (non-throwing recovery routing) -------------------
 
     @Test
