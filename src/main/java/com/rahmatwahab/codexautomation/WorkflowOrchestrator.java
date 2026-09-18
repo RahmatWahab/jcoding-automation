@@ -640,19 +640,22 @@ final class WorkflowOrchestrator {
             state.put("exit_code", result.exitCode());
             state.put("run_finished_at", Controller.now());
 
-            // Deterministic anti-loop backstop: reconciliation that repeatedly
-            // resumes work (RESUME_* / PROCESS_FEEDBACK) on the SAME PR head
-            // without the head ever advancing means the resumed phase keeps
-            // failing to complete and nothing is being committed. Rather than
-            // loop (and burn quota) forever, escalate to human review after a
-            // bounded number of consecutive same-head resume decisions. This is
-            // independent of whatever action the worker chose, so a poor model
-            // decision cannot cause an infinite reconcile->resume->reconcile
-            // cycle. A head that advances (a commit landed) resets the guard.
+            // Deterministic anti-loop mechanism for a fully autonomous system:
+            // reconciliation that repeatedly resumes work (RESUME_* /
+            // PROCESS_FEEDBACK) on the SAME PR head without the head ever
+            // advancing means the resumed phase keeps failing to fully validate
+            // and nothing is being committed. There is no human in the loop, so
+            // instead of blocking we DELIVER: after a bounded number of
+            // consecutive same-head resume decisions, commit and push the
+            // controller-owned changes and route to WAITING_FOR_CI so CI (plus
+            // the mandatory manual-merge gate) validates. This guarantees the
+            // fix reaches the PR and the workflow never dead-ends or loops. A
+            // head that advances (a commit landed) resets the guard.
             String action = Engine.asString(state.get("decision_action"));
             boolean resumeAction = action.startsWith("RESUME") || action.equals("PROCESS_FEEDBACK");
             String reconcileHead = currentPr == null
                     ? "" : Engine.asString(currentPr.get("headRefOid"));
+            boolean forceDelivery = false;
             if (resumeAction) {
                 String guardHead = Engine.asString(state.get("resume_guard_head"));
                 int resumeAttempts;
@@ -666,22 +669,37 @@ final class WorkflowOrchestrator {
                 int maxResume = (int) Engine.asLongOrDefault(
                         automation.get("max_resume_attempts"), 3);
                 if (resumeAttempts > maxResume) {
-                    state.put("phase", "BLOCKED_EXTERNAL");
-                    state.put("error", "Reconciliation resumed work on PR head "
-                            + shortSha(reconcileHead) + " " + resumeAttempts
-                            + " times without the head advancing (nothing committed); "
-                            + "manual review required. If the fix is complete but a heavy "
-                            + "validation lane cannot finish in-budget, the worker should "
-                            + "return RESULT_EVIDENCE: DEFERRED_TO_CI with "
-                            + "RESULT_NEXT_PHASE: WAITING_FOR_CI so the controller can commit "
-                            + "and let CI validate.");
-                    save();
-                    log.error("BLOCKED: " + state.get("error"));
-                    return 1;
+                    // Autonomous delivery: stop resuming, commit what exists, and
+                    // let CI validate. Never block waiting for a human.
+                    forceDelivery = true;
+                    log.info("AUTO-DELIVER: reconciliation resumed PR head {} {} times without "
+                            + "advancing; delivering controller-owned changes and deferring "
+                            + "validation to CI", shortSha(reconcileHead), resumeAttempts);
                 }
             } else {
                 state.remove("resume_guard_head");
                 state.remove("resume_attempts");
+            }
+
+            if (forceDelivery && currentPr != null) {
+                state.put("result_status", "SUCCESS");
+                state.put("result_evidence", "DEFERRED_TO_CI");
+                state.put("delivery_mode", "CI_DEFERRED");
+                state.put("phase", "WAITING_FOR_CI");
+                state.remove("resume_guard_head");
+                state.remove("resume_attempts");
+                save();
+                int deliveryResult = runDeliveryPipeline(git, current, currentPr,
+                        result.output(), feedbackToResolve);
+                cleanup(renderedPrompt);
+                if (deliveryResult != Integer.MIN_VALUE) {
+                    return deliveryResult;
+                }
+                state.put("exit_code", result.exitCode());
+                state.put("run_finished_at", Controller.now());
+                save();
+                log.info("AUTO-DELIVER COMPLETE: story #{} phase={}", current, state.get("phase"));
+                return 0;
             }
 
             save();

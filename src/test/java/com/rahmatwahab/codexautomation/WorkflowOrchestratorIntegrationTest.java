@@ -228,11 +228,12 @@ class WorkflowOrchestratorIntegrationTest {
     }
 
     @Test
-    void repeatedResumeReconcileOnSameHeadEscalatesToHumanReview(@TempDir Path root) throws Exception {
-        // Deterministic anti-loop backstop: if reconciliation keeps choosing
-        // RESUME_IMPLEMENTATION on the same unchanged PR head (nothing ever
-        // commits), the controller must escalate to BLOCKED_EXTERNAL rather than
-        // loop forever — regardless of the model's chosen action.
+    void repeatedResumeReconcileAutoDeliversToCiNeverBlocks(@TempDir Path root) throws Exception {
+        // Fully autonomous anti-loop: if reconciliation keeps choosing
+        // RESUME_IMPLEMENTATION on the same unchanged PR head (worker never
+        // self-certifies done), the controller must NOT block waiting for a
+        // human. After max_resume_attempts it commits the controller-owned fix
+        // and defers validation to CI, guaranteeing the fix reaches the PR.
         Path repo = root.resolve("repo");
         Files.createDirectories(repo);
         runGit(repo, "init", "-q");
@@ -264,12 +265,15 @@ class WorkflowOrchestratorIntegrationTest {
                         "name", "repo", "base_branch", "main"),
                 "epic", map("number", 27),
                 "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
-                "automation", map("dry_run", true, "max_resume_attempts", 2,
-                        "max_feedback_attempts", 99),
+                "automation", map("dry_run", false, "max_resume_attempts", 2,
+                        "max_feedback_attempts", 99, "delivery_verification_attempts", 1,
+                        "delivery_verification_delay_seconds", 0),
                 "budgets", map(),
-                "workflow", map("require_manual_merge", true));
+                "workflow", map("require_manual_merge", true, "allow_push", true,
+                        "allow_comments", true, "allow_thread_resolution", true));
 
-        // Worker always chooses RESUME_IMPLEMENTATION on the same head.
+        // Worker always chooses RESUME_IMPLEMENTATION on the same head (never
+        // self-certifies done) — the pathological case that used to loop.
         CodexRunner codex = new CodexRunner(Map.of(), System::nanoTime) {
             @Override
             public CodexResult run(Map<String, Object> cfg, Path prompt, Path r, boolean dry,
@@ -288,18 +292,26 @@ class WorkflowOrchestratorIntegrationTest {
         Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
                 "body", "Stories: #47", "url", "http://x/27");
 
-        // Fake git: story branch already checked out, clean worktree, so the run
-        // reaches reconcile dispatch (no checkout failure, no dirty-tree block).
+        // Fake git: story branch checked out, DIRTY worktree (a fix exists to
+        // deliver), commit produces the head, and local/origin/PR heads converge.
+        List<String> gitCalls = new ArrayList<>();
         GitOperations.GitRunner gitRunner = (r, args) -> {
             String key = String.join(" ", args);
+            gitCalls.add(key);
             if (key.startsWith("status --porcelain")) {
-                return new GitOperations.GitResult(0, "", "");
+                return new GitOperations.GitResult(0, " M src/impl.txt\n", "");
             }
             if (key.startsWith("branch --show-current")) {
                 return new GitOperations.GitResult(0, "story/47-x\n", "");
             }
             if (key.startsWith("branch --list")) {
                 return new GitOperations.GitResult(0, "story/47-x\n", "");
+            }
+            if (key.startsWith("rev-parse HEAD")) {
+                return new GitOperations.GitResult(0, head + "\n", "");
+            }
+            if (key.startsWith("ls-remote origin")) {
+                return new GitOperations.GitResult(0, head + "\trefs/heads/story/47-x\n", "");
             }
             return new GitOperations.GitResult(0, "", "");
         };
@@ -326,22 +338,25 @@ class WorkflowOrchestratorIntegrationTest {
                     root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
             DeliveryGitHub github = new DeliveryGitHub(prSnapshot);
             WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
-                    config, state, store, github, repo, root, epic, 27, true,
+                    config, state, store, github, repo, root, epic, 27, false,
                     gitFactory, codex, new ReviewCoordinator(), lock);
             lastCode = orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
             lastPhase = Engine.asString(state.get("phase"));
             lock.release();
-            if ("BLOCKED_EXTERNAL".equals(lastPhase)) {
+            if ("WAITING_FOR_CI".equals(lastPhase)) {
                 break;
             }
         }
 
-        // With max_resume_attempts=2, the 3rd consecutive same-head resume
-        // escalates instead of looping forever.
-        assertThat(lastPhase).isEqualTo("BLOCKED_EXTERNAL");
-        assertThat(lastCode).isEqualTo(1);
+        // Fully autonomous: after max_resume_attempts same-head resumes, the
+        // controller stops looping, COMMITS AND PUSHES the controller-owned fix,
+        // and defers validation to CI — it never blocks waiting for a human.
+        assertThat(lastPhase).isEqualTo("WAITING_FOR_CI");
+        assertThat(lastCode).isEqualTo(0);
+        assertThat(gitCalls).anyMatch(c -> c.startsWith("commit -m"));
+        assertThat(gitCalls).anyMatch(c -> c.startsWith("push --set-upstream origin story/47-x"));
         Map<String, Object> finalState = store.load();
-        assertThat((String) finalState.get("error")).contains("without the head advancing");
+        assertThat(finalState.get("delivery_mode")).isEqualTo("CI_DEFERRED");
     }
 
     /** Fake GitHub serving an existing PR and recording thread mutations. */

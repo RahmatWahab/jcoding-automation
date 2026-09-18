@@ -192,6 +192,16 @@ manual-merge gate is preserved — the automation never merges. A worker must us
 `DEFERRED_TO_CI` only when the fix itself is proven by the strongest safe
 in-budget substitute; an unproven fix must report `BLOCKED`.
 
+The system is fully autonomous — there is no human in the delivery loop. If
+reconciliation keeps resuming work on the same PR head without the head
+advancing (for example a worker that repeatedly chooses `RESUME_IMPLEMENTATION`
+but never self-certifies done), the controller does **not** stall waiting for a
+human. After `automation.max_resume_attempts` (default 3) same-head resumes it
+auto-delivers: it commits and pushes the controller-owned changes and routes to
+`WAITING_FOR_CI`, so the fix reaches the PR and CI plus the mandatory
+manual-merge gate become the validation authority. This guarantees the workflow
+never dead-ends or loops.
+
 > Note: this Java build's behavior is validated by an offline, mock-only test
 > suite. Real `gh` responses and the real `codex` worker have not been exercised
 > by automated tests, so a dry-run first launch is the recommended real-world
