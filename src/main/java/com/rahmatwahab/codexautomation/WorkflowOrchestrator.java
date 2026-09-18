@@ -214,6 +214,13 @@ final class WorkflowOrchestrator {
             state.put("current_pr_head", currentPr.get("headRefOid"));
             state.put("pr_state", currentPr.get("state"));
             state.put("pr_review_decision", currentPr.get("reviewDecision"));
+            // Persist the story branch from the PR head so a later worktree
+            // recovery can match the active branch even when the PR was already
+            // recorded in state (and thus not re-adopted this run).
+            if (currentPr.get("headRefName") != null
+                    && !Engine.asString(currentPr.get("headRefName")).isEmpty()) {
+                state.put("branch", currentPr.get("headRefName"));
+            }
             state.put("ci_status", currentPr.get("statusCheckRollup") != null
                     ? currentPr.get("statusCheckRollup") : new ArrayList<>());
 

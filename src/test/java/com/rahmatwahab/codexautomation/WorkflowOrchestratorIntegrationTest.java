@@ -307,4 +307,57 @@ class WorkflowOrchestratorIntegrationTest {
         assertThat(completed).contains(45);
         lock.release();
     }
+
+    @Test
+    void recordedPrPersistsBranchFromHeadWhenStateBranchIsNull(@TempDir Path root) throws Exception {
+        // Regression: when a PR is already recorded (current_pr set) but
+        // state.branch is null, the branch must be persisted from the PR head
+        // so worktree recovery can match the active story branch.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q");
+        Files.createDirectories(root.resolve("prompts"));
+        Files.createDirectories(root.resolve("state"));
+
+        Map<String, Object> prSnapshot = map(
+                "number", 178, "state", "OPEN", "mergedAt", null,
+                "headRefOid", "abc123", "headRefName", "story/47-shared-default-deny",
+                "url", "http://x/pr/178", "reviewDecision", "",
+                "statusCheckRollup", List.of(map("status", "IN_PROGRESS")),
+                "reviewThreadsAvailable", true, "comments", new ArrayList<>(),
+                "reviews", new ArrayList<>(), "reviewThreads", new ArrayList<>());
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", true), "budgets", map(),
+                "workflow", map("require_manual_merge", true));
+
+        Map<String, Object> state = new LinkedHashMap<>();
+        state.put("phase", "FIXING_FEEDBACK");
+        state.put("current_story", 47);
+        state.put("current_pr", 178);
+        state.put("branch", null);   // the bug scenario
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        WorkflowLock lock = WorkflowLock.acquire(root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+        DeliveryGitHub github = new DeliveryGitHub(prSnapshot);
+        // EPIC must link story #47 for it to be eligible.
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #47", "url", "http://x/27");
+
+        WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                config, state, store, github, repo, root, epic, 27, true,
+                new Controller.GitOperationsFactory(repo), new CodexRunner(),
+                new ReviewCoordinator(), lock);
+
+        // CI is IN_PROGRESS, so the run reaches the WAITING short-circuit after
+        // the PR-detail block has persisted the branch.
+        orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
+
+        assertThat(state.get("branch")).isEqualTo("story/47-shared-default-deny");
+        lock.release();
+    }
 }
