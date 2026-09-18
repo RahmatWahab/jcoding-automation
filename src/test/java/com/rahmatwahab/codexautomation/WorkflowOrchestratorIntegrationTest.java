@@ -985,6 +985,14 @@ class WorkflowOrchestratorIntegrationTest {
         state.put("current_story", 45);
         state.put("current_pr", 177);
         state.put("branch", "story/45-x");
+        // Seed story-scoped metadata that must NOT leak into the next story.
+        state.put("worktree_recovery", map("branch", "story/45-x", "action",
+                "RESUME_CONTROLLER_OWNED_WORKTREE"));
+        state.put("resume_guard_head", "deadbeef");
+        state.put("resume_attempts", 2);
+        state.put("feedback_guard_head", "deadbeef");
+        state.put("last_feedback_result", "BLOCKED");
+        state.put("delivery_mode", "CI_DEFERRED");
 
         StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
         WorkflowLock lock = WorkflowLock.acquire(root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
@@ -1004,6 +1012,13 @@ class WorkflowOrchestratorIntegrationTest {
         @SuppressWarnings("unchecked")
         List<Object> completed = (List<Object>) state.get("completed_stories");
         assertThat(completed).contains(45);
+        // No stale story-scoped metadata leaks into the next story.
+        assertThat(state.get("worktree_recovery")).isNull();
+        assertThat(state.get("resume_guard_head")).isNull();
+        assertThat(state.get("resume_attempts")).isNull();
+        assertThat(state.get("feedback_guard_head")).isNull();
+        assertThat(state.get("last_feedback_result")).isNull();
+        assertThat(state.get("delivery_mode")).isNull();
         lock.release();
     }
 

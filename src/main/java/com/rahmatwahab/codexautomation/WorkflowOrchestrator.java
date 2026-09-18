@@ -1068,6 +1068,28 @@ final class WorkflowOrchestrator {
         state.put("branch", null);
         state.put("base_commit", null);
         state.put("phase", "IDLE");
+        // Clear ALL remaining story-scoped metadata so nothing from the
+        // completed story leaks into the next one. A worker was observed
+        // reasoning about (and having to dismiss) stale story-47 recovery
+        // metadata while story-180 was active; that cross-story contamination
+        // is eliminated here. Loop guards especially must reset so a fresh
+        // story never inherits another story's resume/feedback counters.
+        for (String key : List.of(
+                "worktree_recovery", "worktree_baseline", "base_branch",
+                "resume_guard_head", "resume_attempts",
+                "feedback_guard_head", "feedback_attempts",
+                "last_feedback_result", "last_feedback_result_head",
+                "feedback_reconcile_pending",
+                "last_processed_commit", "last_connector_review_commit",
+                "last_review_trigger_commit", "review_trigger_pending",
+                "delivery_mode", "result_status", "result_evidence",
+                "worker_result_status", "worker_result_evidence",
+                "blockers", "error", "raw_error", "message",
+                "decision_action", "decision_reason", "decision_rejection",
+                "blocker_class", "recovery_action", "reconciliation_attempts",
+                "phase_attempt", "phase_started_at", "thread_updates")) {
+            state.remove(key);
+        }
     }
 
     private Integer phaseBudget(String executionPhase) {
