@@ -19,9 +19,9 @@ else
   echo "ROTATED: active cron log is empty or absent"
 fi
 
-# Delete only generated automation logs older than seven days. Never remove
+# Delete only generated automation logs older than one day. Never remove
 # state, source, lock directories, .gitkeep, or unrelated log files.
 find "$LOG_DIR" -maxdepth 1 -type f \
   \( -name 'run-*.log' -o -name 'cron-system-*.log' -o -name 'housekeeping-*.log' \) \
-  -mtime +7 -print -delete
+  -mtime +1 -print -delete
 echo "HOUSEKEEPING COMPLETE: $(date -u +%FT%TZ)"
