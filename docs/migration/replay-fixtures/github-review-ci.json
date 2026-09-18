@@ -1,9 +1,0 @@
-{
-  "fixture": "github-review-ci",
-  "cases": [
-    {"mergedAt": "2026-01-01T00:00:00Z", "headRefOid": "h", "statusCheckRollup": [], "reviewThreads": [], "reviewDecision": "APPROVED", "expected": "MERGED"},
-    {"mergedAt": null, "headRefOid": "h", "statusCheckRollup": [{"status": "PENDING"}], "reviewThreads": [], "reviewDecision": null, "expected": "WAITING_FOR_CI"},
-    {"mergedAt": null, "headRefOid": "h", "statusCheckRollup": [], "reviewThreads": [{"isResolved": false}], "reviewDecision": null, "expected": "CHANGES_REQUESTED"},
-    {"mergedAt": null, "headRefOid": "h", "statusCheckRollup": [], "reviewThreads": [], "reviews": [{"author": {"login": "chatgpt-codex-connector"}, "submittedAt": "2026-01-01", "commit": {"oid": "h"}}], "reviewDecision": "APPROVED", "expected": "READY_TO_MERGE"}
-  ]
-}

@@ -16,10 +16,6 @@ application {
     mainClass = "com.rahmatwahab.codexautomation.Main"
 }
 
-repositories {
-    mavenCentral()
-}
-
 dependencies {
     implementation "com.fasterxml.jackson.core:jackson-databind:2.17.3"
     implementation "org.xerial:sqlite-jdbc:3.46.1.0"

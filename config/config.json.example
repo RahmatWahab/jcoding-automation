@@ -1,0 +1,48 @@
+{
+  "repository": {
+    "local_path": "/local/cquant_platform",
+    "owner": "RahmatWahab",
+    "name": "cquant_platform",
+    "base_branch": "main"
+  },
+  "epic": {
+    "number": 27
+  },
+  "github": {
+    "token_environment_variable": "GH_TOKEN",
+    "cli": "gh",
+    "timeout_seconds": 30
+  },
+  "automation": {
+    "dry_run": true,
+    "stale_lock_seconds": 900,
+    "quota_retry_seconds": 1800,
+    "watchdog_observations": 3,
+    "watchdog_grace_seconds": 10,
+    "delivery_verification_attempts": 5,
+    "delivery_verification_delay_seconds": 2
+  },
+  "codex": {
+    "executable": "codex",
+    "model": "gpt-5.6-luna",
+    "reasoning_effort": "medium",
+    "approval_policy": "never",
+    "dangerously_bypass_sandbox": false,
+    "execution_timeout_seconds": 3600,
+    "progress_interval_seconds": 30
+  },
+  "budgets": {
+    "implementing": 1800,
+    "verifying": 1800,
+    "reviewing_code": 1200,
+    "fixing_feedback": 1200,
+    "reconciling": 600
+  },
+  "workflow": {
+    "allow_push": false,
+    "allow_pr_creation": false,
+    "allow_comments": false,
+    "allow_thread_resolution": false,
+    "require_manual_merge": true
+  }
+}

@@ -1,12 +1,23 @@
+# Gradle
 .gradle/
 build/
 out/
+
+# Runtime state and logs (keep the placeholder files)
 state/*
 !state/.gitkeep
 logs/*
 !logs/.gitkeep
 *.log
+
+# Operator-local configuration (copy from the .example template)
+config/config.json
+
+# IDE / editor
 .idea/
 *.iml
 .vscode/
-__pycache__/
+*.swp
+
+# OS
+.DS_Store

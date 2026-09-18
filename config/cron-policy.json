@@ -1,0 +1,10 @@
+{
+  "interval_minutes": 1,
+  "cron_entry": "*/1 * * * * /home/algo/jcoding-automation/scripts/cron-launcher.sh >> /home/algo/jcoding-automation/logs/cron-system.log 2>&1",
+  "housekeeping_cron_entry": "0 0 * * * /home/algo/jcoding-automation/scripts/log-housekeeping.sh >> /home/algo/jcoding-automation/logs/housekeeping.log 2>&1",
+  "job_control_file": "config/job-control.json",
+  "skip_when_running": true,
+  "stale_lock_seconds": 900,
+  "terminate_long_running_process": false,
+  "log_directory": "logs"
+}
