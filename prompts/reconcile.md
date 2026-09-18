@@ -47,6 +47,34 @@ is required by the acceptance criteria and no documented safe substitute
 exists. A conflict caused by the repository's fixed-port test setup is not
 such a blocker.
 
+DELIVER-THEN-CI ROUTING (avoid resume loops)
+
+Do NOT keep choosing RESUME_IMPLEMENTATION when there is no implementation work
+left and the only gap is a heavy end-to-end/integration lane that exceeded the
+phase budget. That causes an infinite reconcile->implement->reconcile loop that
+never commits. RESUME_IMPLEMENTATION is correct only when concrete code or test
+work genuinely remains to be written or repaired on the current worktree.
+
+When the controller-owned fix is already complete and in scope, CI on the
+current head is green, and the sole remaining check is a heavy lane that timed
+out (for example a Docker migration E2E), the fix must be delivered and the
+heavy lane deferred to CI rather than retried locally forever. In that case
+choose PROCESS_FEEDBACK (for review-feedback fixes) or RESUME_VERIFICATION, and
+the follow-up worker must return RESULT_STATUS: SUCCESS with
+RESULT_EVIDENCE: DEFERRED_TO_CI and RESULT_NEXT_PHASE: WAITING_FOR_CI so the
+controller commits and pushes the fix and lets CI complete validation. The
+manual-merge gate still protects the final merge; the automation never merges.
+Only report a blocking action if the fix itself is not yet proven by the
+strongest safe in-budget substitute.
+
+Unit and mock/contract tests are sufficient evidence of a fix. If the fix is
+proven by focused unit or mock/contract tests, do NOT choose
+RESUME_IMPLEMENTATION merely because an E2E lane did not run, is impossible, or
+is unavailable — there is no implementation work left in that case. Route it to
+delivery (the follow-up worker reports RESULT_EVIDENCE: COMPLETE and the
+controller commits). E2E absence is never, by itself, a reason to resume
+implementation or to block.
+
 DECISION_ACTION: one exact action from the list above
 DECISION_REASON: concise evidence-based reason
 BLOCKER_CLASS: NONE, IMPLEMENTATION, TEST_HARNESS, VALIDATION,

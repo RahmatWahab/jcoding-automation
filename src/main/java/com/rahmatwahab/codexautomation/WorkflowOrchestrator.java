@@ -639,6 +639,51 @@ final class WorkflowOrchestrator {
             state.put("result_evidence", "DECISION_COMPLETE");
             state.put("exit_code", result.exitCode());
             state.put("run_finished_at", Controller.now());
+
+            // Deterministic anti-loop backstop: reconciliation that repeatedly
+            // resumes work (RESUME_* / PROCESS_FEEDBACK) on the SAME PR head
+            // without the head ever advancing means the resumed phase keeps
+            // failing to complete and nothing is being committed. Rather than
+            // loop (and burn quota) forever, escalate to human review after a
+            // bounded number of consecutive same-head resume decisions. This is
+            // independent of whatever action the worker chose, so a poor model
+            // decision cannot cause an infinite reconcile->resume->reconcile
+            // cycle. A head that advances (a commit landed) resets the guard.
+            String action = Engine.asString(state.get("decision_action"));
+            boolean resumeAction = action.startsWith("RESUME") || action.equals("PROCESS_FEEDBACK");
+            String reconcileHead = currentPr == null
+                    ? "" : Engine.asString(currentPr.get("headRefOid"));
+            if (resumeAction) {
+                String guardHead = Engine.asString(state.get("resume_guard_head"));
+                int resumeAttempts;
+                if (!reconcileHead.isEmpty() && reconcileHead.equals(guardHead)) {
+                    resumeAttempts = (int) Engine.asLongOrDefault(state.get("resume_attempts"), 0) + 1;
+                } else {
+                    resumeAttempts = 1;
+                    state.put("resume_guard_head", reconcileHead);
+                }
+                state.put("resume_attempts", resumeAttempts);
+                int maxResume = (int) Engine.asLongOrDefault(
+                        automation.get("max_resume_attempts"), 3);
+                if (resumeAttempts > maxResume) {
+                    state.put("phase", "BLOCKED_EXTERNAL");
+                    state.put("error", "Reconciliation resumed work on PR head "
+                            + shortSha(reconcileHead) + " " + resumeAttempts
+                            + " times without the head advancing (nothing committed); "
+                            + "manual review required. If the fix is complete but a heavy "
+                            + "validation lane cannot finish in-budget, the worker should "
+                            + "return RESULT_EVIDENCE: DEFERRED_TO_CI with "
+                            + "RESULT_NEXT_PHASE: WAITING_FOR_CI so the controller can commit "
+                            + "and let CI validate.");
+                    save();
+                    log.error("BLOCKED: " + state.get("error"));
+                    return 1;
+                }
+            } else {
+                state.remove("resume_guard_head");
+                state.remove("resume_attempts");
+            }
+
             save();
             log.info("RECONCILIATION ACCEPTED: " + state.get("decision_action") + " — " + outcome.detail());
             return 0;
@@ -695,6 +740,11 @@ final class WorkflowOrchestrator {
                 if (committed != null) {
                     state.put("branch", branch);
                     state.put("last_processed_commit", committed);
+                    // A real head advance means progress was made; clear the
+                    // deterministic resume-loop guard so future reconciliation
+                    // starts fresh rather than counting pre-commit attempts.
+                    state.remove("resume_guard_head");
+                    state.remove("resume_attempts");
                 }
                 if (currentPr != null) {
                     int attempts = (int) Engine.asLongOrDefault(

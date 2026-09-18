@@ -227,6 +227,123 @@ class WorkflowOrchestratorIntegrationTest {
         p.waitFor();
     }
 
+    @Test
+    void repeatedResumeReconcileOnSameHeadEscalatesToHumanReview(@TempDir Path root) throws Exception {
+        // Deterministic anti-loop backstop: if reconciliation keeps choosing
+        // RESUME_IMPLEMENTATION on the same unchanged PR head (nothing ever
+        // commits), the controller must escalate to BLOCKED_EXTERNAL rather than
+        // loop forever — regardless of the model's chosen action.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q");
+        Path prompts = root.resolve("prompts");
+        Files.createDirectories(prompts);
+        Files.writeString(prompts.resolve("common.md"), "COMMON");
+        Files.writeString(prompts.resolve("reconcile.md"), "{{COMMON}}\nReconcile.");
+        Files.createDirectories(root.resolve("state"));
+
+        String head = "abc123def456";
+        Map<String, Object> prSnapshot = map(
+                "number", 178, "state", "OPEN", "mergedAt", null,
+                "headRefOid", head, "headRefName", "story/47-x", "url", "http://x/pr/178",
+                "reviewDecision", "CHANGES_REQUESTED", "statusCheckRollup", new ArrayList<>(),
+                "reviewThreadsAvailable", true, "comments", new ArrayList<>(),
+                // Connector review AT the head closes the review gate; the
+                // unresolved thread provides actionable feedback that, combined
+                // with a prior BLOCKED verdict on this head, routes to
+                // BLOCKED_REQUIREMENTS -> reconcile.md (the production path).
+                "reviews", List.of(map("author", map("login", "chatgpt-codex-connector"),
+                        "submittedAt", "2026-02-01", "commit", map("oid", head))),
+                "reviewThreads", List.of(map("id", "PRRT_1", "isResolved", false,
+                        "comments", map("nodes", List.of(map("id", "PRRC_1",
+                                "body", "please fix this bug", "createdAt", "2026-01-01",
+                                "author", map("login", "reviewer")))))));
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", true, "max_resume_attempts", 2,
+                        "max_feedback_attempts", 99),
+                "budgets", map(),
+                "workflow", map("require_manual_merge", true));
+
+        // Worker always chooses RESUME_IMPLEMENTATION on the same head.
+        CodexRunner codex = new CodexRunner(Map.of(), System::nanoTime) {
+            @Override
+            public CodexResult run(Map<String, Object> cfg, Path prompt, Path r, boolean dry,
+                                   Runnable hb, Integer timeout) {
+                return new CodexResult(0,
+                        "DECISION_ACTION: RESUME_IMPLEMENTATION\n"
+                        + "DECISION_REASON: fix uncommitted, E2E timed out\n"
+                        + "BLOCKER_CLASS: IMPLEMENTATION\n"
+                        + "RECOVERY_ACTION: rerun affected validation\n"
+                        + "RESULT_STATUS: SUCCESS\nRESULT_NEXT_PHASE: IMPLEMENTING\n"
+                        + "RESULT_BLOCKER: NONE\nRESULT_EVIDENCE: COMPLETE\n");
+            }
+        };
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #47", "url", "http://x/27");
+
+        // Fake git: story branch already checked out, clean worktree, so the run
+        // reaches reconcile dispatch (no checkout failure, no dirty-tree block).
+        GitOperations.GitRunner gitRunner = (r, args) -> {
+            String key = String.join(" ", args);
+            if (key.startsWith("status --porcelain")) {
+                return new GitOperations.GitResult(0, "", "");
+            }
+            if (key.startsWith("branch --show-current")) {
+                return new GitOperations.GitResult(0, "story/47-x\n", "");
+            }
+            if (key.startsWith("branch --list")) {
+                return new GitOperations.GitResult(0, "story/47-x\n", "");
+            }
+            return new GitOperations.GitResult(0, "", "");
+        };
+        Controller.GitOperationsFactory gitFactory = new Controller.GitOperationsFactory(repo) {
+            @Override
+            public GitOperations create() {
+                return new GitOperations(repo, gitRunner);
+            }
+        };
+
+        int lastCode = 0;
+        String lastPhase = "";
+        for (int run = 1; run <= 4; run++) {
+            Map<String, Object> state = store.load();
+            state.put("phase", "BLOCKED_REQUIREMENTS"); // routes to reconcile.md
+            state.put("current_story", 47);
+            state.put("current_pr", 178);
+            state.put("branch", "story/47-x");
+            // Prior feedback worker returned BLOCKED on this head -> the
+            // orchestrator routes the actionable feedback to reconciliation.
+            state.put("last_feedback_result", "BLOCKED");
+            state.put("last_feedback_result_head", head);
+            WorkflowLock lock = WorkflowLock.acquire(
+                    root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+            DeliveryGitHub github = new DeliveryGitHub(prSnapshot);
+            WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                    config, state, store, github, repo, root, epic, 27, true,
+                    gitFactory, codex, new ReviewCoordinator(), lock);
+            lastCode = orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
+            lastPhase = Engine.asString(state.get("phase"));
+            lock.release();
+            if ("BLOCKED_EXTERNAL".equals(lastPhase)) {
+                break;
+            }
+        }
+
+        // With max_resume_attempts=2, the 3rd consecutive same-head resume
+        // escalates instead of looping forever.
+        assertThat(lastPhase).isEqualTo("BLOCKED_EXTERNAL");
+        assertThat(lastCode).isEqualTo(1);
+        Map<String, Object> finalState = store.load();
+        assertThat((String) finalState.get("error")).contains("without the head advancing");
+    }
+
     /** Fake GitHub serving an existing PR and recording thread mutations. */
     private static final class DeliveryGitHub extends GitHub {
         final List<String> resolvedThreads = new ArrayList<>();

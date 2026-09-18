@@ -21,14 +21,16 @@ failure output and prove the current story with the strongest safe substitute;
 never hide the deferred lane or label a repository-owned failure external.
 
 Determine the required validation scope from the current story's acceptance
-criteria and available interfaces. Run real E2E only when the complete
-dependency path exists. If a broader E2E path depends on a later story, do not
-block this story solely because that path cannot exist yet. Instead verify the
-current story with realistic contract, component, mock/fake, simulator,
-replay, fixture, and negative-path tests as applicable. Record the unavailable
-E2E scenario, its owning future dependency, the substitute evidence, and the
-remaining integration risk. The substitute must prove business outcomes and
-safety behavior, not merely execution or call counts.
+criteria and available interfaces. Unit and mock/contract tests that prove the
+changed behavior are sufficient to pass VERIFY; E2E is never a required gate to
+report success. Run real E2E only when the complete dependency path exists and
+it is achievable within budget. If a broader E2E path depends on a later story,
+is impossible, or is unavailable, do not block this story: verify the current
+story with realistic contract, component, mock/fake, simulator, replay,
+fixture, and negative-path tests as applicable, record the unavailable E2E
+scenario and its owning future dependency as a deferred note, and report
+success. The substitute must prove business value — business outcomes and
+safety behavior — not merely execution or call counts.
 
 Record each acceptance criterion and each required command as PASS, FAIL, or
 NOT RUN with the reason. NOT RUN is not success. Environment failures are

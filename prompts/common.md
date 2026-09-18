@@ -22,23 +22,27 @@ RESULT_STATUS: SUCCESS|BLOCKED|FAILED
 RESULT_NEXT_PHASE: RECONCILING|VERIFYING|REVIEWING_CODE|WAITING_FOR_CI|WAITING_FOR_CODEX_REVIEW|WAITING_FOR_HUMAN_REVIEW|READY_TO_MERGE|FIXING_FEEDBACK|BLOCKED
 RESULT_BLOCKER: NONE or a concise blocker
 RESULT_EVIDENCE: COMPLETE only when the acceptance-criteria matrix and all
-required validation results are complete; DEFERRED_TO_CI when the fix is
-complete and locally proven by the strongest safe substitute, but a required
-heavy end-to-end/integration lane cannot finish within the phase budget and
-must be validated by CI (in that case RESULT_NEXT_PHASE must be WAITING_FOR_CI);
-otherwise BLOCKED
+required validation results are complete; unit and mock/contract tests that
+prove the changed behavior satisfy COMPLETE even when E2E is not run because it
+is impossible, unavailable, or owned by a later story (record it as a deferred
+note). Use DEFERRED_TO_CI only when a heavy E2E/integration lane IS achievable
+and required but cannot finish within the phase budget, so CI must run it after
+the commit (in that case RESULT_NEXT_PHASE must be WAITING_FOR_CI); otherwise
+BLOCKED
 
 DELIVER-THEN-CI POLICY
 
-Prefer COMPLETE with full local validation. Use DEFERRED_TO_CI only when all of
-these hold: the finding is genuinely fixed; you proved the changed behavior with
-the strongest safe substitute available in-budget (focused unit/component/
-contract/fixture tests); the only remaining unrun check is a heavy E2E/
-integration lane that CI runs; and the diff is in scope. DEFERRED_TO_CI is not a
-license to skip validation or to guess — it delivers a proven-in-part,
-CI-gated fix so the controller can commit and let CI complete the remaining
-lane. The manual-merge gate still protects the final merge; the automation
-never merges. If the fix itself is not proven, report BLOCKED, not
+Prefer COMPLETE. Unit and mock/contract evidence proving the behavior is the
+normal bar for COMPLETE and is enough to commit; E2E is never a hard commit
+gate. Use DEFERRED_TO_CI only when all of these hold: the finding is genuinely
+fixed; you proved the changed behavior with the strongest safe substitute
+available in-budget (focused unit/component/contract/fixture tests); the only
+remaining unrun check is a heavy E2E/integration lane that IS achievable and
+that CI runs; and the diff is in scope. DEFERRED_TO_CI is not a license to skip
+validation or to guess — it delivers a proven-in-part, CI-gated fix so the
+controller can commit and let CI complete the remaining lane. The manual-merge
+gate still protects the final merge; the automation never merges. If the fix
+itself is not proven at any available level, report BLOCKED, not
 DEFERRED_TO_CI.
 
 When reporting a blocker, use one of these classes in the phase-specific
@@ -53,6 +57,25 @@ Testing must prove the story's business behavior and safety properties, not
 just increase the test count. For every acceptance criterion, state the user,
 operator, system, or risk-control value being protected and map it to concrete
 test evidence.
+
+PRIMARY EVIDENCE BAR (unit and mock/contract tests are sufficient)
+
+Unit, mock, fake, simulator, replay, fixture, and contract tests that prove the
+changed behavior and its safety properties are SUFFICIENT evidence to report
+RESULT_STATUS: SUCCESS with RESULT_EVIDENCE: COMPLETE, and the controller then
+commits the fix. End-to-end (E2E) testing is NOT a required gate for a commit.
+Many stories cannot run a full E2E early in development because an upstream or
+downstream dependency does not exist yet, or the E2E environment is not
+available; that is expected and must never block delivery of an otherwise
+proven fix.
+
+Run E2E only when it is genuinely achievable and cheap enough for the phase
+budget. When E2E is impossible, unavailable, or belongs to a later story, prove
+the current story with the strongest available unit/mock/contract evidence,
+record the unavailable E2E scenario and its owning future dependency as a
+deferred note, and still report COMPLETE. Do not report BLOCKED merely because
+E2E could not run — BLOCKED is only for a fix that is not proven at ANY
+available test level, or genuinely ambiguous requirements/state.
 
 Use the strongest applicable evidence for the current story:
 

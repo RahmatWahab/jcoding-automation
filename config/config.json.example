@@ -21,7 +21,8 @@
     "watchdog_grace_seconds": 10,
     "delivery_verification_attempts": 5,
     "delivery_verification_delay_seconds": 2,
-    "max_feedback_attempts": 3
+    "max_feedback_attempts": 3,
+    "max_resume_attempts": 3
   },
   "codex": {
     "executable": "codex",

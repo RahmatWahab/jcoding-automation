@@ -21,11 +21,16 @@ and rerun that test before broader validation. If it does not reproduce,
 inspect the implementation and review context rather than guessing.
 
 Do not rerun a full E2E lane when a deterministic unit, component, contract, or
-fixture test proves the affected property, unless the acceptance criterion
-explicitly requires that E2E boundary. Process unresolved findings attached to
-the supplied PR head, but do not rework a finding already proven fixed on a
-newer delivered head. Report the review-thread ID, original commit, current
-head, decision, and test evidence for every finding.
+fixture test proves the affected property. E2E is never required to commit a
+feedback fix: if a focused unit or mock/contract test proves the finding is
+resolved, that is sufficient to report RESULT_STATUS: SUCCESS with
+RESULT_EVIDENCE: COMPLETE, and the controller will commit the fix. Only run E2E
+when it is genuinely achievable and cheap enough for the budget; when it is
+impossible, unavailable, or owned by a later story, record it as a deferred
+note and still report COMPLETE. Process unresolved findings attached to the
+supplied PR head, but do not rework a finding already proven fixed on a newer
+delivered head. Report the review-thread ID, original commit, current head,
+decision, and test evidence for every finding.
 
 Do not commit or push changes; the external controller performs those actions
 only when its configuration explicitly permits pushing.
