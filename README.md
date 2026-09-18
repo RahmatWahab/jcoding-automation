@@ -231,6 +231,7 @@ manual merge gate.
 - `scripts/install-cron.sh` — installs the marked crontab block from `cron-policy.json`.
 - `scripts/healthcheck.sh` — non-mutating operational health check.
 - `scripts/log-housekeeping.sh` — daily log rotation and bounded retention.
+- `scripts/reset.sh` — stop any active run and reset durable state (backs up state first; opt-in `--clean-repo`/`--delete-branch`/`--close-pr` for repo/GitHub cleanup).
 
 Run the health check any time:
 
