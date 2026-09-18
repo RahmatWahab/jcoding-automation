@@ -67,6 +67,39 @@ class EngineResultTest {
     }
 
     @Test
+    void ciDeferredSuccessIsDeliverableAndMovesToWaitingForCi() {
+        // A complete fix that defers a heavy E2E lane to CI must be a deliverable
+        // success (so the controller commits/pushes), not a fail-closed block.
+        Map<String, Object> result = Engine.applyCodexResult(map(), 0,
+                "RESULT_STATUS: SUCCESS\nRESULT_NEXT_PHASE: WAITING_FOR_CI\n"
+                        + "RESULT_BLOCKER: NONE\nRESULT_EVIDENCE: DEFERRED_TO_CI");
+        assertThat(result.get("phase")).isEqualTo("WAITING_FOR_CI");
+        assertThat(result.get("result_status")).isEqualTo("SUCCESS");
+        assertThat(result.get("delivery_mode")).isEqualTo("CI_DEFERRED");
+        assertThat(result.get("blockers")).isEqualTo(new ArrayList<>());
+    }
+
+    @Test
+    void deferredEvidenceWithoutWaitingForCiFailsClosed() {
+        // DEFERRED_TO_CI is only valid when the next phase is WAITING_FOR_CI;
+        // otherwise it must not be treated as a deliverable success.
+        Map<String, Object> result = Engine.applyCodexResult(map(), 0,
+                "RESULT_STATUS: SUCCESS\nRESULT_NEXT_PHASE: REVIEWING_CODE\n"
+                        + "RESULT_BLOCKER: NONE\nRESULT_EVIDENCE: DEFERRED_TO_CI");
+        assertThat(result.get("phase")).isEqualTo("BLOCKED_REQUIREMENTS");
+        assertThat(result.get("delivery_mode")).isNull();
+    }
+
+    @Test
+    void blockedWithDeferredEvidenceStillFailsClosed() {
+        Map<String, Object> result = Engine.applyCodexResult(map(), 0,
+                "RESULT_STATUS: BLOCKED\nRESULT_NEXT_PHASE: WAITING_FOR_CI\n"
+                        + "RESULT_BLOCKER: cannot fix\nRESULT_EVIDENCE: DEFERRED_TO_CI");
+        assertThat(result.get("phase")).isEqualTo("BLOCKED_REQUIREMENTS");
+        assertThat(result.get("delivery_mode")).isNull();
+    }
+
+    @Test
     void finalMachineFooterWinsOverPromptExamples() {
         String output = "RESULT_STATUS: SUCCESS|BLOCKED|FAILED\n"
                 + "RESULT_NEXT_PHASE: VERIFYING|REVIEWING_CODE\n"

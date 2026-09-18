@@ -22,7 +22,24 @@ RESULT_STATUS: SUCCESS|BLOCKED|FAILED
 RESULT_NEXT_PHASE: RECONCILING|VERIFYING|REVIEWING_CODE|WAITING_FOR_CI|WAITING_FOR_CODEX_REVIEW|WAITING_FOR_HUMAN_REVIEW|READY_TO_MERGE|FIXING_FEEDBACK|BLOCKED
 RESULT_BLOCKER: NONE or a concise blocker
 RESULT_EVIDENCE: COMPLETE only when the acceptance-criteria matrix and all
-required validation results are complete; otherwise BLOCKED
+required validation results are complete; DEFERRED_TO_CI when the fix is
+complete and locally proven by the strongest safe substitute, but a required
+heavy end-to-end/integration lane cannot finish within the phase budget and
+must be validated by CI (in that case RESULT_NEXT_PHASE must be WAITING_FOR_CI);
+otherwise BLOCKED
+
+DELIVER-THEN-CI POLICY
+
+Prefer COMPLETE with full local validation. Use DEFERRED_TO_CI only when all of
+these hold: the finding is genuinely fixed; you proved the changed behavior with
+the strongest safe substitute available in-budget (focused unit/component/
+contract/fixture tests); the only remaining unrun check is a heavy E2E/
+integration lane that CI runs; and the diff is in scope. DEFERRED_TO_CI is not a
+license to skip validation or to guess — it delivers a proven-in-part,
+CI-gated fix so the controller can commit and let CI complete the remaining
+lane. The manual-merge gate still protects the final merge; the automation
+never merges. If the fix itself is not proven, report BLOCKED, not
+DEFERRED_TO_CI.
 
 When reporting a blocker, use one of these classes in the phase-specific
 prompt: IMPLEMENTATION, TEST_HARNESS, VALIDATION, REVIEW_FEEDBACK, CI, QUOTA,

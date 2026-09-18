@@ -519,23 +519,38 @@ public final class Engine {
         if (evidence == null) {
             evidence = "";
         }
+        // A fix can be complete yet unable to run heavy validation (e.g. Docker
+        // E2E) within the phase budget. In that case the worker may declare
+        // SUCCESS with RESULT_EVIDENCE: DEFERRED_TO_CI and RESULT_NEXT_PHASE:
+        // WAITING_FOR_CI. This is a deliverable result: the controller commits
+        // and pushes, and CI (already a merge gate) becomes the validation
+        // authority. The manual-merge gate still protects the final merge.
+        boolean deferredToCi = "SUCCESS".equals(status)
+                && "DEFERRED_TO_CI".equals(evidence)
+                && "WAITING_FOR_CI".equals(phase);
+        boolean acceptableEvidence = "COMPLETE".equals(evidence) || deferredToCi;
         if ("BLOCKED".equals(status) || "BLOCKED".equals(phase)) {
             result.put("phase", "BLOCKED_REQUIREMENTS");
         } else if (!"SUCCESS".equals(status) || phase == null || !PhaseModel.PHASES.contains(phase)
-                || !"COMPLETE".equals(evidence)) {
+                || !acceptableEvidence) {
             result.put("phase", "BLOCKED_REQUIREMENTS");
         } else {
             result.put("phase", phase);
         }
         result.put("result_status", status);
         result.put("result_evidence", evidence);
+        if (deferredToCi) {
+            result.put("delivery_mode", "CI_DEFERRED");
+        } else {
+            result.remove("delivery_mode");
+        }
         if (blocker != null && !blocker.equals("NONE")) {
             result.put("blockers", new ArrayList<>(List.of(blocker)));
         } else if (!"SUCCESS".equals(status)) {
             result.put("blockers", new ArrayList<>(List.of("Codex returned no valid SUCCESS result")));
         } else if (phase == null || !PhaseModel.PHASES.contains(phase)) {
             result.put("blockers", new ArrayList<>(List.of("Codex returned SUCCESS with an invalid next phase")));
-        } else if (!"COMPLETE".equals(evidence)) {
+        } else if (!acceptableEvidence) {
             result.put("blockers", new ArrayList<>(
                     List.of("Codex returned SUCCESS without complete acceptance/validation evidence")));
         } else {

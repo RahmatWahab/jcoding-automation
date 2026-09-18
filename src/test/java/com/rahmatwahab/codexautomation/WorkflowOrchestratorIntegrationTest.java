@@ -112,6 +112,114 @@ class WorkflowOrchestratorIntegrationTest {
         lock.release();
     }
 
+    @Test
+    void ciDeferredFeedbackFixIsCommittedAndPushed(@TempDir Path root) throws Exception {
+        // Robustness regression: when a feedback fix is complete but a heavy E2E
+        // lane must run in CI, the worker returns SUCCESS + DEFERRED_TO_CI +
+        // WAITING_FOR_CI. The controller MUST commit and push the fix (breaking
+        // the old loop where an unvalidated fix was never committed), then wait
+        // for CI. The manual-merge gate is untouched.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        Path prompts = root.resolve("prompts");
+        Files.createDirectories(prompts);
+        Files.writeString(prompts.resolve("common.md"), "COMMON");
+        Files.writeString(prompts.resolve("feedback.md"), "{{COMMON}}\nFix feedback.");
+        Files.createDirectories(root.resolve("state"));
+
+        String head = "abcdef1234567890abcdef1234567890abcdef12";
+        Map<String, Object> prSnapshot = map(
+                "number", 178, "state", "OPEN", "mergedAt", null,
+                "headRefOid", head, "url", "http://x/pr/178",
+                "headRefName", "story/47-x", "reviewDecision", "CHANGES_REQUESTED",
+                "statusCheckRollup", new ArrayList<>(), "reviewThreadsAvailable", true,
+                "comments", new ArrayList<>(),
+                "reviews", List.of(map("author", map("login", "chatgpt-codex-connector"),
+                        "submittedAt", "2026-02-01", "commit", map("oid", head))),
+                "reviewThreads", List.of(map("id", "PRRT_1", "isResolved", false,
+                        "comments", map("nodes", List.of(map("id", "PRRC_1",
+                                "body", "please fix this bug", "createdAt", "2026-01-01",
+                                "author", map("login", "reviewer")))))));
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", false, "delivery_verification_attempts", 1,
+                        "delivery_verification_delay_seconds", 0, "max_feedback_attempts", 99),
+                "budgets", map(),
+                "workflow", map("require_manual_merge", true, "allow_push", true,
+                        "allow_comments", true, "allow_thread_resolution", true));
+
+        Map<String, Object> state = new LinkedHashMap<>();
+        state.put("phase", "FIXING_FEEDBACK");
+        state.put("current_story", 47);
+        state.put("current_pr", 178);
+        state.put("branch", "story/47-x");
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        WorkflowLock lock = WorkflowLock.acquire(root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+        DeliveryGitHub github = new DeliveryGitHub(prSnapshot);
+
+        CodexRunner codex = new CodexRunner(Map.of(), System::nanoTime) {
+            @Override
+            public CodexResult run(Map<String, Object> cfg, Path prompt, Path r, boolean dry,
+                                   Runnable hb, Integer timeout) {
+                return new CodexResult(0,
+                        "RESULT_STATUS: SUCCESS\nRESULT_NEXT_PHASE: WAITING_FOR_CI\n"
+                        + "RESULT_BLOCKER: NONE\nRESULT_EVIDENCE: DEFERRED_TO_CI\n");
+            }
+        };
+
+        // Fake git: dirty story branch, a commit produces the new head, and
+        // local/origin/PR heads converge so delivery verification passes.
+        List<String> gitCalls = new ArrayList<>();
+        GitOperations.GitRunner gitRunner = (r, args) -> {
+            String key = String.join(" ", args);
+            gitCalls.add(key);
+            if (key.startsWith("status --porcelain")) {
+                return new GitOperations.GitResult(0, " M src/impl.txt\n", "");
+            }
+            if (key.startsWith("branch --show-current")) {
+                return new GitOperations.GitResult(0, "story/47-x\n", "");
+            }
+            if (key.startsWith("branch --list")) {
+                return new GitOperations.GitResult(0, "story/47-x\n", "");
+            }
+            if (key.startsWith("rev-parse HEAD")) {
+                return new GitOperations.GitResult(0, head + "\n", "");
+            }
+            if (key.startsWith("ls-remote origin")) {
+                return new GitOperations.GitResult(0, head + "\trefs/heads/story/47-x\n", "");
+            }
+            return new GitOperations.GitResult(0, "", "");
+        };
+        Controller.GitOperationsFactory gitFactory = new Controller.GitOperationsFactory(repo) {
+            @Override
+            public GitOperations create() {
+                return new GitOperations(repo, gitRunner);
+            }
+        };
+
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #47", "url", "http://x/27");
+        WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                config, state, store, github, repo, root, epic, 27, false,
+                gitFactory, codex, new ReviewCoordinator(), lock);
+
+        orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
+
+        // The fix was actually committed and pushed (the core robustness fix).
+        assertThat(gitCalls).anyMatch(c -> c.startsWith("commit -m"));
+        assertThat(gitCalls).anyMatch(c -> c.startsWith("push --set-upstream origin story/47-x"));
+        // And the workflow now waits for CI to validate, not a permanent block.
+        assertThat(state.get("result_status")).isEqualTo("SUCCESS");
+        assertThat(state.get("delivery_mode")).isEqualTo("CI_DEFERRED");
+        assertThat(state.get("phase")).isEqualTo("WAITING_FOR_CI");
+        lock.release();
+    }
+
     private static void runGit(Path repo, String... args) throws Exception {
         List<String> command = new ArrayList<>(List.of("git"));
         command.addAll(List.of(args));

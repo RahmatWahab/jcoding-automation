@@ -158,6 +158,40 @@ and in `config/job-control.json`:
 { "job_start": true }
 ```
 
+> **Commits only happen with `dry_run: false` and `allow_push: true`.** Under
+> `dry_run: true` (or with `allow_push: false`) the worker may edit files, but
+> the controller never commits or pushes them — the working tree changes are
+> intentionally left uncommitted. If you observe a fix that never lands on the
+> PR, verify these two flags first.
+
+### Working tree and branch handling
+
+Before each worker phase the controller checks out the active story branch and
+classifies the working tree, so it never validates or commits while sitting on
+the default branch:
+
+- **Clean** or **controller-owned changes on the story branch** → proceed
+  (interrupted work is resumed in place).
+- **Uncommitted changes on the default branch**, or changes on a branch that is
+  not the active story branch → routed to bounded reconciliation
+  (`reconcile.md`) with a clear operator message, **not** a permanent block.
+
+For the automation to cut a fresh story branch, the base branch (e.g. `main`)
+must be clean. Stray untracked or modified files on the base branch are reported
+for reconciliation; commit them to a branch or remove them, then rerun.
+
+### Deliver-then-CI for heavy validation
+
+Some fixes are complete but cannot finish a heavy end-to-end/integration lane
+within the phase budget. In that case the worker returns
+`RESULT_STATUS: SUCCESS`, `RESULT_EVIDENCE: DEFERRED_TO_CI`, and
+`RESULT_NEXT_PHASE: WAITING_FOR_CI`. The controller then commits and pushes the
+fix and waits for CI to complete the remaining lane, instead of looping on an
+unvalidated-but-uncommitted change. CI and review still gate the PR, and the
+manual-merge gate is preserved — the automation never merges. A worker must use
+`DEFERRED_TO_CI` only when the fix itself is proven by the strongest safe
+in-budget substitute; an unproven fix must report `BLOCKED`.
+
 > Note: this Java build's behavior is validated by an offline, mock-only test
 > suite. Real `gh` responses and the real `codex` worker have not been exercised
 > by automated tests, so a dry-run first launch is the recommended real-world
