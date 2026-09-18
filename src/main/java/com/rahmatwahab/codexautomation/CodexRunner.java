@@ -1,5 +1,8 @@
 package com.rahmatwahab.codexautomation;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
@@ -25,6 +28,8 @@ import java.util.regex.Pattern;
  * the controller's classification contract.</p>
  */
 public class CodexRunner {
+
+    private static final Logger log = LoggerFactory.getLogger(CodexRunner.class);
 
     /** Worker result: process exit code plus captured (unredacted) output. */
     public record CodexResult(int exitCode, String output) {
@@ -108,12 +113,12 @@ public class CodexRunner {
         List<String> command = buildCommand(codex, repo);
 
         if (dryRun) {
-            System.out.println("DRY RUN: Codex invocation suppressed");
-            System.out.println("DRY RUN COMMAND: " + String.join(" ", command) + " < " + prompt);
+            log.info("DRY RUN: Codex invocation suppressed");
+            log.info("DRY RUN COMMAND: " + String.join(" ", command) + " < " + prompt);
             return new CodexResult(0, "");
         }
 
-        System.out.println("CODEX START: model=" + Engine.asString(codex.getOrDefault("model", "default"))
+        log.info("CODEX START: model=" + Engine.asString(codex.getOrDefault("model", "default"))
                 + " reasoning=" + Engine.asString(codex.getOrDefault("reasoning_effort", "default"))
                 + " prompt=" + prompt);
 
@@ -130,7 +135,7 @@ public class CodexRunner {
                     .redirectErrorStream(true);
             process = builder.start();
         } catch (IOException exc) {
-            System.out.println("CODEX END: unavailable executable=" + command.get(0));
+            log.info("CODEX END: unavailable executable=" + command.get(0));
             return new CodexResult(127, "Codex executable unavailable: " + command.get(0) + "\n");
         }
 
@@ -154,7 +159,7 @@ public class CodexRunner {
                 }
                 long nowMillis = monotonicMillis.get();
                 if (nowMillis - lastProgress >= (long) progressInterval * 1000L) {
-                    System.out.println("CODEX HEARTBEAT: pid=" + process.pid()
+                    log.debug("CODEX HEARTBEAT: pid=" + process.pid()
                             + " elapsed_seconds=" + ((nowMillis - (deadline - (long) timeout * 1000L)) / 1000L));
                     lastProgress = nowMillis;
                 }
@@ -162,7 +167,7 @@ public class CodexRunner {
                     process.destroyForcibly();
                     String remainder = drain(reader);
                     output.append(remainder);
-                    System.out.println("CODEX END: timeout");
+                    log.info("CODEX END: timeout");
                     return new CodexResult(124, output + "\nCodex execution timed out\n");
                 }
                 if (reader.ready()) {
@@ -183,7 +188,7 @@ public class CodexRunner {
         }
         waitQuietly(process);
         int code = process.exitValue();
-        System.out.println("CODEX END: exit_code=" + code);
+        log.info("CODEX END: exit_code=" + code);
         return new CodexResult(code, output.toString());
     }
 

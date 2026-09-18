@@ -155,6 +155,24 @@ class GitHubTest {
         assertThat(((Map<?, ?>) result).get("number")).isEqualTo(7);
     }
 
+    // -- real runner: large output must not deadlock (regression) ------------
+
+    @Test
+    void defaultRunnerHandlesOutputLargerThanPipeBuffer() {
+        // Regression for the pipe-buffer deadlock: a subprocess that writes far
+        // more than the OS pipe buffer (~64 KB) must be fully read without
+        // hanging. Exercises the real production runner (GitHub.defaultRunner).
+        GitHub shell = new GitHub("owner", "repo", "GH_TOKEN", "/bin/sh", 30,
+                GitHub.defaultRunner(), name -> "token");
+        // Produce >1 MB of non-JSON text (so run() returns the raw string rather
+        // than parsing a leading token). Far exceeds the OS pipe buffer, so a
+        // non-draining reader would deadlock and hit the 30s timeout.
+        String script = "seq 1 200000 | sed 's/^/line-/'";
+        Object out = shell.run("-c", script);
+        assertThat(out).isInstanceOf(String.class);
+        assertThat(((String) out).length()).isGreaterThan(500000);
+    }
+
     // -- pr() review-thread aggregation and fail-closed behavior -------------
 
     @Test

@@ -1,5 +1,8 @@
 package com.rahmatwahab.codexautomation;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.IOException;
@@ -24,6 +27,8 @@ import java.util.Map;
  * preserved; the job-control gate is JSON per the migration decision.</p>
  */
 public final class Controller {
+
+    private static final Logger log = LoggerFactory.getLogger(Controller.class);
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() { };
@@ -111,14 +116,14 @@ public final class Controller {
             config = Config.load(root.resolve(options.configPath()));
             Config.validate(config);
         } catch (IOException | RuntimeException exc) {
-            System.err.println("BLOCKED_CONFIGURATION: " + exc.getMessage());
+            log.error("BLOCKED_CONFIGURATION: " + exc.getMessage());
             return 1;
         }
 
         int epicNumber = Engine.asInt(Config.section(config, "epic").get("number"));
 
         if (!options.forceRun() && !readJobControl(root.resolve(options.jobControlPath()))) {
-            System.out.println("SKIPPED: job_start is not true");
+            log.info("SKIPPED: job_start is not true");
             return 0;
         }
 
@@ -145,7 +150,7 @@ public final class Controller {
             } catch (RuntimeException ignored) {
                 // If state cannot be read, still report the skip without detail.
             }
-            System.out.println("SKIPPED: another automation run is active;" + detail);
+            log.info("SKIPPED: another automation run is active;" + detail);
             return 0;
         }
 
@@ -156,11 +161,11 @@ public final class Controller {
 
             if (StateRecovery.repairLegacyQuotaState(state)) {
                 store.save(state);
-                System.out.println("RECOVERY: repaired false PAUSED_QUOTA state from signal termination");
+                log.info("RECOVERY: repaired false PAUSED_QUOTA state from signal termination");
             }
             int abandoned = store.recoverAbandonedJobs();
             if (abandoned > 0) {
-                System.out.println("RECOVERY: marked " + abandoned + " abandoned worker job(s) cancelled");
+                log.info("RECOVERY: marked " + abandoned + " abandoned worker job(s) cancelled");
             }
 
             // Recover a watchdog forced-termination event, if one was recorded.
@@ -168,7 +173,7 @@ public final class Controller {
             if (Files.exists(watchdogEvent)) {
                 try {
                     state.put("watchdog_event", MAPPER.readValue(Files.readString(watchdogEvent), MAP_TYPE));
-                    System.out.println("WATCHDOG: forced termination recovered: " + state.get("watchdog_event"));
+                    log.info("WATCHDOG: forced termination recovered: " + state.get("watchdog_event"));
                     Files.deleteIfExists(watchdogEvent);
                 } catch (IOException | RuntimeException exc) {
                     Map<String, Object> fallback = new LinkedHashMap<>();
@@ -187,7 +192,7 @@ public final class Controller {
             lock.refresh();
 
             if ("PAUSED_QUOTA".equals(state.get("phase")) && !due(Engine.asString(state.get("retry_at")))) {
-                System.out.println("PAUSED_QUOTA: retry at " + state.get("retry_at"));
+                log.info("PAUSED_QUOTA: retry at " + state.get("retry_at"));
                 return 0;
             }
 
@@ -196,7 +201,7 @@ public final class Controller {
                 state.put("phase", "BLOCKED_REPOSITORY");
                 state.put("error", "Git repository not found: " + repo);
                 store.save(state);
-                System.err.println(state.get("error"));
+                log.error(String.valueOf(state.get("error")));
                 return 1;
             }
 
@@ -212,16 +217,16 @@ public final class Controller {
             List<Map<String, Object>> prs;
             try {
                 lock.refresh();
-                System.out.println("PHASE: GitHub issue read #" + epicNumber);
+                log.info("PHASE: GitHub issue read #" + epicNumber);
                 epic = asMap(github.issue(epicNumber));
-                System.out.println("PHASE: GitHub PR list");
+                log.info("PHASE: GitHub PR list");
                 prs = asMapList(github.prs());
                 state.remove("error");
             } catch (GitHubError exc) {
                 state.put("phase", "BLOCKED_EXTERNAL");
                 state.put("error", exc.getMessage());
                 store.save(state);
-                System.err.println("BLOCKED: GitHub unavailable: " + exc.getMessage());
+                log.error("BLOCKED: GitHub unavailable: " + exc.getMessage());
                 return 1;
             }
 
@@ -232,7 +237,7 @@ public final class Controller {
                     new ReviewCoordinator(), lock);
             return orchestrator.reconcileAndExecute(prs, options.prompt());
         } catch (RuntimeException exc) {
-            System.err.println("BLOCKED: unexpected controller error: " + exc.getMessage());
+            log.error("BLOCKED: unexpected controller error: " + exc.getMessage());
             return 1;
         } finally {
             lock.release(lockToken);

@@ -95,6 +95,10 @@ scripts/run_once.sh
 
 # Bypass the gate for a manual run (still respects dry_run).
 scripts/run_once.sh --force-run
+
+# Verbose (DEBUG) logging, including per-call GitHub durations.
+scripts/run_once.sh --verbose
+scripts/run_once.sh --verbose --force-run
 ```
 
 You can also run the built launcher directly:
@@ -176,7 +180,7 @@ manual merge gate.
 ## Operational scripts
 
 - `scripts/cron-launcher.sh` — loads secrets from the mode-600 env file and launches a run.
-- `scripts/run_once.sh` — one-shot execution under `setsid` with timestamped logs.
+- `scripts/run_once.sh` — one-shot execution under `setsid` with timestamped logs (`--verbose` for DEBUG, `--force-run` to bypass the job gate).
 - `scripts/install-cron.sh` — installs the marked crontab block from `cron-policy.json`.
 - `scripts/healthcheck.sh` — non-mutating operational health check.
 - `scripts/log-housekeeping.sh` — daily log rotation and bounded retention.
@@ -186,6 +190,39 @@ Run the health check any time:
 ```bash
 scripts/healthcheck.sh
 ```
+
+## Logging and observability
+
+Logging uses SLF4J with Logback to the console (captured by `run_once.sh` into a
+timestamped file under `logs/`). Every line carries a UTC ISO-8601 timestamp,
+level, and logger name:
+
+```
+2026-09-18T13:15:23.500Z DEBUG GitHub - GH CALL: issue view took 642 ms (exit 0, 123808 bytes)
+2026-09-18T13:15:25.904Z INFO  WorkflowOrchestrator - PHASE ENTER: VERIFYING story=#45 pr=#177 attempt=2 budget=1800s prompt=verify.md
+```
+
+Default level is `INFO`. Enable `DEBUG` for a single run with the `--verbose`
+flag, or set the JVM property directly:
+
+```bash
+scripts/run_once.sh --verbose
+# or, running the launcher directly:
+JAVA_OPTS="-Dlog.level=DEBUG" build/install/jcoding-automation/bin/jcoding-automation ...
+```
+
+What the logs surface:
+
+- **GitHub call durations** — each `gh` call logs its subcommand and elapsed
+  time (`GH CALL: ...`). Calls slower than 5 s log a `GH CALL SLOW` warning, and
+  a timed-out call logs `GH CALL TIMEOUT` with the elapsed time. Useful for
+  spotting slow or hanging API calls.
+- **Phase context and duration** — `PHASE ENTER` records the phase, story, PR,
+  attempt, and budget; `PHASE EXIT` records the exit code and elapsed time.
+- **Wait reasons** — `WAITING: ... reason=... reviewDecision=... ciChecks=...`
+  explains why the workflow is waiting without inspecting the state file.
+- **Recovery and safety events** — lock recovery, watchdog termination, quota
+  pauses, conflicts, and blocked states are logged at `INFO`/`ERROR`.
 
 ## Build and test
 

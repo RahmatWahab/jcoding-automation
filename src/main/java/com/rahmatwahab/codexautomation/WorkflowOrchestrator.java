@@ -1,5 +1,8 @@
 package com.rahmatwahab.codexautomation;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -20,6 +23,8 @@ import java.util.Set;
  * execution, result application, delivery verification, and thread updates.</p>
  */
 final class WorkflowOrchestrator {
+
+    private static final Logger log = LoggerFactory.getLogger(WorkflowOrchestrator.class);
 
     private final Map<String, Object> config;
     private final Map<String, Object> state;
@@ -108,7 +113,7 @@ final class WorkflowOrchestrator {
                     state.put("phase", "EPIC_COMPLETE");
                     state.put("message", "No eligible incomplete stories remain");
                     save();
-                    System.out.println("EPIC COMPLETE");
+                    log.info("EPIC COMPLETE");
                     return 0;
                 }
                 current = Engine.asInt(selected.get("number"));
@@ -132,7 +137,7 @@ final class WorkflowOrchestrator {
                 state.put("current_pr", currentPr.get("number"));
                 state.put("current_pr_url", currentPr.get("url"));
                 state.put("branch", currentPr.get("headRefName"));
-                System.out.println("PR ADOPTED: story #" + current + ", PR #" + currentPr.get("number"));
+                log.info("PR ADOPTED: story #" + current + ", PR #" + currentPr.get("number"));
             }
         }
 
@@ -150,7 +155,7 @@ final class WorkflowOrchestrator {
                 state.put("phase", "BLOCKED_REQUIREMENTS");
                 state.put("error", "Current story #" + current + " is no longer an eligible linked open story");
                 save();
-                System.err.println("BLOCKED: " + state.get("error"));
+                log.error("BLOCKED: " + state.get("error"));
                 return 1;
             }
             state.put("current_story_url", currentIssue.get("url"));
@@ -158,7 +163,7 @@ final class WorkflowOrchestrator {
                     currentIssue.getOrDefault("title", state.getOrDefault("current_story_title", "")));
             if (currentPr == null && StateRecovery.clearStaleStorySelectionState(state)) {
                 save();
-                System.out.println("RECOVERY: cleared stale story-selection blocker for story #" + current);
+                log.info("RECOVERY: cleared stale story-selection blocker for story #" + current);
             }
             Set<Integer> completed = completedStories();
             for (int dependency : Engine.storyDependencies(currentIssue)) {
@@ -175,7 +180,7 @@ final class WorkflowOrchestrator {
                     state.put("phase", "BLOCKED_REQUIREMENTS");
                     state.put("error", "Story #" + current + " dependency #" + dependency + " is not complete");
                     save();
-                    System.err.println("BLOCKED: " + state.get("error"));
+                    log.error("BLOCKED: " + state.get("error"));
                     return 1;
                 }
             }
@@ -201,7 +206,7 @@ final class WorkflowOrchestrator {
         // PR-scoped reconciliation and wait/merge/blocked short-circuits.
         if (currentPr != null) {
             try {
-                System.out.println("PHASE: GitHub PR detail #" + currentPr.get("number"));
+                log.info("PHASE: GitHub PR detail #" + currentPr.get("number"));
                 currentPr = github.pr(Engine.asInt(currentPr.get("number")));
             } catch (GitHubError exc) {
                 return blockedExternal("Unable to inspect PR: " + exc.getMessage());
@@ -229,7 +234,7 @@ final class WorkflowOrchestrator {
                             github.resolveThread(Engine.asString(thread.get("id")));
                             recordThreadUpdate(Engine.asString(thread.get("id")), head,
                                     "RESOLVED_AFTER_DELIVERED_REPLY");
-                            System.out.println("PR THREAD RESOLVED: " + thread.get("id") + " (recovered)");
+                            log.info("PR THREAD RESOLVED: " + thread.get("id") + " (recovered)");
                         } catch (GitHubError exc) {
                             return blockedExternal("Unable to resolve delivered review feedback: " + exc.getMessage());
                         }
@@ -268,7 +273,7 @@ final class WorkflowOrchestrator {
 
             try {
                 if (review.ensureCodexReviewTrigger(github, currentPr, state, workflow, dryRun, this::save)) {
-                    System.out.println("PR COMMENT POSTED: @codex review on PR #" + currentPr.get("number"));
+                    log.info("PR COMMENT POSTED: @codex review on PR #" + currentPr.get("number"));
                 }
             } catch (GitHubError exc) {
                 return blockedExternal("Unable to post Codex review trigger: " + exc.getMessage());
@@ -279,7 +284,7 @@ final class WorkflowOrchestrator {
                 state.put("review_gate_head", currentPr.get("headRefOid"));
                 state.put("next_action", "WAIT_FOR_CODEX_REVIEW");
                 save();
-                System.out.println("WAITING: story #" + current + ", phase=WAITING_FOR_CODEX_REVIEW");
+                log.info("WAITING: story #" + current + ", phase=WAITING_FOR_CODEX_REVIEW");
                 return 0;
             }
             // The gate has closed for this head; record the connector review.
@@ -302,18 +307,22 @@ final class WorkflowOrchestrator {
                     state.put("last_processed_commit", currentPr.get("headRefOid"));
                 }
                 save();
-                System.out.println("WAITING: story #" + current + ", phase=" + state.get("phase"));
+                log.info("WAITING: story #{} phase={} reason={} reviewDecision={} ciChecks={} head={}",
+                        current, state.get("phase"), waitReason(state.get("phase"), currentPr),
+                        Engine.asString(currentPr.get("reviewDecision")),
+                        Engine.asList(currentPr.get("statusCheckRollup")).size(),
+                        shortSha(currentPr.get("headRefOid")));
                 return 0;
             }
             if (phase.equals("MERGED")) {
                 advanceStory(current);
                 save();
-                System.out.println("MERGED: story #" + current + "; next run may select another story");
+                log.info("MERGED: story #" + current + "; next run may select another story");
                 return 0;
             }
             if (Set.of("BLOCKED_EXTERNAL", "CONFLICT_DETECTED").contains(phase)) {
                 save();
-                System.out.println("STOPPED: story #" + current + ", phase=" + state.get("phase"));
+                log.info("STOPPED: story #" + current + ", phase=" + state.get("phase"));
                 return 1;
             }
         }
@@ -326,7 +335,7 @@ final class WorkflowOrchestrator {
             state.put("phase", "BLOCKED_CONFIGURATION");
             state.put("error", "Prompt not found: " + prompt);
             save();
-            System.err.println(state.get("error"));
+            log.error(String.valueOf(state.get("error")));
             return 1;
         }
 
@@ -337,7 +346,7 @@ final class WorkflowOrchestrator {
             state.put("phase", "BLOCKED_REPOSITORY");
             state.put("error", "Unsafe working tree: " + exc.getMessage());
             save();
-            System.err.println("BLOCKED: Unsafe working tree: " + exc.getMessage());
+            log.error("BLOCKED: Unsafe working tree: " + exc.getMessage());
             return 1;
         }
 
@@ -358,12 +367,12 @@ final class WorkflowOrchestrator {
                 state.put("base_commit", prepared.baseHead());
                 state.put("worktree_baseline", prepared.baseHead());
                 save();
-                System.out.println("BRANCH READY: " + prepared.branch() + " from " + prepared.baseHead());
+                log.info("BRANCH READY: " + prepared.branch() + " from " + prepared.baseHead());
             } catch (RuntimeException exc) {
                 state.put("phase", "BLOCKED_REPOSITORY");
                 state.put("error", "Unable to prepare synchronized story branch: " + exc.getMessage());
                 save();
-                System.err.println("BLOCKED: " + state.get("error"));
+                log.error("BLOCKED: " + state.get("error"));
                 return 1;
             }
         }
@@ -407,8 +416,18 @@ final class WorkflowOrchestrator {
             lock.refresh();
             store.heartbeatJob(jobId, "codex pid active; phase=" + executionPhase);
         };
+        log.info("PHASE ENTER: {} story=#{} pr=#{} attempt={} budget={}s prompt={}",
+                executionPhase, current,
+                currentPr == null ? "none" : currentPr.get("number"),
+                state.get("phase_attempt"),
+                phaseBudget == null ? "default" : phaseBudget,
+                prompt.getFileName());
+        long phaseStartNanos = System.nanoTime();
         CodexRunner.CodexResult result = codexRunner.run(config, renderedPrompt, repo, dryRun,
                 heartbeat, phaseBudget);
+        long phaseElapsedMs = (System.nanoTime() - phaseStartNanos) / 1_000_000L;
+        log.info("PHASE EXIT: {} exit_code={} elapsed={}ms", executionPhase,
+                result.exitCode(), phaseElapsedMs);
         lock.refresh();
 
         String workerStatus = result.exitCode() == 0 ? "SUCCEEDED"
@@ -439,7 +458,7 @@ final class WorkflowOrchestrator {
                     state.put("current_pr_url", currentPr.get("url"));
                     state.put("current_pr_head", currentPr.get("headRefOid"));
                     state.put("branch", currentPr.get("headRefName"));
-                    System.out.println("PR ADOPTED AFTER CODEX: story #" + current
+                    log.info("PR ADOPTED AFTER CODEX: story #" + current
                             + ", PR #" + currentPr.get("number"));
                     review.ensureCodexReviewTrigger(github, currentPr, state, workflow, dryRun, this::save);
                 }
@@ -477,7 +496,7 @@ final class WorkflowOrchestrator {
                 state.put("exit_code", result.exitCode());
                 state.put("run_finished_at", Controller.now());
                 save();
-                System.out.println("RECONCILIATION REJECTED: " + outcome.detail());
+                log.info("RECONCILIATION REJECTED: " + outcome.detail());
                 return 1;
             }
             Map<String, String> parsed = StateRecovery.parseResult(result.output());
@@ -488,7 +507,7 @@ final class WorkflowOrchestrator {
             state.put("exit_code", result.exitCode());
             state.put("run_finished_at", Controller.now());
             save();
-            System.out.println("RECONCILIATION ACCEPTED: " + state.get("decision_action") + " — " + outcome.detail());
+            log.info("RECONCILIATION ACCEPTED: " + state.get("decision_action") + " — " + outcome.detail());
             return 0;
         }
 
@@ -579,7 +598,7 @@ final class WorkflowOrchestrator {
             state.put("error", "Codex declared review IDs that are not present in the "
                     + "authoritative PR thread snapshot: " + String.join(", ", sorted));
             save();
-            System.err.println("BLOCKED: " + state.get("error"));
+            log.error("BLOCKED: " + state.get("error"));
             return 1;
         }
 
@@ -606,13 +625,13 @@ final class WorkflowOrchestrator {
                                     ReviewCoordinator.threadFixReply(thread, deliveredCommit, output));
                             recordThreadUpdate(threadId, deliveredCommit, "REPLIED");
                             save();
-                            System.out.println("PR THREAD REPLIED: " + threadId);
+                            log.info("PR THREAD REPLIED: " + threadId);
                         }
                         if (Engine.asBool(workflow.get("allow_thread_resolution"), false)) {
                             github.resolveThread(threadId);
                             recordThreadUpdate(threadId, deliveredCommit, "RESOLVED");
                             save();
-                            System.out.println("PR THREAD RESOLVED: " + threadId);
+                            log.info("PR THREAD RESOLVED: " + threadId);
                         }
                     }
                 }
@@ -745,7 +764,7 @@ final class WorkflowOrchestrator {
         state.put("phase", "CONFLICT_DETECTED");
         state.put("error", message);
         save();
-        System.err.println("CONFLICT_DETECTED: " + message);
+        log.error("CONFLICT_DETECTED: " + message);
         return 1;
     }
 
@@ -753,12 +772,29 @@ final class WorkflowOrchestrator {
         state.put("phase", "BLOCKED_EXTERNAL");
         state.put("error", message);
         save();
-        System.err.println("BLOCKED: " + message);
+        log.error("BLOCKED: " + message);
         return 1;
     }
 
     private static String tail(String text, int max) {
         return text.length() <= max ? text : text.substring(text.length() - max);
+    }
+
+    /** Human-readable reason for a WAITING phase, for operator logs. */
+    private static String waitReason(Object phase, Map<String, Object> pr) {
+        String p = String.valueOf(phase);
+        return switch (p) {
+            case "WAITING_FOR_CI" -> "CI checks in progress";
+            case "WAITING_FOR_CODEX_REVIEW" -> "awaiting Codex connector review of current head";
+            case "WAITING_FOR_HUMAN_REVIEW" -> "awaiting human review";
+            case "READY_TO_MERGE", "WAITING_FOR_MANUAL_MERGE" -> "approved; manual merge gate";
+            default -> "waiting";
+        };
+    }
+
+    private static String shortSha(Object sha) {
+        String s = sha == null ? "" : String.valueOf(sha);
+        return s.length() <= 12 ? s : s.substring(0, 12);
     }
 
     @SuppressWarnings("unchecked")

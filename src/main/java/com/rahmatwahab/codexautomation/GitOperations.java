@@ -293,12 +293,39 @@ public final class GitOperations {
         try {
             ProcessBuilder builder = new ProcessBuilder(command).directory(repo.toFile());
             Process process = builder.start();
-            String stdout = new String(process.getInputStream().readAllBytes());
-            String stderr = new String(process.getErrorStream().readAllBytes());
+            // Drain both streams concurrently to avoid a pipe-buffer deadlock
+            // when git produces large output (reading one stream fully while
+            // the other fills its buffer would hang).
+            java.io.ByteArrayOutputStream outBuffer = new java.io.ByteArrayOutputStream();
+            java.io.ByteArrayOutputStream errBuffer = new java.io.ByteArrayOutputStream();
+            Thread outReader = pump(process.getInputStream(), outBuffer);
+            Thread errReader = pump(process.getErrorStream(), errBuffer);
+            outReader.start();
+            errReader.start();
             int code = process.waitFor();
-            return new GitResult(code, stdout, stderr);
+            outReader.join();
+            errReader.join();
+            return new GitResult(code,
+                    outBuffer.toString(java.nio.charset.StandardCharsets.UTF_8),
+                    errBuffer.toString(java.nio.charset.StandardCharsets.UTF_8));
         } catch (Exception exc) {
             throw new IllegalStateException("failed to run git " + String.join(" ", args), exc);
         }
+    }
+
+    private static Thread pump(java.io.InputStream source, java.io.ByteArrayOutputStream sink) {
+        Thread thread = new Thread(() -> {
+            byte[] chunk = new byte[8192];
+            int read;
+            try {
+                while ((read = source.read(chunk)) != -1) {
+                    sink.write(chunk, 0, read);
+                }
+            } catch (java.io.IOException ignored) {
+                // stream closed on process exit
+            }
+        });
+        thread.setDaemon(true);
+        return thread;
     }
 }

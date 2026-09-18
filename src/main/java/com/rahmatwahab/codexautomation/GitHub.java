@@ -2,6 +2,7 @@ package com.rahmatwahab.codexautomation;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -16,6 +17,8 @@ import java.util.concurrent.TimeUnit;
  * the configured CLI. No test in this project ever contacts real GitHub.</p>
  */
 public class GitHub {
+
+    private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(GitHub.class);
 
     /** Result of a CLI invocation: exit code and captured streams. */
     public static final class CommandResult {
@@ -94,11 +97,24 @@ public class GitHub {
             command.add(arg);
         }
         CommandResult result;
+        long startNanos = System.nanoTime();
+        String label = args.length >= 2 ? args[0] + " " + args[1] : (args.length == 1 ? args[0] : cli);
         try {
             result = runner.run(command, timeoutSeconds);
         } catch (CommandTimeout exc) {
+            long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
+            log.error("GH CALL TIMEOUT: {} after {} ms (limit {} s)", label, elapsedMs, timeoutSeconds);
             throw new GitHubError("GitHub command timed out after " + timeoutSeconds
                     + " seconds: " + cli, exc);
+        }
+        long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
+        int outSize = result.stdout.length();
+        if (elapsedMs >= 5000) {
+            log.warn("GH CALL SLOW: {} took {} ms (exit {}, {} bytes)", label, elapsedMs,
+                    result.returnCode, outSize);
+        } else {
+            log.debug("GH CALL: {} took {} ms (exit {}, {} bytes)", label, elapsedMs,
+                    result.returnCode, outSize);
         }
         if (result.returnCode != 0) {
             String message = !result.stderr.strip().isEmpty()
@@ -293,25 +309,60 @@ public class GitHub {
     }
 
     /** Production runner: shells out to the configured CLI with a timeout. */
-    private static CommandRunner defaultRunner() {
+    static CommandRunner defaultRunner() {
         return (command, timeoutSeconds) -> {
             ProcessBuilder builder = new ProcessBuilder(command);
+            Process process;
             try {
-                Process process = builder.start();
+                process = builder.start();
+            } catch (IOException exc) {
+                throw new GitHubError("failed to execute command: " + command.get(0), exc);
+            }
+            // Drain stdout and stderr concurrently. A subprocess that produces
+            // more output than the OS pipe buffer holds (e.g. a large EPIC body)
+            // blocks on write until its streams are read; reading only after
+            // waitFor() would deadlock. Reader threads consume in parallel.
+            java.io.ByteArrayOutputStream outBuffer = new java.io.ByteArrayOutputStream();
+            java.io.ByteArrayOutputStream errBuffer = new java.io.ByteArrayOutputStream();
+            Thread outReader = streamPump(process.getInputStream(), outBuffer);
+            Thread errReader = streamPump(process.getErrorStream(), errBuffer);
+            outReader.start();
+            errReader.start();
+            try {
                 boolean finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS);
                 if (!finished) {
                     process.destroyForcibly();
+                    process.waitFor();
                     throw new CommandTimeout("command timed out");
                 }
-                String stdout = new String(process.getInputStream().readAllBytes());
-                String stderr = new String(process.getErrorStream().readAllBytes());
-                return new CommandResult(process.exitValue(), stdout, stderr);
-            } catch (IOException exc) {
-                throw new GitHubError("failed to execute command: " + command.get(0), exc);
+                // Ensure all buffered output is fully consumed after exit.
+                outReader.join(TimeUnit.SECONDS.toMillis(5));
+                errReader.join(TimeUnit.SECONDS.toMillis(5));
+                return new CommandResult(process.exitValue(),
+                        outBuffer.toString(StandardCharsets.UTF_8),
+                        errBuffer.toString(StandardCharsets.UTF_8));
             } catch (InterruptedException exc) {
+                process.destroyForcibly();
                 Thread.currentThread().interrupt();
                 throw new GitHubError("interrupted while executing command", exc);
             }
         };
+    }
+
+    /** A daemon thread that copies an input stream into a buffer until EOF. */
+    private static Thread streamPump(java.io.InputStream source, java.io.ByteArrayOutputStream sink) {
+        Thread thread = new Thread(() -> {
+            byte[] chunk = new byte[8192];
+            int read;
+            try {
+                while ((read = source.read(chunk)) != -1) {
+                    sink.write(chunk, 0, read);
+                }
+            } catch (IOException ignored) {
+                // Stream closed on process termination; stop draining.
+            }
+        });
+        thread.setDaemon(true);
+        return thread;
     }
 }
