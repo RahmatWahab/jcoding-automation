@@ -176,6 +176,96 @@ class GitOperationsTest {
                 .hasMessageContaining("feature branch");
     }
 
+    // -- checkout_story_branch -----------------------------------------------
+
+    @Test
+    void checkoutStoryBranchSwitchesToExistingLocalBranch() {
+        FakeGit git = new FakeGit();
+        git.outputs.put("branch --show-current", "main\n");
+        git.outputs.put("branch --list", "story/47-net\n");
+        GitOperations ops = new GitOperations(Path.of("/repo"), git);
+        assertThat(ops.checkoutStoryBranch("story/47-net")).isTrue();
+        assertThat(git.hasCall("fetch", "origin", "story/47-net")).isTrue();
+        assertThat(git.hasCall("switch", "story/47-net")).isTrue();
+    }
+
+    @Test
+    void checkoutStoryBranchCreatesTrackingBranchWhenMissingLocally() {
+        FakeGit git = new FakeGit();
+        git.outputs.put("branch --show-current", "main\n");
+        git.outputs.put("branch --list", ""); // no local branch yet
+        GitOperations ops = new GitOperations(Path.of("/repo"), git);
+        assertThat(ops.checkoutStoryBranch("story/47-net")).isTrue();
+        assertThat(git.hasCall("checkout", "-B", "story/47-net", "origin/story/47-net")).isTrue();
+    }
+
+    @Test
+    void checkoutStoryBranchIsNoOpWhenAlreadyOnBranch() {
+        FakeGit git = new FakeGit();
+        git.outputs.put("branch --show-current", "story/47-net\n");
+        GitOperations ops = new GitOperations(Path.of("/repo"), git);
+        assertThat(ops.checkoutStoryBranch("story/47-net")).isTrue();
+        assertThat(git.hasCall("switch", "story/47-net")).isFalse();
+        assertThat(git.hasCall("checkout", "-B", "story/47-net")).isFalse();
+    }
+
+    @Test
+    void checkoutStoryBranchReturnsFalseForBlankBranch() {
+        FakeGit git = new FakeGit();
+        GitOperations ops = new GitOperations(Path.of("/repo"), git);
+        assertThat(ops.checkoutStoryBranch("")).isFalse();
+        assertThat(git.calls).isEmpty();
+    }
+
+    @Test
+    void checkoutStoryBranchRefusesDefaultBranch() {
+        FakeGit git = new FakeGit();
+        GitOperations ops = new GitOperations(Path.of("/repo"), git);
+        assertThatThrownBy(() -> ops.checkoutStoryBranch("main"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("default branch");
+    }
+
+    // -- classify_worktree (non-throwing recovery routing) -------------------
+
+    @Test
+    void classifyWorktreeReturnsCleanWhenNoChanges() {
+        FakeGit git = new FakeGit().output("status --porcelain", "");
+        GitOperations ops = new GitOperations(Path.of("/repo"), git);
+        assertThat(ops.classifyWorktree(map())).isEqualTo(GitOperations.WorktreeState.CLEAN);
+    }
+
+    @Test
+    void classifyWorktreeReportsDirtyDefaultBranchWithoutThrowing() {
+        FakeGit git = new FakeGit();
+        git.outputs.put("status --porcelain", "?? migration-updates/\n");
+        git.outputs.put("branch --show-current", "main\n");
+        GitOperations ops = new GitOperations(Path.of("/repo"), git);
+        // This is exactly the stuck-repo scenario: it must classify, not throw.
+        assertThat(ops.classifyWorktree(map("branch", "story/47-net", "current_story", 47)))
+                .isEqualTo(GitOperations.WorktreeState.DIRTY_DEFAULT_BRANCH);
+    }
+
+    @Test
+    void classifyWorktreeReportsRecoverableStoryBranch() {
+        FakeGit git = new FakeGit();
+        git.outputs.put("status --porcelain", " M src/file.txt\n");
+        git.outputs.put("branch --show-current", "story/47-net\n");
+        GitOperations ops = new GitOperations(Path.of("/repo"), git);
+        assertThat(ops.classifyWorktree(map("branch", "story/47-net", "current_story", 47)))
+                .isEqualTo(GitOperations.WorktreeState.RECOVERABLE_STORY_BRANCH);
+    }
+
+    @Test
+    void classifyWorktreeReportsDirtyUnknownBranch() {
+        FakeGit git = new FakeGit();
+        git.outputs.put("status --porcelain", " M src/file.txt\n");
+        git.outputs.put("branch --show-current", "story/99-unrelated\n");
+        GitOperations ops = new GitOperations(Path.of("/repo"), git);
+        assertThat(ops.classifyWorktree(map("branch", "story/47-net", "current_story", 47)))
+                .isEqualTo(GitOperations.WorktreeState.DIRTY_UNKNOWN_BRANCH);
+    }
+
     // -- verify_delivered_head_with_retry ------------------------------------
 
     @Test

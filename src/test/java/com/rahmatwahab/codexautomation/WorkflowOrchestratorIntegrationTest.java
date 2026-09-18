@@ -420,4 +420,169 @@ class WorkflowOrchestratorIntegrationTest {
         assertThat((String) state.get("error")).contains("manual review required");
         lock.release();
     }
+
+    @Test
+    void blockedFeedbackVerdictEscalatesImmediately(@TempDir Path root) throws Exception {
+        // If the previous FIXING_FEEDBACK run returned BLOCKED on this head, the
+        // controller must escalate to human review, not re-dispatch the worker.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q");
+        Files.createDirectories(root.resolve("prompts"));
+        Files.writeString(root.resolve("prompts").resolve("common.md"), "COMMON");
+        Files.writeString(root.resolve("prompts").resolve("reconcile.md"), "{{COMMON}}\nReconcile.");
+        Files.createDirectories(root.resolve("state"));
+
+        String head = "abc123def456";
+        Map<String, Object> prSnapshot = map(
+                "number", 178, "state", "OPEN", "mergedAt", null,
+                "headRefOid", head, "headRefName", "story/47-x", "url", "http://x/pr/178",
+                "reviewDecision", "", "statusCheckRollup", new ArrayList<>(),
+                "reviewThreadsAvailable", true, "comments", new ArrayList<>(),
+                "reviews", List.of(map("author", map("login", "chatgpt-codex-connector"),
+                        "submittedAt", "2026-02-01", "commit", map("oid", head))),
+                "reviewThreads", List.of(map("id", "PRRT_1", "isResolved", false,
+                        "comments", map("nodes", List.of(map("id", "PRRC_1",
+                                "body", "please fix this bug", "createdAt", "2026-01-01",
+                                "author", map("login", "reviewer")))))));
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", true, "max_feedback_attempts", 99),
+                "budgets", map(),
+                "workflow", map("require_manual_merge", true));
+
+        Map<String, Object> state = new LinkedHashMap<>();
+        state.put("phase", "FIXING_FEEDBACK");
+        state.put("current_story", 47);
+        state.put("current_pr", 178);
+        state.put("branch", "story/47-x");
+        // Previous run's worker returned BLOCKED on this exact head.
+        state.put("last_feedback_result", "BLOCKED");
+        state.put("last_feedback_result_head", head);
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        WorkflowLock lock = WorkflowLock.acquire(root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+        DeliveryGitHub github = new DeliveryGitHub(prSnapshot);
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #47", "url", "http://x/27");
+
+        WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                config, state, store, github, repo, root, epic, 27, true,
+                new Controller.GitOperationsFactory(repo), new CodexRunner(),
+                new ReviewCoordinator(), lock);
+
+        int code = orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
+
+        // A repeated BLOCKED feedback verdict routes to reconciliation rather
+        // than re-dispatching feedback. In dry-run the reconcile worker returns
+        // no decision, so the phase remains a blocked/reconcile state (not
+        // FIXING_FEEDBACK), proving the loop is broken.
+        assertThat(Engine.asString(state.get("phase"))).isIn("BLOCKED_REQUIREMENTS", "RECONCILING", "BLOCKED_EXTERNAL");
+        assertThat(Engine.asString(state.get("phase"))).isNotEqualTo("FIXING_FEEDBACK");
+        lock.release();
+    }
+
+    @Test
+    void dirtyDefaultBranchRoutesToReconcileNotPermanentBlock(@TempDir Path root) throws Exception {
+        // Reproduces the exact stuck-repo scenario from the field: an adopted
+        // open PR, but the working tree is dirty ON THE DEFAULT BRANCH (a stray
+        // untracked directory). Previously this threw an unrecoverable
+        // IllegalStateException -> BLOCKED_REPOSITORY and looped forever without
+        // ever committing. The full fix must (a) attempt to check out the story
+        // branch, and (b) route the dirty-default case to bounded reconciliation
+        // (BLOCKED_REQUIREMENTS -> reconcile.md), not a permanent block.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        Files.createDirectories(root.resolve("prompts"));
+        Files.createDirectories(root.resolve("state"));
+
+        String head = "abc123def456";
+        // An unresolved review thread makes this PR classify to CHANGES_REQUESTED
+        // -> FIXING_FEEDBACK, a dispatchable phase that reaches the worktree gate
+        // (where the old permanent block occurred).
+        Map<String, Object> prSnapshot = map(
+                "number", 178, "state", "OPEN", "mergedAt", null,
+                "headRefOid", head, "headRefName", "story/47-shared-default-deny",
+                "url", "http://x/pr/178", "reviewDecision", "CHANGES_REQUESTED",
+                "statusCheckRollup", new ArrayList<>(),
+                "reviewThreadsAvailable", true, "comments", new ArrayList<>(),
+                "reviews", List.of(map("author", map("login", "chatgpt-codex-connector"),
+                        "submittedAt", "2026-02-01", "commit", map("oid", head))),
+                "reviewThreads", List.of(map("id", "PRRT_1", "isResolved", false,
+                        "comments", map("nodes", List.of(map("id", "PRRC_1",
+                                "body", "please fix this bug", "createdAt", "2026-01-01",
+                                "author", map("login", "reviewer")))))));
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", true, "max_feedback_attempts", 99), "budgets", map(),
+                "workflow", map("require_manual_merge", true));
+
+        // feedback.md is the dispatch prompt for FIXING_FEEDBACK.
+        Files.writeString(root.resolve("prompts").resolve("common.md"), "COMMON");
+        Files.writeString(root.resolve("prompts").resolve("feedback.md"), "{{COMMON}}\nFix.");
+
+        Map<String, Object> state = new LinkedHashMap<>();
+        state.put("phase", "FIXING_FEEDBACK");
+        state.put("current_story", 47);
+        state.put("current_pr", 178);
+        state.put("branch", "story/47-shared-default-deny");
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        WorkflowLock lock = WorkflowLock.acquire(root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+        DeliveryGitHub github = new DeliveryGitHub(prSnapshot);
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #47", "url", "http://x/27");
+
+        // Fake git: repo is on the DEFAULT branch with a stray untracked dir.
+        // The checkout attempt for the story branch is recorded, and after the
+        // (simulated) checkout the branch stays 'main' to model a checkout that
+        // could not switch — the classifier must then report DIRTY_DEFAULT_BRANCH
+        // rather than throwing.
+        List<String> gitCalls = new ArrayList<>();
+        GitOperations.GitRunner gitRunner = (r, args) -> {
+            gitCalls.add(String.join(" ", args));
+            String key = String.join(" ", args);
+            if (key.startsWith("status --porcelain")) {
+                return new GitOperations.GitResult(0, "?? migration-updates/\n", "");
+            }
+            if (key.startsWith("branch --show-current")) {
+                return new GitOperations.GitResult(0, "main\n", "");
+            }
+            if (key.startsWith("branch --list")) {
+                return new GitOperations.GitResult(0, "", "");
+            }
+            return new GitOperations.GitResult(0, "", "");
+        };
+        Controller.GitOperationsFactory gitFactory = new Controller.GitOperationsFactory(repo) {
+            @Override
+            public GitOperations create() {
+                return new GitOperations(repo, gitRunner);
+            }
+        };
+
+        WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                config, state, store, github, repo, root, epic, 27, true,
+                gitFactory, new CodexRunner(), new ReviewCoordinator(), lock);
+
+        int code = orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
+
+        // The controller attempted to check out the story branch (the fix).
+        assertThat(gitCalls).anyMatch(c -> c.startsWith("checkout -B story/47-shared-default-deny")
+                || c.startsWith("switch story/47-shared-default-deny"));
+        // The dirty default branch routes to bounded reconciliation, NOT the old
+        // permanent BLOCKED_REPOSITORY hard loop.
+        assertThat(state.get("phase")).isEqualTo("BLOCKED_REQUIREMENTS");
+        assertThat(state.get("phase")).isNotEqualTo("BLOCKED_REPOSITORY");
+        assertThat((String) state.get("error")).contains("default branch");
+        assertThat(code).isEqualTo(1);
+        lock.release();
+    }
 }

@@ -92,6 +92,42 @@ public final class GitOperations {
         }
     }
 
+    /**
+     * Classification of the working tree used to route recovery without a hard,
+     * self-perpetuating block. Unlike {@link #ensureRecoverableWorktree}, this
+     * never throws for a dirty default branch: it reports the situation so the
+     * controller can send the case to bounded reconciliation instead of pinning
+     * {@code BLOCKED_REPOSITORY} forever.
+     */
+    public enum WorktreeState {
+        /** No source changes (ignoring .codex/ metadata). Safe to proceed. */
+        CLEAN,
+        /** Changes exist on the recorded active story branch. Recoverable. */
+        RECOVERABLE_STORY_BRANCH,
+        /** Changes exist on the default branch. Needs reconciliation/cleanup. */
+        DIRTY_DEFAULT_BRANCH,
+        /** Changes exist on a branch that is not the active story branch. */
+        DIRTY_UNKNOWN_BRANCH
+    }
+
+    /** Non-throwing worktree classification for recovery routing. */
+    public WorktreeState classifyWorktree(Map<String, Object> state) {
+        List<String> changes = sourceChanges();
+        if (changes.isEmpty()) {
+            return WorktreeState.CLEAN;
+        }
+        String branch = checkedStdout("branch", "--show-current").strip();
+        if (branch.isEmpty() || DEFAULT_BRANCHES.contains(branch)) {
+            return WorktreeState.DIRTY_DEFAULT_BRANCH;
+        }
+        Object expected = state.get("branch");
+        if (expected != null && !String.valueOf(expected).isEmpty()
+                && branch.equals(String.valueOf(expected))) {
+            return WorktreeState.RECOVERABLE_STORY_BRANCH;
+        }
+        return WorktreeState.DIRTY_UNKNOWN_BRANCH;
+    }
+
     /** Allow recovery of interrupted controller work only on its story branch. */
     public void ensureRecoverableWorktree(Map<String, Object> state) {
         List<String> changes = sourceChanges();
@@ -119,6 +155,45 @@ public final class GitOperations {
 
     public void pushBranch(String branch) {
         checked("push", "--set-upstream", "origin", branch);
+    }
+
+    /**
+     * Check out an existing story branch so subsequent worktree validation and
+     * delivery operate on the correct branch instead of the default branch.
+     *
+     * <p>Refuses the default (main/master) branch. Fetches the branch from
+     * origin first so a fresh checkout can create a local tracking branch when
+     * one does not exist yet. If the branch already exists locally it is
+     * switched to; otherwise it is created from {@code origin/<branch>}. This is
+     * the missing step that previously left the controller stranded on the
+     * default branch, causing the recovery loop.</p>
+     *
+     * @return {@code true} if the branch was switched to (or already current);
+     *         {@code false} when {@code branch} is blank (no active branch yet).
+     */
+    public boolean checkoutStoryBranch(String branch) {
+        if (branch == null || branch.isEmpty()) {
+            return false;
+        }
+        if (DEFAULT_BRANCHES.contains(branch)) {
+            throw new IllegalStateException(
+                    "refusing to check out the default branch as a story branch: " + branch);
+        }
+        String current = checkedStdout("branch", "--show-current").strip();
+        if (current.equals(branch)) {
+            return true;
+        }
+        // Best-effort fetch so a tracking branch can be created; a missing
+        // remote ref is not fatal when the branch already exists locally.
+        runner.run(repo, List.of("fetch", "origin", branch));
+        String existingLocal = checkedStdout("branch", "--list", branch).strip();
+        if (!existingLocal.isEmpty()) {
+            checked("switch", branch);
+        } else {
+            // Create a local branch tracking origin/<branch>.
+            checked("checkout", "-B", branch, "origin/" + branch);
+        }
+        return true;
     }
 
     /**

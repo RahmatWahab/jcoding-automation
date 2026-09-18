@@ -137,6 +137,10 @@ final class WorkflowOrchestrator {
                 state.put("current_pr", currentPr.get("number"));
                 state.put("current_pr_url", currentPr.get("url"));
                 state.put("branch", currentPr.get("headRefName"));
+                // Persist immediately: recovery and reconciliation require a
+                // durable branch to resume, and a crash before the next save
+                // must not lose it (this was a root cause of the recovery loop).
+                save();
                 log.info("PR ADOPTED: story #" + current + ", PR #" + currentPr.get("number"));
             }
         }
@@ -220,6 +224,7 @@ final class WorkflowOrchestrator {
             if (currentPr.get("headRefName") != null
                     && !Engine.asString(currentPr.get("headRefName")).isEmpty()) {
                 state.put("branch", currentPr.get("headRefName"));
+                save();
             }
             state.put("ci_status", currentPr.get("statusCheckRollup") != null
                     ? currentPr.get("statusCheckRollup") : new ArrayList<>());
@@ -264,11 +269,30 @@ final class WorkflowOrchestrator {
                 state.put("last_feedback_id", feedback.get(feedback.size() - 1).get("id"));
                 state.put("phase", "FIXING_FEEDBACK");
 
+                String head = Engine.asString(currentPr.get("headRefOid"));
+
+                // Respect the worker's verdict: if the previous FIXING_FEEDBACK
+                // run on this exact head returned BLOCKED (it could not resolve
+                // the finding directly), do not re-dispatch the same feedback.
+                // Route to reconciliation, which is designed to classify the
+                // blocker (e.g. TEST_HARNESS) and choose RESUME_IMPLEMENTATION
+                // or, if genuinely unrecoverable, BLOCK_EXTERNAL. Reconciliation
+                // has its own 3-attempt ceiling, so this cannot loop.
+                if ("BLOCKED".equals(Engine.asString(state.get("last_feedback_result")))
+                        && head.equals(Engine.asString(state.get("last_feedback_result_head")))) {
+                    // Clear the feedback phase so we do not re-enter FIXING_FEEDBACK,
+                    // then fall through to normal phase dispatch, which routes
+                    // BLOCKED_REQUIREMENTS to reconcile.md.
+                    state.put("phase", "BLOCKED_REQUIREMENTS");
+                    state.put("feedback_reconcile_pending", true);
+                    log.info("RECONCILE: feedback BLOCKED on PR #{} head {}; routing to reconciliation",
+                            currentPr.get("number"), shortSha(head));
+                }
+
                 // Bounded loop guard: if the same PR head has been in
                 // FIXING_FEEDBACK for the same feedback repeatedly without the
                 // head advancing, stop and require human review instead of
                 // looping (and burning quota) forever.
-                String head = Engine.asString(currentPr.get("headRefOid"));
                 String lastGuardHead = Engine.asString(state.get("feedback_guard_head"));
                 int feedbackAttempts;
                 if (head.equals(lastGuardHead)) {
@@ -306,7 +330,15 @@ final class WorkflowOrchestrator {
                             .equals(Engine.asString(state.get("last_processed_commit")))) {
                 detectedPhase = "WAITING_FOR_MANUAL_MERGE";
             }
-            state.put("phase", detectedPhase);
+            // When a repeated BLOCKED feedback verdict routed us to
+            // reconciliation, keep BLOCKED_REQUIREMENTS rather than letting
+            // classify_pr pull us back into CHANGES_REQUESTED/feedback.
+            if (Engine.asBool(state.get("feedback_reconcile_pending"), false)) {
+                state.remove("feedback_reconcile_pending");
+                state.put("phase", "BLOCKED_REQUIREMENTS");
+            } else {
+                state.put("phase", detectedPhase);
+            }
             lock.refresh();
 
             try {
@@ -378,14 +410,63 @@ final class WorkflowOrchestrator {
         }
 
         GitOperations git = gitFactory.create();
-        try {
-            git.ensureRecoverableWorktree(state);
-        } catch (RuntimeException exc) {
-            state.put("phase", "BLOCKED_REPOSITORY");
-            state.put("error", "Unsafe working tree: " + exc.getMessage());
-            save();
-            log.error("BLOCKED: Unsafe working tree: " + exc.getMessage());
-            return 1;
+
+        // Full-loop fix: before validating the worktree, actively check out the
+        // active story branch. Previously the controller validated the worktree
+        // while the repo was still on the default branch, so a dirty default
+        // branch threw an unrecoverable IllegalStateException that pinned
+        // BLOCKED_REPOSITORY and looped forever without ever committing.
+        String activeBranch = Engine.asString(state.get("branch"));
+        if (!activeBranch.isEmpty()) {
+            try {
+                git.checkoutStoryBranch(activeBranch);
+            } catch (RuntimeException exc) {
+                // A failed checkout is a genuine repository problem; route it to
+                // bounded reconciliation rather than a permanent hard block.
+                state.put("phase", "BLOCKED_REQUIREMENTS");
+                state.put("error", "Unable to check out story branch " + activeBranch
+                        + ": " + exc.getMessage());
+                save();
+                log.error("RECONCILE: " + state.get("error"));
+                return 1;
+            }
+        }
+
+        // Classify the worktree without throwing so a dirty default branch or a
+        // stray-changes situation is routed to bounded reconciliation (which can
+        // resume, isolate, or block with a clear operator message) instead of an
+        // infinite BLOCKED_REPOSITORY loop.
+        GitOperations.WorktreeState worktreeState = git.classifyWorktree(state);
+        switch (worktreeState) {
+            case CLEAN, RECOVERABLE_STORY_BRANCH -> {
+                try {
+                    git.ensureRecoverableWorktree(state);
+                } catch (RuntimeException exc) {
+                    state.put("phase", "BLOCKED_REQUIREMENTS");
+                    state.put("error", "Unsafe working tree: " + exc.getMessage());
+                    save();
+                    log.error("RECONCILE: Unsafe working tree: " + exc.getMessage());
+                    return 1;
+                }
+            }
+            case DIRTY_DEFAULT_BRANCH -> {
+                state.put("phase", "BLOCKED_REQUIREMENTS");
+                state.put("error", "Working tree has uncommitted changes on the default branch; "
+                        + "reconcile before proceeding. Commit or relocate these changes onto a "
+                        + "story branch, or remove them, then rerun.");
+                save();
+                log.error("RECONCILE: uncommitted changes on the default branch require reconciliation");
+                return 1;
+            }
+            case DIRTY_UNKNOWN_BRANCH -> {
+                state.put("phase", "BLOCKED_REQUIREMENTS");
+                state.put("error", "Working tree has changes on a branch that is not the active "
+                        + "story branch; reconcile before proceeding.");
+                save();
+                log.error("RECONCILE: changes outside the active story branch require reconciliation");
+                return 1;
+            }
+            default -> { }
         }
 
         if (!dryRun && !Engine.asBool(workflow.get("allow_push"), false)) {
@@ -508,6 +589,20 @@ final class WorkflowOrchestrator {
 
         state.putAll(Engine.applyCodexResult(state, result.exitCode(), result.output(),
                 (int) Engine.asLongOrDefault(automation.get("quota_retry_seconds"), 1800)));
+
+        // Record the FIXING_FEEDBACK verdict per head so a repeated BLOCKED
+        // result escalates to human review instead of being re-dispatched.
+        if ("FIXING_FEEDBACK".equals(executionPhase)) {
+            String resultStatus = Engine.asString(state.get("result_status"));
+            if (!"SUCCESS".equals(resultStatus)) {
+                state.put("last_feedback_result", "BLOCKED");
+                state.put("last_feedback_result_head",
+                        currentPr == null ? "" : Engine.asString(currentPr.get("headRefOid")));
+            } else {
+                state.remove("last_feedback_result");
+                state.remove("last_feedback_result_head");
+            }
+        }
 
         // Journal: a zero exit with a non-SUCCESS structured result is BLOCKED.
         String journalStatus = workerStatus;
