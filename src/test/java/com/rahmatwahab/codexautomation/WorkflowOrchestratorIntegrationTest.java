@@ -220,6 +220,130 @@ class WorkflowOrchestratorIntegrationTest {
         lock.release();
     }
 
+    @Test
+    void firstImplementationSuccessCreatesPrEvenWhenWorkerWantsReview(@TempDir Path root) throws Exception {
+        // Regression: a first-time story (no PR yet) whose IMPLEMENTING worker
+        // returns SUCCESS with RESULT_NEXT_PHASE: WAITING_FOR_CODEX_REVIEW must
+        // get its PR created (branch pushed), not stall waiting for a review on
+        // a PR that does not exist.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q");
+        Path prompts = root.resolve("prompts");
+        Files.createDirectories(prompts);
+        Files.writeString(prompts.resolve("common.md"), "COMMON");
+        Files.writeString(prompts.resolve("implement.md"), "{{COMMON}}\nImplement.");
+        Files.createDirectories(root.resolve("state"));
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", false, "delivery_verification_attempts", 1,
+                        "delivery_verification_delay_seconds", 0),
+                "budgets", map(),
+                "workflow", map("auto_merge", false, "allow_push", true,
+                        "allow_pr_creation", true, "allow_comments", true));
+
+        Map<String, Object> state = new LinkedHashMap<>();
+        state.put("phase", "IMPLEMENTING");
+        state.put("current_story", 180);
+        state.put("branch", "story/180-x");
+
+        // Records whether a PR was created.
+        boolean[] prCreated = {false};
+        GitHub github = new GitHub("owner", "repo", "GH_TOKEN", "gh", 30,
+                (command, timeout) -> new GitHub.CommandResult(0, "{}", ""), name -> "t") {
+            @Override
+            public Object issue(int number) {
+                if (number == 27) {
+                    return map("number", 27, "title", "EPIC", "state", "OPEN",
+                            "body", "Stories: #180", "url", "http://x/27");
+                }
+                return map("number", number, "title", "Story " + number, "state", "OPEN",
+                        "body", "Acceptance", "url", "http://x/" + number);
+            }
+
+            @Override
+            public Object prs() {
+                return new ArrayList<>();
+            }
+
+            @Override
+            public Object createPr(String title, String body, String base, String head) {
+                prCreated[0] = true;
+                return map("number", 200, "url", "http://x/pr/200", "state", "OPEN",
+                        "isDraft", false, "headRefName", head, "headRefOid", "newhead1234");
+            }
+
+            @Override
+            public Map<String, Object> pr(int number) {
+                return map("number", 200, "state", "OPEN", "mergedAt", null,
+                        "headRefOid", "newhead1234", "headRefName", "story/180-x",
+                        "url", "http://x/pr/200", "reviewDecision", "",
+                        "statusCheckRollup", List.of(map("status", "IN_PROGRESS")),
+                        "reviewThreadsAvailable", true, "reviewThreads", new ArrayList<>(),
+                        "reviews", new ArrayList<>(), "comments", new ArrayList<>());
+            }
+
+            @Override
+            public void comment(int number, String bodyText) {
+                // no-op
+            }
+        };
+
+        CodexRunner codex = new CodexRunner(Map.of(), System::nanoTime) {
+            @Override
+            public CodexResult run(Map<String, Object> cfg, Path prompt, Path r, boolean dry,
+                                   Runnable hb, Integer timeout) {
+                return new CodexResult(0,
+                        "RESULT_STATUS: SUCCESS\nRESULT_NEXT_PHASE: WAITING_FOR_CODEX_REVIEW\n"
+                        + "RESULT_BLOCKER: NONE\nRESULT_EVIDENCE: COMPLETE\n");
+            }
+        };
+
+        GitOperations.GitRunner gitRunner = (r, args) -> {
+            String key = String.join(" ", args);
+            if (key.startsWith("status --porcelain")) {
+                return new GitOperations.GitResult(0, " M src/new.txt\n", "");
+            }
+            if (key.startsWith("branch --show-current") || key.startsWith("branch --list")) {
+                return new GitOperations.GitResult(0, "story/180-x\n", "");
+            }
+            if (key.startsWith("rev-parse HEAD")) {
+                return new GitOperations.GitResult(0, "newhead1234\n", "");
+            }
+            if (key.startsWith("ls-remote origin")) {
+                return new GitOperations.GitResult(0, "newhead1234\trefs/heads/story/180-x\n", "");
+            }
+            return new GitOperations.GitResult(0, "", "");
+        };
+        Controller.GitOperationsFactory gitFactory = new Controller.GitOperationsFactory(repo) {
+            @Override
+            public GitOperations create() {
+                return new GitOperations(repo, gitRunner);
+            }
+        };
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        WorkflowLock lock = WorkflowLock.acquire(root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #180", "url", "http://x/27");
+
+        WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                config, state, store, github, repo, root, epic, 27, false,
+                gitFactory, codex, new ReviewCoordinator(), lock);
+
+        orchestrator.reconcileAndExecute(new ArrayList<>(), null);
+
+        // The PR was created for the first delivery, and state now tracks it.
+        assertThat(prCreated[0]).isTrue();
+        assertThat(state.get("current_pr")).isEqualTo(200);
+        assertThat(state.get("phase")).isEqualTo("WAITING_FOR_CI");
+        lock.release();
+    }
+
     private static void runGit(Path repo, String... args) throws Exception {
         List<String> command = new ArrayList<>(List.of("git"));
         command.addAll(List.of(args));

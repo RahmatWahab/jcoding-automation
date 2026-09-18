@@ -976,8 +976,17 @@ final class WorkflowOrchestrator {
             }
         }
 
-        // Create a PR for a ready story that has none yet.
-        if (!dryRun && "READY_TO_MERGE".equals(state.get("phase")) && currentPr == null) {
+        // Create a PR for a story that has delivered work but no PR yet. This
+        // fires for ANY forward phase the worker chose after a SUCCESS result
+        // (implementation done -> wants review/CI/merge), not only
+        // READY_TO_MERGE. Previously a first-time story whose worker returned
+        // WAITING_FOR_CODEX_REVIEW/WAITING_FOR_CI never got a PR, so the
+        // workflow stalled waiting for a review on a PR that did not exist.
+        Set<String> prReadyPhases = Set.of(
+                "READY_TO_MERGE", "WAITING_FOR_CI", "WAITING_FOR_CODEX_REVIEW",
+                "WAITING_FOR_HUMAN_REVIEW", "REVIEWING_CODE", "VERIFYING", "FIXING_FEEDBACK");
+        if (!dryRun && currentPr == null
+                && prReadyPhases.contains(Engine.asString(state.get("phase")))) {
             if (!Engine.asBool(workflow.get("allow_push"), false)
                     || !Engine.asBool(workflow.get("allow_pr_creation"), false)) {
                 state.put("phase", "BLOCKED_EXTERNAL");
@@ -989,7 +998,11 @@ final class WorkflowOrchestrator {
                     state.put("current_pr", created.get("number"));
                     state.put("current_pr_url", created.get("url"));
                     state.put("branch", created.get("headRefName"));
+                    // After opening the PR, wait for CI/Codex review to run
+                    // against the new PR head rather than assuming readiness.
                     state.put("phase", "WAITING_FOR_CI");
+                    log.info("PR CREATED: story #{} PR #{} (first delivery)",
+                            current, created.get("number"));
                     Map<String, Object> createdDetail = github.pr(Engine.asInt(created.get("number")));
                     review.ensureCodexReviewTrigger(github, createdDetail, state, workflow, dryRun, this::save);
                 } catch (RuntimeException exc) {
