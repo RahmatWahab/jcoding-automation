@@ -360,4 +360,64 @@ class WorkflowOrchestratorIntegrationTest {
         assertThat(state.get("branch")).isEqualTo("story/47-shared-default-deny");
         lock.release();
     }
+
+    @Test
+    void feedbackLoopGuardBlocksAfterMaxAttempts(@TempDir Path root) throws Exception {
+        // Same unresolved feedback on the same head, already at the attempt
+        // ceiling, must stop with BLOCKED_EXTERNAL instead of looping.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q");
+        Files.createDirectories(root.resolve("prompts"));
+        Files.createDirectories(root.resolve("state"));
+
+        String head = "abc123def456";
+        Map<String, Object> prSnapshot = map(
+                "number", 178, "state", "OPEN", "mergedAt", null,
+                "headRefOid", head, "headRefName", "story/47-x", "url", "http://x/pr/178",
+                "reviewDecision", "", "statusCheckRollup", new ArrayList<>(),
+                "reviewThreadsAvailable", true, "comments", new ArrayList<>(),
+                "reviews", List.of(map("author", map("login", "chatgpt-codex-connector"),
+                        "submittedAt", "2026-02-01", "commit", map("oid", head))),
+                "reviewThreads", List.of(map("id", "PRRT_1", "isResolved", false,
+                        "comments", map("nodes", List.of(map("id", "PRRC_1",
+                                "body", "please fix this bug", "createdAt", "2026-01-01",
+                                "author", map("login", "reviewer")))))));
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", true, "max_feedback_attempts", 3),
+                "budgets", map(),
+                "workflow", map("require_manual_merge", true));
+
+        Map<String, Object> state = new LinkedHashMap<>();
+        state.put("phase", "FIXING_FEEDBACK");
+        state.put("current_story", 47);
+        state.put("current_pr", 178);
+        state.put("branch", "story/47-x");
+        // Already at the ceiling for this exact head.
+        state.put("feedback_guard_head", head);
+        state.put("feedback_attempts", 3);
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        WorkflowLock lock = WorkflowLock.acquire(root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+        DeliveryGitHub github = new DeliveryGitHub(prSnapshot);
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #47", "url", "http://x/27");
+
+        WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                config, state, store, github, repo, root, epic, 27, true,
+                new Controller.GitOperationsFactory(repo), new CodexRunner(),
+                new ReviewCoordinator(), lock);
+
+        int code = orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
+
+        assertThat(code).isEqualTo(1);
+        assertThat(state.get("phase")).isEqualTo("BLOCKED_EXTERNAL");
+        assertThat((String) state.get("error")).contains("manual review required");
+        lock.release();
+    }
 }

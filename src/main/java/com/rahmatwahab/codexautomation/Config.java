@@ -107,7 +107,8 @@ public final class Config {
             missing.add("github.timeout_seconds(positive integer)");
         }
 
-        for (String key : List.of("stale_lock_seconds", "watchdog_observations", "watchdog_grace_seconds")) {
+        for (String key : List.of("stale_lock_seconds", "watchdog_observations", "watchdog_grace_seconds",
+                "max_feedback_attempts")) {
             if (automation.containsKey(key) && !isPositiveInt(automation.get(key))) {
                 missing.add("automation." + key + "(positive integer)");
             }

@@ -263,6 +263,37 @@ final class WorkflowOrchestrator {
             if (!feedback.isEmpty()) {
                 state.put("last_feedback_id", feedback.get(feedback.size() - 1).get("id"));
                 state.put("phase", "FIXING_FEEDBACK");
+
+                // Bounded loop guard: if the same PR head has been in
+                // FIXING_FEEDBACK for the same feedback repeatedly without the
+                // head advancing, stop and require human review instead of
+                // looping (and burning quota) forever.
+                String head = Engine.asString(currentPr.get("headRefOid"));
+                String lastGuardHead = Engine.asString(state.get("feedback_guard_head"));
+                int feedbackAttempts;
+                if (head.equals(lastGuardHead)) {
+                    feedbackAttempts = (int) Engine.asLongOrDefault(
+                            state.get("feedback_attempts"), 0) + 1;
+                } else {
+                    feedbackAttempts = 1;
+                    state.put("feedback_guard_head", head);
+                }
+                state.put("feedback_attempts", feedbackAttempts);
+                int maxAttempts = (int) Engine.asLongOrDefault(
+                        automation.get("max_feedback_attempts"), 3);
+                if (feedbackAttempts > maxAttempts) {
+                    state.put("phase", "BLOCKED_EXTERNAL");
+                    state.put("error", "Feedback for PR #" + currentPr.get("number")
+                            + " head " + shortSha(head) + " was reprocessed " + feedbackAttempts
+                            + " times without resolution; manual review required");
+                    save();
+                    log.error("BLOCKED: " + state.get("error"));
+                    return 1;
+                }
+            } else {
+                // No actionable feedback on this head: reset the guard.
+                state.remove("feedback_guard_head");
+                state.remove("feedback_attempts");
             }
             feedbackToResolve = new ArrayList<>(feedback);
             String[] reconciled = Engine.reconcile(state, currentPr, !feedback.isEmpty());
@@ -581,7 +612,15 @@ final class WorkflowOrchestrator {
                     deliveryVerified = delivery.verified();
                     currentPr = delivery.pr();
                     if (deliveredCommit == null) {
+                        // Nothing new to commit: the fix from a prior run is
+                        // already on the PR head. Treat the current verified
+                        // head as the delivered commit so declared threads are
+                        // still replied to/resolved and cursors advance —
+                        // otherwise the same feedback loops forever.
                         deliveredCommit = Engine.asString(currentPr.get("headRefOid"));
+                        if (deliveryVerified && !deliveredCommit.isEmpty()) {
+                            state.put("last_processed_commit", deliveredCommit);
+                        }
                     }
                     if (!deliveryVerified) {
                         throw new IllegalStateException(

@@ -111,4 +111,13 @@ class ConfigTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("execution_timeout_seconds");
     }
+
+    @Test
+    void nonPositiveMaxFeedbackAttemptsIsValidated() {
+        Map<String, Object> config = valid();
+        config.put("automation", map("max_feedback_attempts", 0));
+        assertThatThrownBy(() -> Config.validate(config))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("max_feedback_attempts");
+    }
 }
