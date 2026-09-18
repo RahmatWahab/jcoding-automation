@@ -307,52 +307,77 @@ final class WorkflowOrchestrator {
                         automation.get("max_feedback_attempts"), 3);
                 if (feedbackAttempts > maxAttempts) {
                     // Fully autonomous: do not dead-end at "manual review". After
-                    // the feedback cap on an unchanging head, deliver whatever
-                    // controller-owned changes exist, auto-resolve the open
-                    // threads, re-trigger @codex review, and let CI plus the
-                    // mandatory manual-merge gate validate. This mirrors the
-                    // resume-guard auto-deliver and guarantees no loop/dead-end.
+                    // the feedback cap on an unchanging head, if the worker has
+                    // produced deliverable changes, commit them, auto-resolve
+                    // the open threads, and defer to CI. If there is NOTHING to
+                    // deliver (clean worktree, head unchanged — the worker could
+                    // not produce a fix), do not fake-resolve unfixed findings;
+                    // route once to the reasoning supervisor for a bounded
+                    // decision instead of soft-looping.
                     if (!dryRun && Engine.asBool(workflow.get("allow_push"), false)) {
-                        log.info("FEEDBACK AUTO-DELIVER: PR #{} head {} reprocessed {} times "
-                                + "without advancing; delivering and deferring to CI",
-                                currentPr.get("number"), shortSha(head), feedbackAttempts);
-                        state.put("phase", "WAITING_FOR_CI");
-                        state.put("result_status", "SUCCESS");
-                        state.put("result_evidence", "DEFERRED_TO_CI");
-                        state.put("delivery_mode", "CI_DEFERRED");
-                        state.remove("feedback_guard_head");
-                        state.remove("feedback_attempts");
-                        state.remove("error");
                         GitOperations fbGit = gitFactory.create();
                         try {
                             fbGit.checkoutStoryBranch(Engine.asString(state.get("branch")));
                         } catch (RuntimeException exc) {
                             log.error("FEEDBACK AUTO-DELIVER: checkout failed: {}", exc.getMessage());
                         }
-                        save();
-                        int deliveryResult = runDeliveryPipeline(
-                                fbGit, current, currentPr, "", new ArrayList<>(feedback), true);
-                        state.put("run_finished_at", Controller.now());
-                        save();
-                        if (state.get("current_pr") != null) {
+                        boolean hasDeliverableChanges;
+                        try {
+                            hasDeliverableChanges =
+                                    fbGit.classifyWorktree(state) != GitOperations.WorktreeState.CLEAN;
+                        } catch (RuntimeException exc) {
+                            hasDeliverableChanges = false;
+                        }
+                        if (hasDeliverableChanges) {
+                            log.info("FEEDBACK AUTO-DELIVER: PR #{} head {} reprocessed {} times; "
+                                    + "delivering worker changes and deferring to CI",
+                                    currentPr.get("number"), shortSha(head), feedbackAttempts);
+                            state.put("phase", "WAITING_FOR_CI");
+                            state.put("result_status", "SUCCESS");
+                            state.put("result_evidence", "DEFERRED_TO_CI");
+                            state.put("delivery_mode", "CI_DEFERRED");
+                            state.remove("feedback_guard_head");
+                            state.remove("feedback_attempts");
+                            state.remove("error");
+                            save();
+                            int deliveryResult = runDeliveryPipeline(
+                                    fbGit, current, currentPr, "", new ArrayList<>(feedback), true);
+                            state.put("run_finished_at", Controller.now());
+                            save();
                             log.info("FEEDBACK AUTO-DELIVER COMPLETE: PR #{} phase={}",
                                     currentPr.get("number"), state.get("phase"));
-                        } else {
-                            log.error("FEEDBACK AUTO-DELIVER incomplete: phase={} error={}",
-                                    state.get("phase"), state.get("error"));
+                            return deliveryResult == Integer.MIN_VALUE ? 0 : deliveryResult;
                         }
-                        return deliveryResult == Integer.MIN_VALUE ? 0 : deliveryResult;
+                        // Nothing to deliver: the worker cannot fix the findings.
+                        // Route to the reasoning supervisor via the existing
+                        // pending-reconcile mechanism (kept below), rather than
+                        // resolving unfixed threads or spinning.
+                        state.put("phase", "BLOCKED_REQUIREMENTS");
+                        state.put("feedback_reconcile_pending", true);
+                        state.put("error", "Feedback for PR #" + currentPr.get("number")
+                                + " head " + shortSha(head) + " reprocessed " + feedbackAttempts
+                                + " times and the worker produced no deliverable fix; escalating "
+                                + "to the reasoning supervisor.");
+                        state.remove("feedback_guard_head");
+                        state.remove("feedback_attempts");
+                        save();
+                        log.info("FEEDBACK ESCALATION: PR #{} no deliverable fix after {} attempts; "
+                                + "routing to supervisor", currentPr.get("number"), feedbackAttempts);
+                        // fall through: feedback_reconcile_pending keeps
+                        // BLOCKED_REQUIREMENTS, and the deviation supervisor
+                        // routes it to reconcile.
+                    } else {
+                        // Simulation (dry-run) or push disabled: record and stop
+                        // without pretending to deliver.
+                        state.put("phase", "BLOCKED_EXTERNAL");
+                        state.put("error", "Feedback for PR #" + currentPr.get("number")
+                                + " head " + shortSha(head) + " was reprocessed " + feedbackAttempts
+                                + " times without resolution and delivery is disabled (dry_run or "
+                                + "allow_push=false)");
+                        save();
+                        log.error("BLOCKED: " + state.get("error"));
+                        return 1;
                     }
-                    // Simulation (dry-run) or push disabled: record and stop
-                    // without pretending to deliver.
-                    state.put("phase", "BLOCKED_EXTERNAL");
-                    state.put("error", "Feedback for PR #" + currentPr.get("number")
-                            + " head " + shortSha(head) + " was reprocessed " + feedbackAttempts
-                            + " times without resolution and delivery is disabled (dry_run or "
-                            + "allow_push=false)");
-                    save();
-                    log.error("BLOCKED: " + state.get("error"));
-                    return 1;
                 }
             } else {
                 // No actionable feedback on this head: reset the guard.
@@ -963,6 +988,7 @@ final class WorkflowOrchestrator {
                                     boolean autoResolveAllThreads) {
         boolean deliveryVerified = false;
         String deliveredCommit = null;
+        boolean newCommitDelivered = false;
         Set<String> declaredFixedIds = ReviewCoordinator.fixedThreadIds(output);
 
         // On autonomous auto-delivery there is no per-thread FIXED_THREAD
@@ -995,6 +1021,7 @@ final class WorkflowOrchestrator {
                 String committed = git.commitAndPush(branch, current);
                 deliveredCommit = committed;
                 if (committed != null) {
+                    newCommitDelivered = true;
                     state.put("branch", branch);
                     state.put("last_processed_commit", committed);
                     // A real head advance means progress was made; clear the
@@ -1053,8 +1080,15 @@ final class WorkflowOrchestrator {
         }
 
         // Reply to and resolve only verified, delivered, explicitly-fixed threads.
-        if (deliveryVerified && deliveredCommit != null && currentPr != null
+        // For the autonomous auto-resolve-all path, additionally require that a
+        // genuinely NEW commit was delivered this run — otherwise we would be
+        // resolving unfixed findings on an unchanged head, which hides real
+        // feedback. When nothing advanced, threads are left open for the
+        // connector to re-evaluate.
+        boolean mayResolveThreads = deliveryVerified && deliveredCommit != null && currentPr != null
                 && !mapping.canonical().isEmpty()
+                && (!autoResolveAllThreads || newCommitDelivered);
+        if (mayResolveThreads
                 && (Engine.asBool(workflow.get("allow_comments"), false)
                     || Engine.asBool(workflow.get("allow_thread_resolution"), false))) {
             try {

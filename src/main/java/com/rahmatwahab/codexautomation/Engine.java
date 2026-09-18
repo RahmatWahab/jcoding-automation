@@ -229,17 +229,21 @@ public final class Engine {
         if ("APPROVED".equals(decision)) {
             return "READY_TO_MERGE";
         }
-        // Autonomous ready gate: the Codex connector reviewed this exact head
-        // and found no issues (clean review), CI has passed, and no review
-        // thread is unresolved. There is no human reviewer to produce a formal
-        // APPROVED decision, so a clean connector review is the ready signal.
-        // The controller posts "READY TO MERGE" and moves to the manual-merge
-        // gate; it still never merges by itself.
-        if (!codexReviewPending(pr)
-                && hasCodexCleanReviewComment(pr, asString(pr.get("headRefOid")))) {
+        // Autonomous ready gate. There is no human reviewer, so the workflow
+        // must never park in a "wait for human" state. Reaching this point means
+        // CI is not failing or pending and there are no unresolved review
+        // threads. If the Codex connector has reviewed THIS head (either a clean
+        // "no issues" pass, or a review whose findings are now all resolved),
+        // the PR is ready — post READY TO MERGE / auto-merge. The controller
+        // still never merges unless auto_merge is enabled, and the manual-merge
+        // gate is preserved for auto_merge=false.
+        if (!codexReviewPending(pr)) {
             return "READY_TO_MERGE";
         }
-        return "WAITING_FOR_HUMAN_REVIEW";
+        // Codex has not yet reviewed this exact head — wait for the connector
+        // review (which the controller triggers via "@codex review"), not for a
+        // human.
+        return "WAITING_FOR_CODEX_REVIEW";
     }
 
     // -- codex_review_pending ------------------------------------------------

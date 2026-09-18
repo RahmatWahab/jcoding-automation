@@ -415,11 +415,26 @@ class EngineResultTest {
     }
 
     @Test
-    void codexReviewCompleteForCurrentHead() {
+    void codexReviewCompleteForCurrentHeadIsReadyToMerge() {
+        // Autonomous: Codex reviewed this head, no unresolved threads, CI not
+        // failing/pending -> READY_TO_MERGE. There is no human-review wait.
         Map<String, Object> pr = prBase("headRefOid", "abc");
         pr.put("reviews", List.of(map("author", map("login", "chatgpt-codex-connector"),
                 "submittedAt", "2026-01-01", "commit", map("oid", "abc"))));
         assertThat(Engine.codexReviewPending(pr)).isFalse();
-        assertThat(Engine.classifyPr(pr)).isEqualTo("WAITING_FOR_HUMAN_REVIEW");
+        assertThat(Engine.classifyPr(pr)).isEqualTo("READY_TO_MERGE");
+    }
+
+    @Test
+    void classifyPrNeverWaitsForHumanReview() {
+        // No PR/CI/thread condition may produce WAITING_FOR_HUMAN_REVIEW in the
+        // fully-autonomous flow: either it waits for the Codex connector review
+        // or it is READY_TO_MERGE.
+        Map<String, Object> reviewed = prBase("headRefOid", "abc");
+        reviewed.put("reviews", List.of(map("author", map("login", "chatgpt-codex-connector"),
+                "submittedAt", "2026-01-01", "commit", map("oid", "abc"))));
+        assertThat(Engine.classifyPr(reviewed)).isNotEqualTo("WAITING_FOR_HUMAN_REVIEW");
+        Map<String, Object> notReviewed = prBase("headRefOid", "xyz");
+        assertThat(Engine.classifyPr(notReviewed)).isEqualTo("WAITING_FOR_CODEX_REVIEW");
     }
 }
