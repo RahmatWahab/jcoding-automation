@@ -359,6 +359,119 @@ class WorkflowOrchestratorIntegrationTest {
         assertThat(finalState.get("delivery_mode")).isEqualTo("CI_DEFERRED");
     }
 
+    @Test
+    void autoDeliveryRepliesAndResolvesAllOpenThreads(@TempDir Path root) throws Exception {
+        // Autonomous auto-delivery must also close the loop on review threads:
+        // reply with fix evidence and resolve every currently-unresolved thread,
+        // then re-trigger @codex review — without a per-thread FIXED_THREAD
+        // declaration (the worker only returned a reconcile decision).
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q");
+        Path prompts = root.resolve("prompts");
+        Files.createDirectories(prompts);
+        Files.writeString(prompts.resolve("common.md"), "COMMON");
+        Files.writeString(prompts.resolve("reconcile.md"), "{{COMMON}}\nReconcile.");
+        Files.createDirectories(root.resolve("state"));
+
+        String head = "abc123def456";
+        Map<String, Object> prSnapshot = map(
+                "number", 178, "state", "OPEN", "mergedAt", null,
+                "headRefOid", head, "headRefName", "story/47-x", "url", "http://x/pr/178",
+                "reviewDecision", "CHANGES_REQUESTED", "statusCheckRollup", new ArrayList<>(),
+                "reviewThreadsAvailable", true, "comments", new ArrayList<>(),
+                "reviews", List.of(map("author", map("login", "chatgpt-codex-connector"),
+                        "submittedAt", "2026-02-01", "commit", map("oid", head))),
+                "reviewThreads", List.of(map("id", "PRRT_open", "isResolved", false,
+                        "comments", map("nodes", List.of(map("id", "PRRC_1",
+                                "body", "recreate the frontend network as internal",
+                                "createdAt", "2026-01-01",
+                                "author", map("login", "chatgpt-codex-connector")))))));
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", false, "max_resume_attempts", 1,
+                        "max_feedback_attempts", 99, "delivery_verification_attempts", 1,
+                        "delivery_verification_delay_seconds", 0),
+                "budgets", map(),
+                "workflow", map("require_manual_merge", true, "allow_push", true,
+                        "allow_comments", true, "allow_thread_resolution", true));
+
+        CodexRunner codex = new CodexRunner(Map.of(), System::nanoTime) {
+            @Override
+            public CodexResult run(Map<String, Object> cfg, Path prompt, Path r, boolean dry,
+                                   Runnable hb, Integer timeout) {
+                return new CodexResult(0,
+                        "DECISION_ACTION: RESUME_IMPLEMENTATION\n"
+                        + "DECISION_REASON: harness cleanup\nBLOCKER_CLASS: TEST_HARNESS\n"
+                        + "RECOVERY_ACTION: repair cleanup\n"
+                        + "RESULT_STATUS: SUCCESS\nRESULT_NEXT_PHASE: IMPLEMENTING\n"
+                        + "RESULT_BLOCKER: NONE\nRESULT_EVIDENCE: COMPLETE\n");
+            }
+        };
+
+        GitOperations.GitRunner gitRunner = (r, args) -> {
+            String key = String.join(" ", args);
+            if (key.startsWith("status --porcelain")) {
+                return new GitOperations.GitResult(0, " M src/impl.txt\n", "");
+            }
+            if (key.startsWith("branch --show-current")) {
+                return new GitOperations.GitResult(0, "story/47-x\n", "");
+            }
+            if (key.startsWith("branch --list")) {
+                return new GitOperations.GitResult(0, "story/47-x\n", "");
+            }
+            if (key.startsWith("rev-parse HEAD")) {
+                return new GitOperations.GitResult(0, head + "\n", "");
+            }
+            if (key.startsWith("ls-remote origin")) {
+                return new GitOperations.GitResult(0, head + "\trefs/heads/story/47-x\n", "");
+            }
+            return new GitOperations.GitResult(0, "", "");
+        };
+        Controller.GitOperationsFactory gitFactory = new Controller.GitOperationsFactory(repo) {
+            @Override
+            public GitOperations create() {
+                return new GitOperations(repo, gitRunner);
+            }
+        };
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #47", "url", "http://x/27");
+        DeliveryGitHub github = new DeliveryGitHub(prSnapshot);
+
+        String lastPhase = "";
+        for (int run = 1; run <= 3; run++) {
+            Map<String, Object> state = store.load();
+            state.put("phase", "BLOCKED_REQUIREMENTS");
+            state.put("current_story", 47);
+            state.put("current_pr", 178);
+            state.put("branch", "story/47-x");
+            state.put("last_feedback_result", "BLOCKED");
+            state.put("last_feedback_result_head", head);
+            WorkflowLock lock = WorkflowLock.acquire(
+                    root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+            WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                    config, state, store, github, repo, root, epic, 27, false,
+                    gitFactory, codex, new ReviewCoordinator(), lock);
+            orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
+            lastPhase = Engine.asString(state.get("phase"));
+            lock.release();
+            if ("WAITING_FOR_CI".equals(lastPhase)) {
+                break;
+            }
+        }
+
+        assertThat(lastPhase).isEqualTo("WAITING_FOR_CI");
+        // The open thread was replied to and resolved by the autonomous delivery.
+        assertThat(github.repliedThreads).extracting(a -> a[0]).contains("PRRT_open");
+        assertThat(github.resolvedThreads).contains("PRRT_open");
+    }
+
     /** Fake GitHub serving an existing PR and recording thread mutations. */
     private static final class DeliveryGitHub extends GitHub {
         final List<String> resolvedThreads = new ArrayList<>();

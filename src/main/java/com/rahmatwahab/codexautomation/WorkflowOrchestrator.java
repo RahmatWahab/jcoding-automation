@@ -690,7 +690,7 @@ final class WorkflowOrchestrator {
                 state.remove("resume_attempts");
                 save();
                 int deliveryResult = runDeliveryPipeline(git, current, currentPr,
-                        result.output(), feedbackToResolve);
+                        result.output(), feedbackToResolve, true);
                 cleanup(renderedPrompt);
                 if (deliveryResult != Integer.MIN_VALUE) {
                     return deliveryResult;
@@ -746,9 +746,49 @@ final class WorkflowOrchestrator {
     @SuppressWarnings("unchecked")
     private int runDeliveryPipeline(GitOperations git, Integer current, Map<String, Object> currentPr,
                                     String output, List<Map<String, Object>> feedbackToResolve) {
+        return runDeliveryPipeline(git, current, currentPr, output, feedbackToResolve, false);
+    }
+
+    /**
+     * @param autoResolveAllThreads when true (autonomous auto-delivery), treat
+     *        every currently-unresolved review thread as addressed by the
+     *        delivered changes: reply with the fix evidence and resolve them,
+     *        then re-trigger {@code @codex review}. The connector review is the
+     *        self-correcting safety net — a prematurely resolved thread is
+     *        re-surfaced by the next review. This keeps the fully autonomous
+     *        loop closing threads without a per-thread worker declaration.
+     */
+    @SuppressWarnings("unchecked")
+    private int runDeliveryPipeline(GitOperations git, Integer current, Map<String, Object> currentPr,
+                                    String output, List<Map<String, Object>> feedbackToResolve,
+                                    boolean autoResolveAllThreads) {
         boolean deliveryVerified = false;
         String deliveredCommit = null;
         Set<String> declaredFixedIds = ReviewCoordinator.fixedThreadIds(output);
+
+        // On autonomous auto-delivery there is no per-thread FIXED_THREAD
+        // declaration (the worker returned a reconcile decision). Treat all
+        // currently-unresolved threads on the PR as addressed by the delivered
+        // controller-owned changes, and synthesize the feedback list so the
+        // reply/resolve loop below has items to act on.
+        if (autoResolveAllThreads && currentPr != null) {
+            List<Map<String, Object>> synthesized = new ArrayList<>();
+            Set<String> allUnresolved = new LinkedHashSet<>();
+            for (Object t : Engine.asList(currentPr.get("reviewThreads"))) {
+                if (t instanceof Map<?, ?> tm) {
+                    Map<String, Object> thread = castMap(tm);
+                    String threadId = Engine.asString(thread.get("id"));
+                    if (!threadId.isEmpty() && !Engine.asBool(thread.get("isResolved"), true)) {
+                        allUnresolved.add(threadId);
+                        Map<String, Object> item = new LinkedHashMap<>(thread);
+                        item.put("thread_id", threadId);
+                        synthesized.add(item);
+                    }
+                }
+            }
+            declaredFixedIds = allUnresolved;
+            feedbackToResolve = synthesized;
+        }
 
         if (!dryRun && Engine.asBool(workflow.get("allow_push"), false)) {
             try {
