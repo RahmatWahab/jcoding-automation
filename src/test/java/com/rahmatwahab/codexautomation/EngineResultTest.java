@@ -100,6 +100,47 @@ class EngineResultTest {
     }
 
     @Test
+    void cleanCodexReviewCommentAtHeadClosesGate() {
+        String head = "90bb92b6304993d218f317070fbef07e236b5142";
+        Map<String, Object> pr = prBase(
+                "headRefOid", head,
+                "reviews", new ArrayList<>(),
+                "comments", List.of(map(
+                        "author", map("login", "chatgpt-codex-connector[bot]"),
+                        "body", "Codex Review: Didn't find any major issues. Already looking "
+                                + "forward to the next diff.\n\n**Reviewed commit:** `90bb92b630`")));
+        assertThat(Engine.codexReviewPending(pr)).isFalse();
+    }
+
+    @Test
+    void cleanCodexReviewCommentForOldHeadDoesNotCloseGate() {
+        Map<String, Object> pr = prBase(
+                "headRefOid", "newhead000000000000",
+                "reviews", new ArrayList<>(),
+                "comments", List.of(map(
+                        "author", map("login", "chatgpt-codex-connector[bot]"),
+                        "body", "Codex Review: Didn't find any major issues.\n\n"
+                                + "**Reviewed commit:** `oldhead111`")));
+        assertThat(Engine.codexReviewPending(pr)).isTrue();
+    }
+
+    @Test
+    void cleanCodexReviewWithGreenCiIsReadyToMerge() {
+        String head = "90bb92b6304993d218f317070fbef07e236b5142";
+        Map<String, Object> pr = prBase(
+                "headRefOid", head,
+                "statusCheckRollup", List.of(map("status", "COMPLETED", "conclusion", "SUCCESS")),
+                "reviewThreads", new ArrayList<>(),
+                "reviews", new ArrayList<>(),
+                "reviewDecision", "",
+                "comments", List.of(map(
+                        "author", map("login", "chatgpt-codex-connector[bot]"),
+                        "body", "Codex Review: Didn't find any major issues.\n\n"
+                                + "**Reviewed commit:** `90bb92b630`")));
+        assertThat(Engine.classifyPr(pr)).isEqualTo("READY_TO_MERGE");
+    }
+
+    @Test
     void finalMachineFooterWinsOverPromptExamples() {
         String output = "RESULT_STATUS: SUCCESS|BLOCKED|FAILED\n"
                 + "RESULT_NEXT_PHASE: VERIFYING|REVIEWING_CODE\n"

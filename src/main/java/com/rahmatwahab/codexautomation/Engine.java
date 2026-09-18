@@ -229,6 +229,16 @@ public final class Engine {
         if ("APPROVED".equals(decision)) {
             return "READY_TO_MERGE";
         }
+        // Autonomous ready gate: the Codex connector reviewed this exact head
+        // and found no issues (clean review), CI has passed, and no review
+        // thread is unresolved. There is no human reviewer to produce a formal
+        // APPROVED decision, so a clean connector review is the ready signal.
+        // The controller posts "READY TO MERGE" and moves to the manual-merge
+        // gate; it still never merges by itself.
+        if (!codexReviewPending(pr)
+                && hasCodexCleanReviewComment(pr, asString(pr.get("headRefOid")))) {
+            return "READY_TO_MERGE";
+        }
         return "WAITING_FOR_HUMAN_REVIEW";
     }
 
@@ -247,19 +257,70 @@ public final class Engine {
                 Map<String, Object> typed = (Map<String, Object>) review;
                 Object author = typed.get("author");
                 String login = author instanceof Map<?, ?> a ? asString(a.get("login")) : "";
-                if ("chatgpt-codex-connector".equals(login)) {
+                if (isCodexConnector(login)) {
                     reviews.add(typed);
                 }
             }
         }
-        if (reviews.isEmpty()) {
-            return true;
+        if (!reviews.isEmpty()) {
+            reviews.sort((a, b) -> asString(a.get("submittedAt")).compareTo(asString(b.get("submittedAt"))));
+            Map<String, Object> last = reviews.get(reviews.size() - 1);
+            Object commit = last.get("commit");
+            String oid = commit instanceof Map<?, ?> c ? asString(c.get("oid")) : "";
+            if (oid.equals(head)) {
+                return false;
+            }
         }
-        reviews.sort((a, b) -> asString(a.get("submittedAt")).compareTo(asString(b.get("submittedAt"))));
-        Map<String, Object> last = reviews.get(reviews.size() - 1);
-        Object commit = last.get("commit");
-        String oid = commit instanceof Map<?, ?> c ? asString(c.get("oid")) : "";
-        return !oid.equals(head);
+        // Clean-result path: when Codex finds no issues it does not submit a
+        // review object at the head — it posts a "Didn't find any major issues"
+        // issue comment (and/or a 👍 reaction) that references the reviewed
+        // commit. Treat such a connector comment for the current head as a
+        // completed, clean review so the gate closes instead of waiting forever.
+        return !hasCodexCleanReviewComment(pr, head);
+    }
+
+    /** Codex connector login as it appears in reviews or issue comments. */
+    private static boolean isCodexConnector(String login) {
+        return "chatgpt-codex-connector".equals(login)
+                || "chatgpt-codex-connector[bot]".equals(login);
+    }
+
+    /**
+     * Detect a connector-posted clean-review comment ("no major issues") that
+     * references the current head commit (by full or short SHA in the
+     * "Reviewed commit:" line).
+     */
+    static boolean hasCodexCleanReviewComment(Map<String, Object> pr, String head) {
+        if (head.isEmpty()) {
+            return false;
+        }
+        String shortHead = head.length() >= 10 ? head.substring(0, 10) : head;
+        for (Object c : asList(pr.get("comments"))) {
+            if (!(c instanceof Map<?, ?> cm)) {
+                continue;
+            }
+            @SuppressWarnings("unchecked")
+            Map<String, Object> comment = (Map<String, Object>) cm;
+            Object author = comment.get("author");
+            String login = author instanceof Map<?, ?> a ? asString(a.get("login"))
+                    : asString(comment.get("login"));
+            if (author == null && comment.get("user") instanceof Map<?, ?> u) {
+                login = asString(u.get("login"));
+            }
+            if (!isCodexConnector(login)) {
+                continue;
+            }
+            String body = asString(comment.get("body"));
+            String lower = body.toLowerCase();
+            boolean clean = lower.contains("didn't find any major issues")
+                    || lower.contains("didnt find any major issues")
+                    || lower.contains("no major issues");
+            boolean refsHead = body.contains(head) || body.contains(shortHead);
+            if (clean && refsHead) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // -- next_action ---------------------------------------------------------

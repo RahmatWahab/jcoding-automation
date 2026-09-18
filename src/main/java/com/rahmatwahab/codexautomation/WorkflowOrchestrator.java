@@ -371,10 +371,17 @@ final class WorkflowOrchestrator {
                 if (phase.equals("READY_TO_MERGE") && !dryRun
                         && Engine.asBool(workflow.get("allow_comments"), false)) {
                     if (!github.hasComment(currentPr, "READY TO MERGE")) {
-                        github.comment(Engine.asInt(currentPr.get("number")), "READY TO MERGE");
+                        github.comment(Engine.asInt(currentPr.get("number")),
+                                "✅ READY TO MERGE — Codex review found no issues on the current head ("
+                                + shortSha(currentPr.get("headRefOid")) + "), CI is green, and all review "
+                                + "threads are resolved. This PR is ready for the manual merge gate. "
+                                + "The automation does not merge; a maintainer must merge.");
                     }
                     state.put("phase", "WAITING_FOR_MANUAL_MERGE");
                     state.put("last_processed_commit", currentPr.get("headRefOid"));
+                    log.info("READY TO MERGE: story #{} PR #{} head={} — posted ready comment; "
+                            + "awaiting manual merge", current, currentPr.get("number"),
+                            shortSha(currentPr.get("headRefOid")));
                 }
                 save();
                 log.info("WAITING: story #{} phase={} reason={} reviewDecision={} ciChecks={} head={}",
