@@ -52,8 +52,11 @@ All configuration is JSON.
    `automation.dry_run = true` and all mutation flags `false`, so nothing is
    pushed or commented until you explicitly enable it.
 
-   The safety invariant `workflow.require_manual_merge` must be `true`; the
-   controller refuses to start otherwise, and it never merges a PR itself.
+   The merge policy is the single flag `workflow.auto_merge` (default `false`).
+   When `false`, the controller never merges: it posts a `READY TO MERGE`
+   comment on a ready PR and waits for a maintainer to merge. When `true`, the
+   controller merges a ready PR itself — clean Codex review, green CI, no
+   unresolved threads — and advances to the next story (fully autonomous).
 
 2. `config/job-control.json` — the execution gate:
 
@@ -137,7 +140,7 @@ implement → PR → review → feedback loop, set in `config/config.json`:
     "allow_pr_creation": true,
     "allow_comments": true,
     "allow_thread_resolution": true,
-    "require_manual_merge": true
+    "auto_merge": false
   }
 }
 ```
@@ -150,7 +153,7 @@ What each flag unlocks (all default to `false`):
 | `allow_pr_creation` | opening a pull request for a ready story |
 | `allow_comments` | posting the `@codex review` trigger and fix replies |
 | `allow_thread_resolution` | resolving review threads after a verified fix |
-| `require_manual_merge` | must stay `true`; the automation never merges a PR itself |
+| `auto_merge` | merge policy (single flag). `false` (default): the controller never merges — it posts `READY TO MERGE` and waits for a maintainer. `true`: fully autonomous — the controller merges a ready PR itself (clean Codex review + green CI + no unresolved threads) and advances to the next story. It never force-merges: a conflicting PR is routed to reconciliation to rebase/resolve, pending mergeability waits and retries, and branch-protection blocks are surfaced (never bypassed). Optional `merge_method` selects `squash` (default), `merge`, or `rebase` — the method must be enabled in the repo's merge settings. |
 
 and in `config/job-control.json`:
 

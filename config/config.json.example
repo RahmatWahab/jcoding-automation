@@ -45,6 +45,7 @@
     "allow_pr_creation": false,
     "allow_comments": false,
     "allow_thread_resolution": false,
-    "require_manual_merge": true
+    "auto_merge": false,
+    "merge_method": "squash"
   }
 }

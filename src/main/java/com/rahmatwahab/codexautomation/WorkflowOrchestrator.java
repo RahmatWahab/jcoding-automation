@@ -383,6 +383,85 @@ final class WorkflowOrchestrator {
                             + "awaiting manual merge", current, currentPr.get("number"),
                             shortSha(currentPr.get("headRefOid")));
                 }
+
+                // Fully autonomous merge (opt-in): when workflow.auto_merge is
+                // enabled, the ready gate merges the PR instead of waiting for a
+                // human. It never force-merges: it merges only when GitHub
+                // reports the PR mergeable, and routes fixable blockers back
+                // into the autonomous fix loop so the workflow drives toward a
+                // legitimate merge without dead-ending. Guarded by dry_run and
+                // allow_push.
+                if (Set.of("READY_TO_MERGE", "WAITING_FOR_MANUAL_MERGE").contains(
+                            Engine.asString(state.get("phase")))
+                        && !dryRun
+                        && Engine.asBool(workflow.get("auto_merge"), false)
+                        && Engine.asBool(workflow.get("allow_push"), false)) {
+                    String mergeable = Engine.asString(currentPr.get("mergeable")).toUpperCase();
+                    String mergeStateStatus =
+                            Engine.asString(currentPr.get("mergeStateStatus")).toUpperCase();
+
+                    // Merge conflict with the base branch: Codex must rebase the
+                    // story branch on base and resolve conflicts. Route to
+                    // reconciliation (which decides RESUME_IMPLEMENTATION) rather
+                    // than failing. Never force-merge a conflicting PR.
+                    if ("CONFLICTING".equals(mergeable) || "DIRTY".equals(mergeStateStatus)) {
+                        state.put("phase", "BLOCKED_REQUIREMENTS");
+                        state.put("error", "Auto-merge blocked: PR #" + currentPr.get("number")
+                                + " has merge conflicts with the base branch; rebase and resolve "
+                                + "conflicts before merging.");
+                        save();
+                        log.info("AUTO-MERGE DEFERRED: PR #{} conflicts with base; routing to "
+                                + "reconciliation to rebase/resolve", currentPr.get("number"));
+                        return 1;
+                    }
+                    // Mergeability not yet computed by GitHub, or checks still
+                    // settling: wait and retry on the next run rather than fail.
+                    if ("UNKNOWN".equals(mergeable) || "BEHIND".equals(mergeStateStatus)
+                            || "UNSTABLE".equals(mergeStateStatus)) {
+                        state.put("phase", "WAITING_FOR_CI");
+                        save();
+                        log.info("AUTO-MERGE WAIT: PR #{} mergeable={} state={}; retrying next run",
+                                currentPr.get("number"), mergeable, mergeStateStatus);
+                        return 0;
+                    }
+                    // Branch protection or required approvals the automation must
+                    // not bypass: surface it instead of force-merging.
+                    if ("BLOCKED".equals(mergeStateStatus)) {
+                        state.put("phase", "BLOCKED_EXTERNAL");
+                        state.put("error", "Auto-merge blocked by branch protection or required "
+                                + "checks on PR #" + currentPr.get("number") + " (mergeStateStatus="
+                                + mergeStateStatus + "); the automation will not bypass repository "
+                                + "protection. Adjust protection rules or merge manually.");
+                        save();
+                        log.error("BLOCKED: " + state.get("error"));
+                        return 1;
+                    }
+                    // Mergeable and clean: merge, then advance the story.
+                    try {
+                        String mergeMethod = Engine.asString(
+                                workflow.getOrDefault("merge_method", "squash"));
+                        github.mergePr(Engine.asInt(currentPr.get("number")), mergeMethod);
+                        log.info("AUTO-MERGE: merged PR #{} for story #{} (head {}) via {}",
+                                currentPr.get("number"), current,
+                                shortSha(currentPr.get("headRefOid")), mergeMethod);
+                        advanceStory(current);
+                        save();
+                        log.info("MERGED: story #{}; next run may select another story", current);
+                        return 0;
+                    } catch (GitHubError exc) {
+                        // A merge-call failure is not a dead end: re-inspect the
+                        // PR next run. If CI regressed or a new conflict appeared
+                        // the standard classification routes it back into the fix
+                        // loop. Record and retry rather than permanently block.
+                        state.put("phase", "WAITING_FOR_CI");
+                        state.put("error", "Auto-merge attempt failed for PR #"
+                                + currentPr.get("number") + " (will re-evaluate next run): "
+                                + exc.getMessage());
+                        save();
+                        log.info("AUTO-MERGE RETRY: {}", state.get("error"));
+                        return 0;
+                    }
+                }
                 save();
                 log.info("WAITING: story #{} phase={} reason={} reviewDecision={} ciChecks={} head={}",
                         current, state.get("phase"), waitReason(state.get("phase"), currentPr),

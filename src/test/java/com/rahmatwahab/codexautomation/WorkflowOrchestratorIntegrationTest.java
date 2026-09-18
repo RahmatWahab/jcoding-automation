@@ -85,7 +85,7 @@ class WorkflowOrchestratorIntegrationTest {
                 "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
                 "automation", map("dry_run", true),
                 "budgets", map(),
-                "workflow", map("require_manual_merge", true, "allow_push", false));
+                "workflow", map("allow_push", false));
 
         Map<String, Object> state = new LinkedHashMap<>();
         state.put("phase", "IDLE");
@@ -149,7 +149,7 @@ class WorkflowOrchestratorIntegrationTest {
                 "automation", map("dry_run", false, "delivery_verification_attempts", 1,
                         "delivery_verification_delay_seconds", 0, "max_feedback_attempts", 99),
                 "budgets", map(),
-                "workflow", map("require_manual_merge", true, "allow_push", true,
+                "workflow", map("allow_push", true,
                         "allow_comments", true, "allow_thread_resolution", true));
 
         Map<String, Object> state = new LinkedHashMap<>();
@@ -269,7 +269,7 @@ class WorkflowOrchestratorIntegrationTest {
                         "max_feedback_attempts", 99, "delivery_verification_attempts", 1,
                         "delivery_verification_delay_seconds", 0),
                 "budgets", map(),
-                "workflow", map("require_manual_merge", true, "allow_push", true,
+                "workflow", map("allow_push", true,
                         "allow_comments", true, "allow_thread_resolution", true));
 
         // Worker always chooses RESUME_IMPLEMENTATION on the same head (never
@@ -397,7 +397,7 @@ class WorkflowOrchestratorIntegrationTest {
                         "max_feedback_attempts", 99, "delivery_verification_attempts", 1,
                         "delivery_verification_delay_seconds", 0),
                 "budgets", map(),
-                "workflow", map("require_manual_merge", true, "allow_push", true,
+                "workflow", map("allow_push", true,
                         "allow_comments", true, "allow_thread_resolution", true));
 
         CodexRunner codex = new CodexRunner(Map.of(), System::nanoTime) {
@@ -472,10 +472,227 @@ class WorkflowOrchestratorIntegrationTest {
         assertThat(github.resolvedThreads).contains("PRRT_open");
     }
 
+    @Test
+    void autoMergeMergesReadyPrAndAdvancesStory(@TempDir Path root) throws Exception {
+        // Fully autonomous merge: with workflow.auto_merge=true, a ready PR
+        // (clean Codex review at head + green CI + no unresolved threads) is
+        // merged by the controller and the story advances — no manual gate.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q");
+        Files.createDirectories(root.resolve("prompts"));
+        Files.createDirectories(root.resolve("state"));
+
+        String head = "90bb92b6304993d218f317070fbef07e236b5142";
+        Map<String, Object> prSnapshot = map(
+                "number", 178, "state", "OPEN", "mergedAt", null,
+                "headRefOid", head, "headRefName", "story/47-x", "url", "http://x/pr/178",
+                "reviewDecision", "", "mergeable", "MERGEABLE", "mergeStateStatus", "CLEAN",
+                "statusCheckRollup", List.of(map("status", "COMPLETED", "conclusion", "SUCCESS")),
+                "reviewThreadsAvailable", true, "reviewThreads", new ArrayList<>(),
+                "reviews", new ArrayList<>(),
+                "comments", List.of(map("author", map("login", "chatgpt-codex-connector[bot]"),
+                        "body", "Codex Review: Didn't find any major issues.\n\n"
+                                + "**Reviewed commit:** `90bb92b630`")));
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", false),
+                "budgets", map(),
+                "workflow", map("auto_merge", true,
+                        "allow_push", true, "allow_comments", true));
+
+        Map<String, Object> state = new LinkedHashMap<>();
+        state.put("phase", "WAITING_FOR_MANUAL_MERGE");
+        state.put("current_story", 47);
+        state.put("current_pr", 178);
+        state.put("branch", "story/47-x");
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        WorkflowLock lock = WorkflowLock.acquire(root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+        DeliveryGitHub github = new DeliveryGitHub(prSnapshot);
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #47", "url", "http://x/27");
+
+        // Fake git so the story branch is checked out and the worktree is clean.
+        GitOperations.GitRunner gitRunner = (r, args) -> {
+            String key = String.join(" ", args);
+            if (key.startsWith("branch --show-current")) {
+                return new GitOperations.GitResult(0, "story/47-x\n", "");
+            }
+            if (key.startsWith("branch --list")) {
+                return new GitOperations.GitResult(0, "story/47-x\n", "");
+            }
+            return new GitOperations.GitResult(0, "", "");
+        };
+        Controller.GitOperationsFactory gitFactory = new Controller.GitOperationsFactory(repo) {
+            @Override
+            public GitOperations create() {
+                return new GitOperations(repo, gitRunner);
+            }
+        };
+
+        WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                config, state, store, github, repo, root, epic, 27, false,
+                gitFactory, new CodexRunner(), new ReviewCoordinator(), lock);
+
+        int code = orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
+
+        assertThat(code).isEqualTo(0);
+        assertThat(github.mergedPrs).extracting(a -> a[0]).contains(178);
+        // Story advanced: cleared current story and recorded completion.
+        assertThat(state.get("current_story")).isNull();
+        @SuppressWarnings("unchecked")
+        List<Object> completed = (List<Object>) state.get("completed_stories");
+        assertThat(completed).contains(47);
+        lock.release();
+    }
+
+    @Test
+    void autoMergeDoesNotForceConflictingPrAndRoutesToReconcile(@TempDir Path root) throws Exception {
+        // auto_merge must NEVER force a conflicting PR. A CONFLICTING/DIRTY
+        // merge state routes to reconciliation (rebase/resolve), not a merge.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q");
+        Files.createDirectories(root.resolve("prompts"));
+        Files.createDirectories(root.resolve("state"));
+
+        String head = "90bb92b6304993d218f317070fbef07e236b5142";
+        Map<String, Object> prSnapshot = map(
+                "number", 178, "state", "OPEN", "mergedAt", null,
+                "headRefOid", head, "headRefName", "story/47-x", "url", "http://x/pr/178",
+                "reviewDecision", "", "mergeable", "CONFLICTING", "mergeStateStatus", "DIRTY",
+                "statusCheckRollup", List.of(map("status", "COMPLETED", "conclusion", "SUCCESS")),
+                "reviewThreadsAvailable", true, "reviewThreads", new ArrayList<>(),
+                "reviews", new ArrayList<>(),
+                "comments", List.of(map("author", map("login", "chatgpt-codex-connector[bot]"),
+                        "body", "Codex Review: Didn't find any major issues.\n\n"
+                                + "**Reviewed commit:** `90bb92b630`")));
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", false),
+                "budgets", map(),
+                "workflow", map("auto_merge", true, "allow_push", true, "allow_comments", true));
+
+        Map<String, Object> state = new LinkedHashMap<>();
+        state.put("phase", "WAITING_FOR_MANUAL_MERGE");
+        state.put("current_story", 47);
+        state.put("current_pr", 178);
+        state.put("branch", "story/47-x");
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        WorkflowLock lock = WorkflowLock.acquire(root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+        DeliveryGitHub github = new DeliveryGitHub(prSnapshot);
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #47", "url", "http://x/27");
+        GitOperations.GitRunner gitRunner = (r, args) -> {
+            String key = String.join(" ", args);
+            if (key.startsWith("branch --show-current") || key.startsWith("branch --list")) {
+                return new GitOperations.GitResult(0, "story/47-x\n", "");
+            }
+            return new GitOperations.GitResult(0, "", "");
+        };
+        Controller.GitOperationsFactory gitFactory = new Controller.GitOperationsFactory(repo) {
+            @Override
+            public GitOperations create() {
+                return new GitOperations(repo, gitRunner);
+            }
+        };
+
+        WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                config, state, store, github, repo, root, epic, 27, false,
+                gitFactory, new CodexRunner(), new ReviewCoordinator(), lock);
+
+        orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
+
+        // No merge happened; routed to reconciliation to rebase/resolve.
+        assertThat(github.mergedPrs).isEmpty();
+        assertThat(state.get("phase")).isEqualTo("BLOCKED_REQUIREMENTS");
+        assertThat((String) state.get("error")).contains("merge conflicts");
+        lock.release();
+    }
+
+    @Test
+    void autoMergeDoesNotBypassBranchProtection(@TempDir Path root) throws Exception {
+        // A BLOCKED merge state (branch protection / required approvals) must be
+        // surfaced, never bypassed by the automation.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q");
+        Files.createDirectories(root.resolve("prompts"));
+        Files.createDirectories(root.resolve("state"));
+
+        String head = "90bb92b6304993d218f317070fbef07e236b5142";
+        Map<String, Object> prSnapshot = map(
+                "number", 178, "state", "OPEN", "mergedAt", null,
+                "headRefOid", head, "headRefName", "story/47-x", "url", "http://x/pr/178",
+                "reviewDecision", "", "mergeable", "MERGEABLE", "mergeStateStatus", "BLOCKED",
+                "statusCheckRollup", List.of(map("status", "COMPLETED", "conclusion", "SUCCESS")),
+                "reviewThreadsAvailable", true, "reviewThreads", new ArrayList<>(),
+                "reviews", new ArrayList<>(),
+                "comments", List.of(map("author", map("login", "chatgpt-codex-connector[bot]"),
+                        "body", "Codex Review: Didn't find any major issues.\n\n"
+                                + "**Reviewed commit:** `90bb92b630`")));
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", false),
+                "budgets", map(),
+                "workflow", map("auto_merge", true, "allow_push", true, "allow_comments", true));
+
+        Map<String, Object> state = new LinkedHashMap<>();
+        state.put("phase", "WAITING_FOR_MANUAL_MERGE");
+        state.put("current_story", 47);
+        state.put("current_pr", 178);
+        state.put("branch", "story/47-x");
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        WorkflowLock lock = WorkflowLock.acquire(root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+        DeliveryGitHub github = new DeliveryGitHub(prSnapshot);
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #47", "url", "http://x/27");
+        GitOperations.GitRunner gitRunner = (r, args) -> {
+            String key = String.join(" ", args);
+            if (key.startsWith("branch --show-current") || key.startsWith("branch --list")) {
+                return new GitOperations.GitResult(0, "story/47-x\n", "");
+            }
+            return new GitOperations.GitResult(0, "", "");
+        };
+        Controller.GitOperationsFactory gitFactory = new Controller.GitOperationsFactory(repo) {
+            @Override
+            public GitOperations create() {
+                return new GitOperations(repo, gitRunner);
+            }
+        };
+
+        WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                config, state, store, github, repo, root, epic, 27, false,
+                gitFactory, new CodexRunner(), new ReviewCoordinator(), lock);
+
+        orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
+
+        assertThat(github.mergedPrs).isEmpty();
+        assertThat(state.get("phase")).isEqualTo("BLOCKED_EXTERNAL");
+        assertThat((String) state.get("error")).contains("branch protection");
+        lock.release();
+    }
+
     /** Fake GitHub serving an existing PR and recording thread mutations. */
     private static final class DeliveryGitHub extends GitHub {
         final List<String> resolvedThreads = new ArrayList<>();
         final List<String[]> repliedThreads = new ArrayList<>();
+        final List<int[]> mergedPrs = new ArrayList<>();
         private final Map<String, Object> prSnapshot;
 
         DeliveryGitHub(Map<String, Object> prSnapshot) {
@@ -518,6 +735,11 @@ class WorkflowOrchestratorIntegrationTest {
         public void comment(int number, String body) {
             // recorded elsewhere; not needed for these assertions
         }
+
+        @Override
+        public void mergePr(int number, String method) {
+            mergedPrs.add(new int[] {number});
+        }
     }
 
     @Test
@@ -552,7 +774,7 @@ class WorkflowOrchestratorIntegrationTest {
                 "automation", map("dry_run", false, "delivery_verification_attempts", 1,
                         "delivery_verification_delay_seconds", 0),
                 "budgets", map(),
-                "workflow", map("require_manual_merge", true, "allow_push", true,
+                "workflow", map("allow_push", true,
                         "allow_comments", true, "allow_thread_resolution", true));
 
         Map<String, Object> state = new LinkedHashMap<>();
@@ -632,7 +854,7 @@ class WorkflowOrchestratorIntegrationTest {
                 "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
                 "automation", map("dry_run", true),
                 "budgets", map(),
-                "workflow", map("require_manual_merge", true));
+                "workflow", map());
 
         Map<String, Object> state = new LinkedHashMap<>();
         state.put("phase", "WAITING_FOR_MANUAL_MERGE");
@@ -686,7 +908,7 @@ class WorkflowOrchestratorIntegrationTest {
                 "epic", map("number", 27),
                 "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
                 "automation", map("dry_run", true), "budgets", map(),
-                "workflow", map("require_manual_merge", true));
+                "workflow", map());
 
         Map<String, Object> state = new LinkedHashMap<>();
         state.put("phase", "FIXING_FEEDBACK");
@@ -744,7 +966,7 @@ class WorkflowOrchestratorIntegrationTest {
                 "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
                 "automation", map("dry_run", true, "max_feedback_attempts", 3),
                 "budgets", map(),
-                "workflow", map("require_manual_merge", true));
+                "workflow", map());
 
         Map<String, Object> state = new LinkedHashMap<>();
         state.put("phase", "FIXING_FEEDBACK");
@@ -806,7 +1028,7 @@ class WorkflowOrchestratorIntegrationTest {
                 "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
                 "automation", map("dry_run", true, "max_feedback_attempts", 99),
                 "budgets", map(),
-                "workflow", map("require_manual_merge", true));
+                "workflow", map());
 
         Map<String, Object> state = new LinkedHashMap<>();
         state.put("phase", "FIXING_FEEDBACK");
@@ -876,7 +1098,7 @@ class WorkflowOrchestratorIntegrationTest {
                 "epic", map("number", 27),
                 "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
                 "automation", map("dry_run", true, "max_feedback_attempts", 99), "budgets", map(),
-                "workflow", map("require_manual_merge", true));
+                "workflow", map());
 
         // feedback.md is the dispatch prompt for FIXING_FEEDBACK.
         Files.writeString(root.resolve("prompts").resolve("common.md"), "COMMON");

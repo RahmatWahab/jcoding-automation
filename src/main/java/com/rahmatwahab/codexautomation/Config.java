@@ -18,7 +18,8 @@ import java.util.Set;
  * Loads and validates the JSON configuration. The
  * keys, defaults, and validation
  * rules are preserved exactly so behavior parity holds. The mandatory
- * {@code workflow.require_manual_merge=true} safety invariant is enforced.</p>
+ * {@code workflow.auto_merge} merge policy is validated (default false =
+ * manual merge; true = fully autonomous merge).</p>
  */
 public final class Config {
 
@@ -31,7 +32,7 @@ public final class Config {
             Set.of("implementing", "verifying", "reviewing_code", "fixing_feedback", "reconciling");
     private static final List<String> MUTATION_FLAGS = List.of(
             "allow_push", "allow_pr_creation", "allow_comments",
-            "allow_thread_resolution", "require_manual_merge");
+            "allow_thread_resolution", "auto_merge");
 
     private Config() {
     }
@@ -125,10 +126,11 @@ public final class Config {
             }
         }
 
-        Object manualMerge = workflow.getOrDefault("require_manual_merge", Boolean.TRUE);
-        if (!Boolean.TRUE.equals(manualMerge)) {
-            missing.add("workflow.require_manual_merge(must be true)");
-        }
+        // Merge policy is governed by the single boolean workflow.auto_merge.
+        // Default false = manual merge (the automation posts READY TO MERGE and
+        // never merges). true = fully autonomous merge by the controller. The
+        // boolean type is validated with the other mutation flags above; no
+        // further merge-policy checks are needed.
 
         if (!missing.isEmpty()) {
             throw new IllegalArgumentException("invalid configuration: " + String.join(", ", missing));

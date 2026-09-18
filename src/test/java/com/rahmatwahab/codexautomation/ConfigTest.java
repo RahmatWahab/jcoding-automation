@@ -28,7 +28,7 @@ class ConfigTest {
                 "repository", map("local_path", "/repo", "owner", "o", "name", "n"),
                 "epic", map("number", 1),
                 "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
-                "workflow", map("require_manual_merge", true));
+                "workflow", map());
     }
 
     @Test
@@ -50,12 +50,9 @@ class ConfigTest {
     }
 
     @Test
-    void manualMergeCannotBeDisabled() {
-        Map<String, Object> config = valid();
-        Config.section(config, "workflow").put("require_manual_merge", false);
-        assertThatThrownBy(() -> Config.validate(config))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("require_manual_merge");
+    void defaultMergePolicyIsManual() {
+        // No auto_merge flag = manual merge; config is valid.
+        assertThatCode(() -> Config.validate(valid())).doesNotThrowAnyException();
     }
 
     @Test
@@ -113,11 +110,19 @@ class ConfigTest {
     }
 
     @Test
-    void nonPositiveMaxFeedbackAttemptsIsValidated() {
+    void autoMergeTrueIsAccepted() {
+        // auto_merge=true enables fully autonomous merge; config is valid.
         Map<String, Object> config = valid();
-        config.put("automation", map("max_feedback_attempts", 0));
+        Config.section(config, "workflow").put("auto_merge", true);
+        assertThatCode(() -> Config.validate(config)).doesNotThrowAnyException();
+    }
+
+    @Test
+    void autoMergeFlagMustBeBoolean() {
+        Map<String, Object> config = valid();
+        Config.section(config, "workflow").put("auto_merge", "true");
         assertThatThrownBy(() -> Config.validate(config))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("max_feedback_attempts");
+                .hasMessageContaining("auto_merge");
     }
 }

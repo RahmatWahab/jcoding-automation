@@ -164,7 +164,7 @@ public class GitHub {
     public Map<String, Object> pr(int number) {
         Map<String, Object> data = runObject("pr", "view", String.valueOf(number), "--repo", repo,
                 "--json", "number,state,isDraft,mergedAt,headRefName,headRefOid,url,"
-                        + "reviewDecision,comments,reviews,statusCheckRollup");
+                        + "reviewDecision,comments,reviews,statusCheckRollup,mergeable,mergeStateStatus");
         try {
             List<Object> nodes = new ArrayList<>();
             String cursor = null;
@@ -229,6 +229,21 @@ public class GitHub {
 
     public void comment(int number, String body) {
         run("pr", "comment", String.valueOf(number), "--repo", repo, "--body", body);
+    }
+
+    /**
+     * Merge a pull request. {@code method} selects the merge strategy
+     * ("merge", "squash", or "rebase"). Used only when the fully autonomous
+     * {@code workflow.auto_merge} policy is enabled; the default policy keeps
+     * the manual-merge gate and never calls this.
+     */
+    public void mergePr(int number, String method) {
+        String strategy = switch (method == null ? "" : method) {
+            case "squash" -> "--squash";
+            case "rebase" -> "--rebase";
+            default -> "--merge";
+        };
+        run("pr", "merge", String.valueOf(number), "--repo", repo, strategy);
     }
 
     public void resolveThread(String threadId) {
