@@ -306,10 +306,50 @@ final class WorkflowOrchestrator {
                 int maxAttempts = (int) Engine.asLongOrDefault(
                         automation.get("max_feedback_attempts"), 3);
                 if (feedbackAttempts > maxAttempts) {
+                    // Fully autonomous: do not dead-end at "manual review". After
+                    // the feedback cap on an unchanging head, deliver whatever
+                    // controller-owned changes exist, auto-resolve the open
+                    // threads, re-trigger @codex review, and let CI plus the
+                    // mandatory manual-merge gate validate. This mirrors the
+                    // resume-guard auto-deliver and guarantees no loop/dead-end.
+                    if (!dryRun && Engine.asBool(workflow.get("allow_push"), false)) {
+                        log.info("FEEDBACK AUTO-DELIVER: PR #{} head {} reprocessed {} times "
+                                + "without advancing; delivering and deferring to CI",
+                                currentPr.get("number"), shortSha(head), feedbackAttempts);
+                        state.put("phase", "WAITING_FOR_CI");
+                        state.put("result_status", "SUCCESS");
+                        state.put("result_evidence", "DEFERRED_TO_CI");
+                        state.put("delivery_mode", "CI_DEFERRED");
+                        state.remove("feedback_guard_head");
+                        state.remove("feedback_attempts");
+                        state.remove("error");
+                        GitOperations fbGit = gitFactory.create();
+                        try {
+                            fbGit.checkoutStoryBranch(Engine.asString(state.get("branch")));
+                        } catch (RuntimeException exc) {
+                            log.error("FEEDBACK AUTO-DELIVER: checkout failed: {}", exc.getMessage());
+                        }
+                        save();
+                        int deliveryResult = runDeliveryPipeline(
+                                fbGit, current, currentPr, "", new ArrayList<>(feedback), true);
+                        state.put("run_finished_at", Controller.now());
+                        save();
+                        if (state.get("current_pr") != null) {
+                            log.info("FEEDBACK AUTO-DELIVER COMPLETE: PR #{} phase={}",
+                                    currentPr.get("number"), state.get("phase"));
+                        } else {
+                            log.error("FEEDBACK AUTO-DELIVER incomplete: phase={} error={}",
+                                    state.get("phase"), state.get("error"));
+                        }
+                        return deliveryResult == Integer.MIN_VALUE ? 0 : deliveryResult;
+                    }
+                    // Simulation (dry-run) or push disabled: record and stop
+                    // without pretending to deliver.
                     state.put("phase", "BLOCKED_EXTERNAL");
                     state.put("error", "Feedback for PR #" + currentPr.get("number")
                             + " head " + shortSha(head) + " was reprocessed " + feedbackAttempts
-                            + " times without resolution; manual review required");
+                            + " times without resolution and delivery is disabled (dry_run or "
+                            + "allow_push=false)");
                     save();
                     log.error("BLOCKED: " + state.get("error"));
                     return 1;

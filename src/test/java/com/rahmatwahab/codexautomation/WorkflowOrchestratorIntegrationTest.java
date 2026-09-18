@@ -1350,7 +1350,92 @@ class WorkflowOrchestratorIntegrationTest {
 
         assertThat(code).isEqualTo(1);
         assertThat(state.get("phase")).isEqualTo("BLOCKED_EXTERNAL");
-        assertThat((String) state.get("error")).contains("manual review required");
+        assertThat((String) state.get("error")).contains("delivery is disabled");
+        lock.release();
+    }
+
+    @Test
+    void feedbackLoopGuardAutoDeliversInLiveModeNeverBlocks(@TempDir Path root) throws Exception {
+        // Fully autonomous: after the feedback cap on an unchanging head, live
+        // mode must auto-deliver and defer to CI, NOT dead-end at manual review.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q");
+        Files.createDirectories(root.resolve("prompts"));
+        Files.createDirectories(root.resolve("state"));
+
+        String head = "abc123def456";
+        Map<String, Object> prSnapshot = map(
+                "number", 181, "state", "OPEN", "mergedAt", null,
+                "headRefOid", head, "headRefName", "story/180-x", "url", "http://x/pr/181",
+                "reviewDecision", "", "statusCheckRollup", new ArrayList<>(),
+                "reviewThreadsAvailable", true, "comments", new ArrayList<>(),
+                "reviews", List.of(map("author", map("login", "chatgpt-codex-connector"),
+                        "submittedAt", "2026-02-01", "commit", map("oid", head))),
+                "reviewThreads", List.of(map("id", "PRRT_1", "isResolved", false,
+                        "comments", map("nodes", List.of(map("id", "PRRC_1",
+                                "body", "please fix this bug", "createdAt", "2026-01-01",
+                                "author", map("login", "reviewer")))))));
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", false, "max_feedback_attempts", 3,
+                        "delivery_verification_attempts", 1, "delivery_verification_delay_seconds", 0),
+                "budgets", map(),
+                "workflow", map("auto_merge", false, "allow_push", true,
+                        "allow_comments", true, "allow_thread_resolution", true));
+
+        Map<String, Object> state = new LinkedHashMap<>();
+        state.put("phase", "FIXING_FEEDBACK");
+        state.put("current_story", 180);
+        state.put("current_pr", 181);
+        state.put("branch", "story/180-x");
+        state.put("feedback_guard_head", head);
+        state.put("feedback_attempts", 3);
+
+        GitOperations.GitRunner gitRunner = (r, args) -> {
+            String key = String.join(" ", args);
+            if (key.startsWith("status --porcelain")) {
+                return new GitOperations.GitResult(0, " M src/impl.txt\n", "");
+            }
+            if (key.startsWith("branch --show-current") || key.startsWith("branch --list")) {
+                return new GitOperations.GitResult(0, "story/180-x\n", "");
+            }
+            if (key.startsWith("rev-parse HEAD")) {
+                return new GitOperations.GitResult(0, head + "\n", "");
+            }
+            if (key.startsWith("ls-remote origin")) {
+                return new GitOperations.GitResult(0, head + "\trefs/heads/story/180-x\n", "");
+            }
+            return new GitOperations.GitResult(0, "", "");
+        };
+        Controller.GitOperationsFactory gitFactory = new Controller.GitOperationsFactory(repo) {
+            @Override
+            public GitOperations create() {
+                return new GitOperations(repo, gitRunner);
+            }
+        };
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        WorkflowLock lock = WorkflowLock.acquire(root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+        DeliveryGitHub github = new DeliveryGitHub(prSnapshot);
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #180", "url", "http://x/27");
+
+        WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                config, state, store, github, repo, root, epic, 27, false,
+                gitFactory, new CodexRunner(), new ReviewCoordinator(), lock);
+
+        int code = orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
+
+        // Auto-delivered, not blocked: committed, deferred to CI, threads handled.
+        assertThat(code).isEqualTo(0);
+        assertThat(state.get("phase")).isEqualTo("WAITING_FOR_CI");
+        assertThat(state.get("phase")).isNotEqualTo("BLOCKED_EXTERNAL");
+        assertThat(state.get("delivery_mode")).isEqualTo("CI_DEFERRED");
         lock.release();
     }
 
