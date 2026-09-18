@@ -331,6 +331,101 @@ public final class Engine {
     private static final Set<String> STOP_PHASES = Set.of(
             "BLOCKED_REQUIREMENTS", "BLOCKED_EXTERNAL", "CONFLICT_DETECTED");
 
+    // -- deviation detection (generic supervisor sensor) ---------------------
+
+    /**
+     * A detected workflow deviation: the controller's deterministic signal that
+     * something is incorrect, stalled, or cannot complete, so the reasoning
+     * (reconcile) supervisor should diagnose and propose a bounded recovery.
+     *
+     * @param code       stable machine code for routing/telemetry
+     * @param detail     human-readable explanation (also injected into the prompt)
+     * @param recoverable true when the controller should escalate to reasoning;
+     *                    false for hard-safety stops that must not be overridden
+     */
+    public record Deviation(String code, String detail, boolean recoverable) {
+    }
+
+    /**
+     * Generic deviation detector. Inspects the durable state and the current PR
+     * snapshot and returns a {@link Deviation} when the workflow is in an
+     * incorrect, stalled, or incomplete condition that the deterministic path
+     * cannot itself resolve. Returns {@code null} when the workflow is healthy
+     * (progressing or legitimately waiting).
+     *
+     * <p>Pure and side-effect free so it is fully unit-testable. The controller
+     * decides what to do with the result (escalate to reconcile, or refuse to
+     * override a hard-safety stop).</p>
+     */
+    public static Deviation detectDeviation(Map<String, Object> state, Map<String, Object> pr,
+                                            int maxPhaseAttempts) {
+        String phase = asString(state.get("phase"));
+        boolean hasPr = state.get("current_pr") != null;
+        boolean committed = !asString(state.get("last_processed_commit")).isEmpty();
+        boolean hasBranch = !asString(state.get("branch")).isEmpty();
+        int attempts = (int) asLongOrDefault(state.get("phase_attempt"), 0);
+
+        // Hard-safety stops: real conflicts must be reconciled, but the
+        // supervisor must never be told it can force past them.
+        if ("CONFLICT_DETECTED".equals(phase)) {
+            return new Deviation("CONFLICT", "Conflicting state requires reconciliation: "
+                    + asString(state.get("error")), true);
+        }
+
+        // Committed implementation but no PR: work is done yet undelivered.
+        if (committed && hasBranch && !hasPr) {
+            return new Deviation("COMMITTED_NO_PR",
+                    "Implementation is committed on " + asString(state.get("branch"))
+                    + " but no pull request exists; the delivery step did not complete.", true);
+        }
+
+        // Blocked phases that are not hard-external: escalate for diagnosis.
+        if ("BLOCKED_EXTERNAL".equals(phase) || "BLOCKED_REQUIREMENTS".equals(phase)
+                || "CODEX_FAILURE".equals(phase) || "FAILED_RECOVERABLE".equals(phase)) {
+            return new Deviation("BLOCKED_PHASE",
+                    "Workflow is in blocked phase " + phase + ": " + asString(state.get("error")), true);
+        }
+
+        // Stalled: the same phase re-entered too many times without progress.
+        if (attempts > Math.max(1, maxPhaseAttempts)
+                && !WAIT_PHASES.contains(phase) && !"MERGED".equals(phase)) {
+            return new Deviation("STALLED_PHASE",
+                    "Phase " + phase + " re-entered " + attempts
+                    + " times without completing; likely stalled.", true);
+        }
+
+        // Cross-story contamination: a review cursor that does not belong to the
+        // current PR head indicates stale leaked state.
+        if (hasPr && pr != null) {
+            String head = asString(pr.get("headRefOid"));
+            String connectorCursor = asString(state.get("last_connector_review_commit"));
+            if (!head.isEmpty() && !connectorCursor.isEmpty()
+                    && !connectorCursor.equals(head)
+                    && !asString(state.get("last_processed_commit")).equals(connectorCursor)) {
+                // Only a deviation if the cursor references neither the head nor
+                // the delivered commit — i.e. it is stale/foreign.
+                boolean cursorKnown = false;
+                for (Object r : asList(pr.get("reviews"))) {
+                    if (r instanceof Map<?, ?> rm) {
+                        Object c = ((Map<?, ?>) rm).get("commit");
+                        if (c instanceof Map<?, ?> cm && head.equals(asString(cm.get("oid"))))  {
+                            cursorKnown = true;
+                            break;
+                        }
+                    }
+                }
+                if (!cursorKnown && !connectorCursor.equals(head)) {
+                    return new Deviation("STALE_REVIEW_CURSOR",
+                            "last_connector_review_commit " + connectorCursor
+                            + " does not match the current PR head " + head
+                            + "; stale cross-story state.", true);
+                }
+            }
+        }
+
+        return null;
+    }
+
     /** Determine the controller action for a phase without side effects. */
     public static String nextAction(String phase, boolean hasNewFeedback) {
         if (hasNewFeedback) {

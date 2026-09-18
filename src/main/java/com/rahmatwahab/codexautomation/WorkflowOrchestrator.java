@@ -477,10 +477,73 @@ final class WorkflowOrchestrator {
                 return 0;
             }
             if (Set.of("BLOCKED_EXTERNAL", "CONFLICT_DETECTED").contains(phase)) {
-                save();
-                log.info("STOPPED: story #" + current + ", phase=" + state.get("phase"));
-                return 1;
+                // Do not dead-end: let the generic deviation supervisor below
+                // detect this and escalate to the reasoning reconcile phase.
+                // Only a non-recoverable deviation results in a hard stop.
+                int maxAttempts = (int) Engine.asLongOrDefault(
+                        automation.get("max_phase_attempts"), 5);
+                Engine.Deviation stopDeviation = Engine.detectDeviation(state, currentPr, maxAttempts);
+                if (stopDeviation == null || !stopDeviation.recoverable()) {
+                    save();
+                    log.info("STOPPED: story #" + current + ", phase=" + state.get("phase"));
+                    return 1;
+                }
+                log.info("STOP DEFERRED: story #{} phase={} — escalating to supervisor",
+                        current, phase);
+                // fall through to the deviation supervisor
             }
+        }
+
+        // ── Generic deviation supervisor (intelligence on exception) ──────────
+        // The controller deterministically detects any deviation, stall, or
+        // inability to complete, then routes to the reasoning layer instead of
+        // re-running the same phase or dead-ending. Codex (reconcile) diagnoses
+        // and proposes a bounded recovery; the controller validates and applies
+        // it. This is the single, general mechanism that replaces per-case
+        // patches — "if the controller sees anything incorrect, think and fix".
+        int maxPhaseAttempts = (int) Engine.asLongOrDefault(
+                automation.get("max_phase_attempts"), 5);
+        Engine.Deviation deviation = Engine.detectDeviation(state, currentPr, maxPhaseAttempts);
+        if (deviation != null && deviation.recoverable()) {
+            log.info("DEVIATION DETECTED: code={} — {}", deviation.code(), deviation.detail());
+            state.put("deviation_code", deviation.code());
+            state.put("deviation_detail", deviation.detail());
+
+            // Fast, deterministic recovery when the fix is obvious and safe:
+            // committed work with no PR just needs the PR opened and CI to run.
+            boolean committedNoPr = "COMMITTED_NO_PR".equals(deviation.code());
+            if (!dryRun && committedNoPr
+                    && Engine.asBool(workflow.get("allow_push"), false)
+                    && Engine.asBool(workflow.get("allow_pr_creation"), false)) {
+                GitOperations recoveryGit = gitFactory.create();
+                try {
+                    recoveryGit.checkoutStoryBranch(Engine.asString(state.get("branch")));
+                } catch (RuntimeException ignored) {
+                    // best-effort; createStoryPr re-derives the branch
+                }
+                log.info("SUPERVISOR RECOVERY: story #{} committed but no PR (phase {}, attempt {}); "
+                        + "creating PR and deferring to CI", current,
+                        Engine.asString(state.get("phase")), state.get("phase_attempt"));
+                state.put("phase", "WAITING_FOR_CI");
+                state.put("result_status", "SUCCESS");
+                state.put("result_evidence", "DEFERRED_TO_CI");
+                state.put("delivery_mode", "CI_DEFERRED");
+                state.remove("error");
+                save();
+                int deliveryResult = runDeliveryPipeline(
+                        recoveryGit, current, null, "", new ArrayList<>(), true);
+                state.put("run_finished_at", Controller.now());
+                save();
+                return deliveryResult == Integer.MIN_VALUE ? 0 : deliveryResult;
+            }
+
+            // Otherwise escalate to the reasoning supervisor (reconcile.md),
+            // which diagnoses the deviation and returns a bounded recovery
+            // action the controller validates and applies. Force the reconcile
+            // prompt regardless of the raw phase so the intelligence layer runs.
+            forcedPrompt = "prompts/reconcile.md";
+            log.info("SUPERVISOR ESCALATION: routing deviation {} to reasoning reconcile",
+                    deviation.code());
         }
 
         // Phase dispatch: render prompt and run the bounded worker.

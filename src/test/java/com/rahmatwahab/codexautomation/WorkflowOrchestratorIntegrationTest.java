@@ -344,11 +344,230 @@ class WorkflowOrchestratorIntegrationTest {
         lock.release();
     }
 
+    @Test
+    void blockedDeviationWithPrEscalatesToReconcileSupervisor(@TempDir Path root) throws Exception {
+        // Generic supervisor: a story with committed work stalled in a blocked
+        // phase (no PR-scoped wait applies) must escalate to the reasoning
+        // reconcile prompt, whose bounded recovery the controller applies —
+        // instead of dead-ending or re-running the same phase.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q");
+        Path prompts = root.resolve("prompts");
+        Files.createDirectories(prompts);
+        Files.writeString(prompts.resolve("common.md"), "COMMON");
+        Files.writeString(prompts.resolve("reconcile.md"), "{{COMMON}}\nSupervisor reconcile.");
+        Files.createDirectories(root.resolve("state"));
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", true, "max_phase_attempts", 5),
+                "budgets", map(),
+                "workflow", map("auto_merge", false));
+
+        Map<String, Object> state = new LinkedHashMap<>();
+        // Blocked phase, no PR, no committed work -> BLOCKED_PHASE deviation
+        // that must escalate to the reasoning supervisor.
+        state.put("phase", "BLOCKED_REQUIREMENTS");
+        state.put("current_story", 47);
+        state.put("current_pr", null);
+        state.put("branch", "");
+        state.put("error", "some earlier blocker");
+
+        boolean[] reconcileRan = {false};
+        CodexRunner codex = new CodexRunner(Map.of(), System::nanoTime) {
+            @Override
+            public CodexResult run(Map<String, Object> cfg, Path prompt, Path r, boolean dry,
+                                   Runnable hb, Integer timeout) {
+                try {
+                    if (java.nio.file.Files.readString(prompt).contains("Supervisor reconcile")) {
+                        reconcileRan[0] = true;
+                    }
+                } catch (Exception ignored) {
+                    // ignore
+                }
+                return new CodexResult(0,
+                        "DECISION_ACTION: RESUME_IMPLEMENTATION\nDECISION_REASON: continue work\n"
+                        + "BLOCKER_CLASS: NONE\nRECOVERY_ACTION: implement\n"
+                        + "RESULT_STATUS: SUCCESS\nRESULT_NEXT_PHASE: IMPLEMENTING\n"
+                        + "RESULT_BLOCKER: NONE\nRESULT_EVIDENCE: COMPLETE\n");
+            }
+        };
+
+        GitOperations.GitRunner gitRunner = (r, args) -> {
+            String key = String.join(" ", args);
+            if (key.startsWith("status --porcelain")) {
+                return new GitOperations.GitResult(0, "", "");
+            }
+            return new GitOperations.GitResult(0, "", "");
+        };
+        Controller.GitOperationsFactory gitFactory = new Controller.GitOperationsFactory(repo) {
+            @Override
+            public GitOperations create() {
+                return new GitOperations(repo, gitRunner);
+            }
+        };
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        WorkflowLock lock = WorkflowLock.acquire(root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+        // Story #47 must be closed-eligible; use a GitHub that returns it OPEN.
+        GitHub github = new GitHub("owner", "repo", "GH_TOKEN", "gh", 30,
+                (command, timeout) -> new GitHub.CommandResult(0, "{}", ""), name -> "t") {
+            @Override
+            public Object issue(int number) {
+                if (number == 27) {
+                    return map("number", 27, "title", "EPIC", "state", "OPEN",
+                            "body", "Stories: #47", "url", "http://x/27");
+                }
+                return map("number", number, "title", "Story " + number, "state", "OPEN",
+                        "body", "Acceptance", "url", "http://x/" + number);
+            }
+
+            @Override
+            public Object prs() {
+                return new ArrayList<>();
+            }
+        };
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #47", "url", "http://x/27");
+
+        WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                config, state, store, github, repo, root, epic, 27, true,
+                gitFactory, codex, new ReviewCoordinator(), lock);
+
+        orchestrator.reconcileAndExecute(new ArrayList<>(), null);
+
+        // The deviation was detected and routed to the reasoning supervisor.
+        assertThat(state.get("deviation_code")).isEqualTo("BLOCKED_PHASE");
+        assertThat(reconcileRan[0]).isTrue();
+        lock.release();
+    }
+
     private static void runGit(Path repo, String... args) throws Exception {
         List<String> command = new ArrayList<>(List.of("git"));
         command.addAll(List.of(args));
         Process p = new ProcessBuilder(command).directory(repo.toFile()).inheritIO().start();
         p.waitFor();
+    }
+
+    @Test
+    void committedButNoPrStuckInBlockedExternalRecoversByCreatingPr(@TempDir Path root) throws Exception {
+        // Reproduces the field failure: story #180 implementation committed
+        // (last_processed_commit set), but current_pr=null and phase stuck at
+        // BLOCKED_EXTERNAL with phase_attempt climbing (79 in the field). The
+        // controller must self-heal by creating the PR and deferring to CI,
+        // not re-run implement forever.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q");
+        Files.createDirectories(root.resolve("prompts"));
+        Files.createDirectories(root.resolve("state"));
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", false, "delivery_verification_attempts", 1,
+                        "delivery_verification_delay_seconds", 0),
+                "budgets", map(),
+                "workflow", map("auto_merge", false, "allow_push", true,
+                        "allow_pr_creation", true, "allow_comments", true));
+
+        Map<String, Object> state = new LinkedHashMap<>();
+        state.put("phase", "BLOCKED_EXTERNAL");
+        state.put("current_story", 180);
+        state.put("current_pr", null);
+        state.put("branch", "story/180-x");
+        state.put("last_processed_commit", "1f8860d981e7d3bc1dbbd9b7aec369d8948c7cf4");
+        state.put("phase_attempt", 79);
+        // Stale cross-story cursor from the previous story (the real bug data).
+        state.put("last_connector_review_commit", "90bb92b6304993d218f317070fbef07e236b5142");
+
+        boolean[] prCreated = {false};
+        GitHub github = new GitHub("owner", "repo", "GH_TOKEN", "gh", 30,
+                (command, timeout) -> new GitHub.CommandResult(0, "{}", ""), name -> "t") {
+            @Override
+            public Object issue(int number) {
+                if (number == 27) {
+                    return map("number", 27, "title", "EPIC", "state", "OPEN",
+                            "body", "Stories: #180", "url", "http://x/27");
+                }
+                return map("number", number, "title", "Story " + number, "state", "OPEN",
+                        "body", "Acceptance", "url", "http://x/" + number);
+            }
+
+            @Override
+            public Object prs() {
+                return new ArrayList<>();
+            }
+
+            @Override
+            public Object createPr(String title, String body, String base, String head) {
+                prCreated[0] = true;
+                return map("number", 200, "url", "http://x/pr/200", "state", "OPEN",
+                        "isDraft", false, "headRefName", head, "headRefOid", "1f8860d");
+            }
+
+            @Override
+            public Map<String, Object> pr(int number) {
+                return map("number", 200, "state", "OPEN", "mergedAt", null,
+                        "headRefOid", "1f8860d", "headRefName", "story/180-x",
+                        "url", "http://x/pr/200", "reviewDecision", "",
+                        "statusCheckRollup", List.of(map("status", "IN_PROGRESS")),
+                        "reviewThreadsAvailable", true, "reviewThreads", new ArrayList<>(),
+                        "reviews", new ArrayList<>(), "comments", new ArrayList<>());
+            }
+
+            @Override
+            public void comment(int number, String bodyText) {
+                // no-op
+            }
+        };
+
+        GitOperations.GitRunner gitRunner = (r, args) -> {
+            String key = String.join(" ", args);
+            if (key.startsWith("status --porcelain")) {
+                return new GitOperations.GitResult(0, "", ""); // nothing new to commit
+            }
+            if (key.startsWith("branch --show-current") || key.startsWith("branch --list")) {
+                return new GitOperations.GitResult(0, "story/180-x\n", "");
+            }
+            if (key.startsWith("rev-parse HEAD")) {
+                return new GitOperations.GitResult(0, "1f8860d\n", "");
+            }
+            if (key.startsWith("ls-remote origin")) {
+                return new GitOperations.GitResult(0, "1f8860d\trefs/heads/story/180-x\n", "");
+            }
+            return new GitOperations.GitResult(0, "", "");
+        };
+        Controller.GitOperationsFactory gitFactory = new Controller.GitOperationsFactory(repo) {
+            @Override
+            public GitOperations create() {
+                return new GitOperations(repo, gitRunner);
+            }
+        };
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        WorkflowLock lock = WorkflowLock.acquire(root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #180", "url", "http://x/27");
+
+        WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                config, state, store, github, repo, root, epic, 27, false,
+                gitFactory, new CodexRunner(), new ReviewCoordinator(), lock);
+
+        orchestrator.reconcileAndExecute(new ArrayList<>(), null);
+
+        // Self-healed: PR created, no longer stuck in BLOCKED_EXTERNAL.
+        assertThat(prCreated[0]).isTrue();
+        assertThat(state.get("current_pr")).isEqualTo(200);
+        assertThat(state.get("phase")).isEqualTo("WAITING_FOR_CI");
+        assertThat(state.get("phase")).isNotEqualTo("BLOCKED_EXTERNAL");
+        lock.release();
     }
 
     @Test

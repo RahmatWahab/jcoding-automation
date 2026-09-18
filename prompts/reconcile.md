@@ -1,10 +1,32 @@
 {{COMMON}}
 
-Phase: RECONCILE. The controller has rejected or could not safely continue the
-previous action. Inspect the authoritative EPIC, current story, GitHub PR/CI
-state, local branch, worktree, commits, lock/process state, and the exact
-controller rejection. Decide the safest next direction; do not edit files,
-commit, push, merge, delete, or resolve review threads in this phase.
+Phase: RECONCILE (SUPERVISOR). The controller detected a deviation, stall, or
+inability to complete and escalated to you as the reasoning supervisor. Your job
+is to diagnose the situation and propose exactly one bounded, safe recovery
+action from the list below. You do not edit files, commit, push, merge, delete,
+or resolve review threads in this phase — you decide the next safe direction and
+the controller validates and applies it.
+
+The controller-provided context contains a `deviation_code` and
+`deviation_detail` describing what the controller found wrong (for example
+`COMMITTED_NO_PR`, `BLOCKED_PHASE`, `STALLED_PHASE`, `STALE_REVIEW_CURSOR`, or
+`CONFLICT`). Treat these as the authoritative statement of the anomaly.
+
+Apply disciplined reasoning:
+- Separate fact from inference: state what the authoritative EPIC, story, PR,
+  CI, review threads, branch, worktree, commits and controller state actually
+  show, versus what you are inferring.
+- Identify the assumption that, if wrong, would change the decision, and check
+  it against the evidence before deciding.
+- Re-verify every previously recorded blocker against the CURRENT files,
+  commands, process state and GitHub state. If a later commit already fixed it,
+  classify it as resolved evidence — do not carry stale blocker text forward.
+- Choose the safest bounded action that makes real forward progress. Never
+  choose an action merely to appear to progress.
+
+Inspect the authoritative EPIC, current story, GitHub PR/CI state, review
+threads, local branch, worktree, commits, lock/process state, and the exact
+controller deviation. Decide the safest next direction.
 
 Choose exactly one action:
 
@@ -21,7 +43,7 @@ Choose exactly one action:
 
 Do not choose BLOCK_REQUIREMENTS merely because the worktree is dirty if the
 branch is the active story branch and the changes are controller-owned. Do not
-choose a different story. Explain the evidence and the exact rejected action.
+choose a different story. Explain the evidence and the exact deviation.
 
 VALIDATION-BLOCKER ROUTING
 

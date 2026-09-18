@@ -140,6 +140,57 @@ class EngineResultTest {
         assertThat(Engine.classifyPr(pr)).isEqualTo("READY_TO_MERGE");
     }
 
+    // -- deviation detection (generic supervisor sensor) ---------------------
+
+    @Test
+    void healthyWaitingStateHasNoDeviation() {
+        Map<String, Object> state = map("phase", "WAITING_FOR_CI",
+                "current_pr", 178, "branch", "story/47-x",
+                "last_processed_commit", "abc", "phase_attempt", 1);
+        assertThat(Engine.detectDeviation(state, prBase("headRefOid", "abc"), 5)).isNull();
+    }
+
+    @Test
+    void committedWithoutPrIsADeviation() {
+        Map<String, Object> state = map("phase", "WAITING_FOR_CODEX_REVIEW",
+                "current_pr", null, "branch", "story/180-x",
+                "last_processed_commit", "1f8860d", "phase_attempt", 3);
+        Engine.Deviation d = Engine.detectDeviation(state, null, 5);
+        assertThat(d).isNotNull();
+        assertThat(d.code()).isEqualTo("COMMITTED_NO_PR");
+        assertThat(d.recoverable()).isTrue();
+    }
+
+    @Test
+    void blockedExternalIsADeviation() {
+        Map<String, Object> state = map("phase", "BLOCKED_EXTERNAL",
+                "current_pr", null, "branch", "", "error", "stuck");
+        Engine.Deviation d = Engine.detectDeviation(state, null, 5);
+        assertThat(d).isNotNull();
+        assertThat(d.code()).isEqualTo("BLOCKED_PHASE");
+    }
+
+    @Test
+    void stalledPhaseIsADeviation() {
+        Map<String, Object> state = map("phase", "IMPLEMENTING",
+                "current_pr", null, "branch", "", "phase_attempt", 79);
+        Engine.Deviation d = Engine.detectDeviation(state, null, 5);
+        assertThat(d).isNotNull();
+        assertThat(d.code()).isEqualTo("STALLED_PHASE");
+    }
+
+    @Test
+    void staleReviewCursorIsADeviation() {
+        Map<String, Object> state = map("phase", "WAITING_FOR_CODEX_REVIEW",
+                "current_pr", 178, "branch", "story/180-x",
+                "last_processed_commit", "1f8860d",
+                "last_connector_review_commit", "90bb92b6", "phase_attempt", 2);
+        Map<String, Object> pr = prBase("headRefOid", "1f8860d", "reviews", new ArrayList<>());
+        Engine.Deviation d = Engine.detectDeviation(state, pr, 5);
+        assertThat(d).isNotNull();
+        assertThat(d.code()).isEqualTo("STALE_REVIEW_CURSOR");
+    }
+
     @Test
     void finalMachineFooterWinsOverPromptExamples() {
         String output = "RESULT_STATUS: SUCCESS|BLOCKED|FAILED\n"
