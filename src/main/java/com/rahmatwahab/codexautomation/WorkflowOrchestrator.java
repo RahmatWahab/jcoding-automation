@@ -775,6 +775,16 @@ final class WorkflowOrchestrator {
         Runnable heartbeat = () -> {
             lock.refresh();
             store.heartbeatJob(jobId, "codex pid active; phase=" + executionPhase);
+            // Also refresh the durable state heartbeat so operators (and the
+            // stale-heartbeat monitor) see the worker is alive during a long
+            // phase, not a value frozen at phase entry.
+            state.put("worker_heartbeat_at", Controller.now());
+            state.put("heartbeat_at", Controller.now());
+            try {
+                save();
+            } catch (RuntimeException ignored) {
+                // best-effort; a heartbeat persistence failure must not abort work
+            }
         };
         log.info("PHASE ENTER: {} story=#{} pr=#{} attempt={} budget={}s prompt={}",
                 executionPhase, current,
