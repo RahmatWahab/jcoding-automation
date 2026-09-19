@@ -215,6 +215,19 @@ class EngineResultTest {
     }
 
     @Test
+    void clearedStuckHeadAllowsEscalationForSameHead() {
+        // When the controller clears stuck_head (because deliverable changes
+        // exist), the same head is no longer suppressed and escalates normally.
+        Map<String, Object> state = map("phase", "BLOCKED_REQUIREMENTS",
+                "current_pr", 183, "branch", "story/48-x", "phase_attempt", 282);
+        // stuck_head deliberately absent (cleared by the controller).
+        Map<String, Object> pr = prBase("headRefOid", "765d9b0583c2");
+        Engine.Deviation d = Engine.detectDeviation(state, pr, 5);
+        assertThat(d).isNotNull();
+        assertThat(d.code()).isEqualTo("BLOCKED_PHASE");
+    }
+
+    @Test
     void finalMachineFooterWinsOverPromptExamples() {
         String output = "RESULT_STATUS: SUCCESS|BLOCKED|FAILED\n"
                 + "RESULT_NEXT_PHASE: VERIFYING|REVIEWING_CODE\n"

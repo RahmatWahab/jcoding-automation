@@ -568,6 +568,23 @@ final class WorkflowOrchestrator {
         // patches — "if the controller sees anything incorrect, think and fix".
         int maxPhaseAttempts = (int) Engine.asLongOrDefault(
                 automation.get("max_phase_attempts"), 5);
+        // A prior terminal stuck_head marker must not suppress a genuinely new
+        // fix. If the worktree now has deliverable changes (the worker produced
+        // a real fix since the head was marked stuck), clear the marker so the
+        // deviation supervisor can route it to delivery instead of treating the
+        // head as permanently dead.
+        if (!Engine.asString(state.get("stuck_head")).isEmpty()) {
+            try {
+                GitOperations probe = gitFactory.create();
+                if (probe.classifyWorktree(state) != GitOperations.WorktreeState.CLEAN) {
+                    log.info("STUCK-HEAD CLEARED: deliverable changes present; allowing delivery "
+                            + "of the new fix for head {}", shortSha(state.get("stuck_head")));
+                    state.remove("stuck_head");
+                }
+            } catch (RuntimeException ignored) {
+                // If we cannot classify, leave the marker; the guard still caps loops.
+            }
+        }
         Engine.Deviation deviation = Engine.detectDeviation(state, currentPr, maxPhaseAttempts);
         if (deviation != null && deviation.recoverable()) {
             log.info("DEVIATION DETECTED: code={} — {}", deviation.code(), deviation.detail());
