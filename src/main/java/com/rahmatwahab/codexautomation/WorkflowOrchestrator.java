@@ -906,6 +906,38 @@ final class WorkflowOrchestrator {
             }
 
             if (forceDelivery && currentPr != null) {
+                // Only auto-deliver if there are REAL uncommitted changes to
+                // deliver. If the head cannot advance and there is nothing to
+                // commit (the worker keeps producing nothing), delivering is a
+                // no-op that re-loops forever. In that genuinely-unrecoverable
+                // case, stop re-processing this head: record a terminal blocked
+                // state keyed to the head so the next run does not immediately
+                // re-enter feedback/reconcile on the same unchanged head.
+                boolean hasDeliverable;
+                try {
+                    hasDeliverable = git.classifyWorktree(state) != GitOperations.WorktreeState.CLEAN;
+                } catch (RuntimeException exc) {
+                    hasDeliverable = false;
+                }
+                if (!hasDeliverable) {
+                    state.put("phase", "BLOCKED_EXTERNAL");
+                    state.put("error", "Story #" + current + " PR #" + currentPr.get("number")
+                            + " head " + shortSha(reconcileHead) + " could not be advanced after "
+                            + "repeated resume attempts and the worker produced no deliverable "
+                            + "change; the automated worker cannot resolve the remaining feedback "
+                            + "for this head. Stopping to avoid an infinite loop.");
+                    // Mark this head as terminally stuck so the deviation
+                    // supervisor does not immediately re-escalate the same head.
+                    state.put("stuck_head", reconcileHead);
+                    state.remove("resume_guard_head");
+                    state.remove("resume_attempts");
+                    state.put("exit_code", result.exitCode());
+                    state.put("run_finished_at", Controller.now());
+                    save();
+                    cleanup(renderedPrompt);
+                    log.error("AUTO-DELIVER ABORTED (nothing to deliver): {}", state.get("error"));
+                    return 1;
+                }
                 state.put("result_status", "SUCCESS");
                 state.put("result_evidence", "DEFERRED_TO_CI");
                 state.put("delivery_mode", "CI_DEFERRED");
@@ -1029,6 +1061,9 @@ final class WorkflowOrchestrator {
                     // starts fresh rather than counting pre-commit attempts.
                     state.remove("resume_guard_head");
                     state.remove("resume_attempts");
+                    // The head advanced, so any prior terminal-stuck marker no
+                    // longer applies.
+                    state.remove("stuck_head");
                 }
                 if (currentPr != null) {
                     int attempts = (int) Engine.asLongOrDefault(
@@ -1234,6 +1269,7 @@ final class WorkflowOrchestrator {
                 "resume_guard_head", "resume_attempts",
                 "feedback_guard_head", "feedback_attempts",
                 "last_feedback_result", "last_feedback_result_head",
+                "stuck_head",
                 "feedback_reconcile_pending",
                 "last_processed_commit", "last_connector_review_commit",
                 "last_review_trigger_commit", "review_trigger_pending",

@@ -192,6 +192,29 @@ class EngineResultTest {
     }
 
     @Test
+    void stuckHeadShortCircuitsDeviation() {
+        // Loop-breaker: a head already marked terminally stuck must NOT be
+        // re-escalated, even if it is in a blocked phase with high attempts.
+        Map<String, Object> state = map("phase", "BLOCKED_EXTERNAL",
+                "current_pr", 183, "branch", "story/48-x",
+                "phase_attempt", 272, "stuck_head", "765d9b0583c2");
+        Map<String, Object> pr = prBase("headRefOid", "765d9b0583c2");
+        assertThat(Engine.detectDeviation(state, pr, 5)).isNull();
+    }
+
+    @Test
+    void newHeadClearsStuckShortCircuit() {
+        // A genuinely new head is NOT suppressed by a stale stuck_head marker.
+        Map<String, Object> state = map("phase", "BLOCKED_EXTERNAL",
+                "current_pr", 183, "branch", "story/48-x",
+                "phase_attempt", 3, "stuck_head", "oldhead");
+        Map<String, Object> pr = prBase("headRefOid", "newhead999");
+        Engine.Deviation d = Engine.detectDeviation(state, pr, 5);
+        assertThat(d).isNotNull();
+        assertThat(d.code()).isEqualTo("BLOCKED_PHASE");
+    }
+
+    @Test
     void finalMachineFooterWinsOverPromptExamples() {
         String output = "RESULT_STATUS: SUCCESS|BLOCKED|FAILED\n"
                 + "RESULT_NEXT_PHASE: VERIFYING|REVIEWING_CODE\n"

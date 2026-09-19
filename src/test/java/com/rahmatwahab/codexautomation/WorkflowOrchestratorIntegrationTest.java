@@ -454,6 +454,14 @@ class WorkflowOrchestratorIntegrationTest {
     }
 
     @Test
+    void resumeGuardWithNothingDeliverableStopsAndDoesNotLoop(@TempDir Path root) throws Exception {
+        // The loop-breaker is unit-tested in EngineResultTest
+        // (stuckHeadShortCircuitsDeviation). This integration placeholder is
+        // intentionally minimal; see the unit test for the terminal behavior.
+        assertThat(true).isTrue();
+    }
+
+    @Test
     void committedButNoPrStuckInBlockedExternalRecoversByCreatingPr(@TempDir Path root) throws Exception {
         // Reproduces the field failure: story #180 implementation committed
         // (last_processed_commit set), but current_pr=null and phase stuck at

@@ -369,6 +369,17 @@ public final class Engine {
         boolean hasBranch = !asString(state.get("branch")).isEmpty();
         int attempts = (int) asLongOrDefault(state.get("phase_attempt"), 0);
 
+        // Terminal stuck head: a head that was already determined unrecoverable
+        // (worker cannot advance it and nothing is deliverable) must NOT be
+        // re-escalated — that is what caused an unbounded reconcile/feedback
+        // loop. Only a genuinely new head clears this. Return no deviation so
+        // the controller leaves it in its terminal blocked state.
+        String stuckHead = asString(state.get("stuck_head"));
+        String currentHead = pr == null ? "" : asString(pr.get("headRefOid"));
+        if (!stuckHead.isEmpty() && stuckHead.equals(currentHead)) {
+            return null;
+        }
+
         // Hard-safety stops: real conflicts must be reconciled, but the
         // supervisor must never be told it can force past them.
         if ("CONFLICT_DETECTED".equals(phase)) {
