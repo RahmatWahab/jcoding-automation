@@ -197,6 +197,102 @@ class WorkflowOrchestratorIntegrationTest {
     }
 
     @Test
+    void liveModeIgnoresStaleStuckHeadAndDoesNotTerminallyBlock(@TempDir Path root) throws Exception {
+        // Regression (PR #187 after switching to live): a stuck_head marker was
+        // set during an earlier dry-run period. When the operator then enabled
+        // allow_push (delivery), that stale marker must NOT cause the feedback
+        // path to log "BLOCKED (terminal) ... delivery is disabled" and stop —
+        // delivery IS enabled, so the workflow must clear the stale marker and
+        // proceed on the normal live feedback path.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q");
+        Path prompts = root.resolve("prompts");
+        Files.createDirectories(prompts);
+        Files.writeString(prompts.resolve("common.md"), "COMMON");
+        Files.writeString(prompts.resolve("feedback.md"), "{{COMMON}}\nFix.");
+        Files.writeString(prompts.resolve("reconcile.md"), "{{COMMON}}\nReconcile.");
+        Files.createDirectories(root.resolve("state"));
+
+        String head = "53c56f1cba11";
+        Map<String, Object> prSnapshot = map(
+                "number", 187, "state", "OPEN", "mergedAt", null,
+                "headRefOid", head, "headRefName", "story/52-x", "url", "http://x/pr/187",
+                "reviewDecision", "CHANGES_REQUESTED", "statusCheckRollup", new ArrayList<>(),
+                "reviewThreadsAvailable", true, "comments", new ArrayList<>(),
+                "reviews", List.of(map("author", map("login", "chatgpt-codex-connector"),
+                        "submittedAt", "2026-02-01", "commit", map("oid", head))),
+                "reviewThreads", List.of(map("id", "PRRT_1", "isResolved", false,
+                        "comments", map("nodes", List.of(map("id", "PRRC_1",
+                                "body", "preserve phase route_refresh", "createdAt", "2026-01-01",
+                                "author", map("login", "reviewer")))))));
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", false, "max_feedback_attempts", 3,
+                        "delivery_verification_attempts", 1, "delivery_verification_delay_seconds", 0),
+                "budgets", map(),
+                "workflow", map("allow_push", true, "allow_comments", true,
+                        "allow_thread_resolution", true, "auto_merge", true));
+
+        // Clean worktree (fix already committed/pushed in live mode) — the old
+        // worktree-only check would have (wrongly) kept the head stuck here.
+        GitOperations.GitRunner gitRunner = (r, args) -> {
+            String key = String.join(" ", args);
+            if (key.startsWith("status --porcelain")) {
+                return new GitOperations.GitResult(0, "", "");
+            }
+            if (key.startsWith("branch --show-current") || key.startsWith("branch --list")) {
+                return new GitOperations.GitResult(0, "story/52-x\n", "");
+            }
+            if (key.startsWith("rev-parse HEAD")) {
+                return new GitOperations.GitResult(0, head + "\n", "");
+            }
+            if (key.startsWith("ls-remote origin")) {
+                return new GitOperations.GitResult(0, head + "\trefs/heads/story/52-x\n", "");
+            }
+            return new GitOperations.GitResult(0, "", "");
+        };
+        Controller.GitOperationsFactory gitFactory = new Controller.GitOperationsFactory(repo) {
+            @Override
+            public GitOperations create() {
+                return new GitOperations(repo, gitRunner);
+            }
+        };
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #52", "url", "http://x/27");
+
+        Map<String, Object> state = store.load();
+        state.put("phase", "FIXING_FEEDBACK");
+        state.put("current_story", 52);
+        state.put("current_pr", 187);
+        state.put("branch", "story/52-x");
+        // Stale marker left from a prior dry-run period.
+        state.put("stuck_head", head);
+
+        WorkflowLock lock = WorkflowLock.acquire(
+                root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+        DeliveryGitHub github = new DeliveryGitHub(prSnapshot);
+        WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                config, state, store, github, repo, root, epic, 27, false,
+                gitFactory, new CodexRunner(), new ReviewCoordinator(), lock);
+        orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
+        lock.release();
+
+        // The stale stuck_head must be gone (delivery enabled clears it)...
+        Map<String, Object> after = store.load();
+        assertThat(after.get("stuck_head")).isNull();
+        // ...and the run must NOT have terminally blocked via the stuck-head
+        // short-circuit (which is only valid in a non-delivering mode).
+        assertThat(Engine.asString(after.get("phase"))).isNotEqualTo("BLOCKED_EXTERNAL");
+    }
+
+    @Test
     void ciDeferredFeedbackFixIsCommittedAndPushed(@TempDir Path root) throws Exception {
         // Robustness regression: when a feedback fix is complete but a heavy E2E
         // lane must run in CI, the worker returns SUCCESS + DEFERRED_TO_CI +
@@ -926,6 +1022,125 @@ class WorkflowOrchestratorIntegrationTest {
         assertThat(runsTaken).isLessThanOrEqualTo(6);
         Map<String, Object> finalState = store.load();
         assertThat(finalState.get("delivery_mode")).isEqualTo("CI_DEFERRED");
+    }
+
+    @Test
+    void reconcileProcessFeedbackClearsStaleBlockedVerdictSoFeedbackCanRun(@TempDir Path root)
+            throws Exception {
+        // Live loop regression (PR #187): a prior FIXING_FEEDBACK returned BLOCKED
+        // on head H, so state.last_feedback_result=BLOCKED. The feedback guard
+        // then routes to reconcile, which decides PROCESS_FEEDBACK ("re-attempt
+        // the fix"). Previously the stale BLOCKED verdict was NOT cleared, so the
+        // next tick re-routed straight back to reconcile — feedback.md never ran,
+        // the fix never happened, and the thread never resolved. After the fix,
+        // an accepted PROCESS_FEEDBACK clears the verdict so FIXING_FEEDBACK can
+        // actually be dispatched.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q");
+        Path prompts = root.resolve("prompts");
+        Files.createDirectories(prompts);
+        Files.writeString(prompts.resolve("common.md"), "COMMON");
+        Files.writeString(prompts.resolve("reconcile.md"), "{{COMMON}}\nReconcile.");
+        Files.createDirectories(root.resolve("state"));
+
+        String head = "53c56f1cba11";
+        Map<String, Object> prSnapshot = map(
+                "number", 187, "state", "OPEN", "mergedAt", null,
+                "headRefOid", head, "headRefName", "story/52-x", "url", "http://x/pr/187",
+                "reviewDecision", "CHANGES_REQUESTED", "statusCheckRollup", new ArrayList<>(),
+                "reviewThreadsAvailable", true, "comments", new ArrayList<>(),
+                "reviews", List.of(map("author", map("login", "chatgpt-codex-connector"),
+                        "submittedAt", "2026-02-01", "commit", map("oid", head))),
+                "reviewThreads", List.of(map("id", "PRRT_1", "isResolved", false,
+                        "comments", map("nodes", List.of(map("id", "PRRC_1",
+                                "body", "preserve phase route_refresh", "createdAt", "2026-01-01",
+                                "author", map("login", "reviewer")))))));
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", false, "max_feedback_attempts", 3),
+                "budgets", map(),
+                "workflow", map("allow_push", true, "allow_comments", true,
+                        "allow_thread_resolution", true, "auto_merge", true));
+
+        // Reconcile worker decides PROCESS_FEEDBACK (re-attempt the fix).
+        CodexRunner codex = new CodexRunner(Map.of(), System::nanoTime) {
+            @Override
+            public CodexResult run(Map<String, Object> cfg, Path prompt, Path r, boolean dry,
+                                   Runnable hb, Integer timeout) {
+                return new CodexResult(0,
+                        "DECISION_ACTION: PROCESS_FEEDBACK\n"
+                        + "DECISION_REASON: valid unresolved review finding remains\n"
+                        + "BLOCKER_CLASS: REVIEW_FEEDBACK\n"
+                        + "RECOVERY_ACTION: implement the bounded fix and re-review\n"
+                        + "RESULT_STATUS: SUCCESS\nRESULT_NEXT_PHASE: FIXING_FEEDBACK\n"
+                        + "RESULT_BLOCKER: NONE\nRESULT_EVIDENCE: COMPLETE\n");
+            }
+        };
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #52", "url", "http://x/27");
+
+        // Fake git so the reconcile checkout of the story branch succeeds and the
+        // worktree is clean (no delivery side effects) — isolates the assertion to
+        // the verdict-clearing behavior.
+        GitOperations.GitRunner gitRunner = (r, args) -> {
+            String key = String.join(" ", args);
+            if (key.startsWith("status --porcelain")) {
+                return new GitOperations.GitResult(0, "", "");
+            }
+            if (key.startsWith("branch --show-current") || key.startsWith("branch --list")) {
+                return new GitOperations.GitResult(0, "story/52-x\n", "");
+            }
+            if (key.startsWith("rev-parse HEAD")) {
+                return new GitOperations.GitResult(0, head + "\n", "");
+            }
+            if (key.startsWith("ls-remote origin")) {
+                return new GitOperations.GitResult(0, head + "\trefs/heads/story/52-x\n", "");
+            }
+            return new GitOperations.GitResult(0, "", "");
+        };
+        Controller.GitOperationsFactory gitFactory = new Controller.GitOperationsFactory(repo) {
+            @Override
+            public GitOperations create() {
+                return new GitOperations(repo, gitRunner);
+            }
+        };
+
+        Map<String, Object> state = store.load();
+        state.put("phase", "BLOCKED_REQUIREMENTS"); // routes to reconcile.md
+        state.put("current_story", 52);
+        state.put("current_pr", 187);
+        state.put("branch", "story/52-x");
+        // The stale BLOCKED verdict that caused the loop.
+        state.put("last_feedback_result", "BLOCKED");
+        state.put("last_feedback_result_head", head);
+
+        WorkflowLock lock = WorkflowLock.acquire(
+                root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+        DeliveryGitHub github = new DeliveryGitHub(prSnapshot);
+        WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                config, state, store, github, repo, root, epic, 27, false,
+                gitFactory, codex,
+                new ReviewCoordinator(), lock);
+        int code = orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
+        lock.release();
+
+        // Reconcile accepted PROCESS_FEEDBACK and set the next phase to
+        // FIXING_FEEDBACK...
+        assertThat(code).isEqualTo(0);
+        Map<String, Object> after = store.load();
+        assertThat(Engine.asString(after.get("phase"))).isEqualTo("FIXING_FEEDBACK");
+        // ...and — the loop breaker — the stale BLOCKED verdict is cleared so the
+        // next tick will actually dispatch feedback.md instead of re-routing to
+        // reconcile.
+        assertThat(after.get("last_feedback_result")).isNull();
+        assertThat(after.get("last_feedback_result_head")).isNull();
     }
 
     @Test

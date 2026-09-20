@@ -271,33 +271,42 @@ final class WorkflowOrchestrator {
 
                 String head = Engine.asString(currentPr.get("headRefOid"));
 
-                // Terminal stuck head: if this exact head was already determined
-                // unrecoverable in a non-delivering mode (dry-run/allow_push
-                // disabled), do NOT re-enter feedback and re-increment the attempt
-                // count every cron tick — that produced the unbounded "reprocessed
-                // N times" BLOCKED loop. Only a genuinely new deliverable fix in
-                // the worktree clears the marker (checked here so the block is not
-                // permanent when real work arrives). Otherwise stay blocked
-                // quietly and stop processing this head.
+                // Terminal stuck head: only meaningful in a NON-delivering mode
+                // (dry-run or allow_push disabled), which is the only place
+                // stuck_head is set for feedback. In that mode a head that could
+                // not be fixed must not re-enter feedback every tick (the
+                // unbounded "reprocessed N times" loop). In a DELIVERING mode
+                // (allow_push=true) the workflow can commit fixes and advance the
+                // PR, so a stale stuck_head — e.g. left over from an earlier
+                // dry-run before the flags were enabled — must NOT block: clear
+                // it and let the normal live feedback path run. Only a genuinely
+                // new deliverable fix clears it in the non-delivering case.
+                boolean deliveringMode = !dryRun && Engine.asBool(workflow.get("allow_push"), false);
                 if (head.equals(Engine.asString(state.get("stuck_head")))) {
-                    boolean newFix = false;
-                    try {
-                        newFix = gitFactory.create().classifyWorktree(state)
-                                != GitOperations.WorktreeState.CLEAN;
-                    } catch (RuntimeException ignored) {
-                        newFix = false;
-                    }
-                    if (newFix) {
-                        log.info("STUCK-HEAD CLEARED: deliverable changes present for head {}; "
-                                + "allowing a fresh feedback attempt", shortSha(head));
+                    if (deliveringMode) {
+                        log.info("STUCK-HEAD CLEARED: delivery is enabled for head {}; "
+                                + "resuming the normal feedback path", shortSha(head));
                         state.remove("stuck_head");
                     } else {
-                        state.put("phase", "BLOCKED_EXTERNAL");
-                        save();
-                        log.info("BLOCKED (terminal): PR #{} head {} feedback remains unresolved and "
-                                + "delivery is disabled; awaiting a new head or operator action",
-                                currentPr.get("number"), shortSha(head));
-                        return 1;
+                        boolean newFix = false;
+                        try {
+                            newFix = gitFactory.create().classifyWorktree(state)
+                                    != GitOperations.WorktreeState.CLEAN;
+                        } catch (RuntimeException ignored) {
+                            newFix = false;
+                        }
+                        if (newFix) {
+                            log.info("STUCK-HEAD CLEARED: deliverable changes present for head {}; "
+                                    + "allowing a fresh feedback attempt", shortSha(head));
+                            state.remove("stuck_head");
+                        } else {
+                            state.put("phase", "BLOCKED_EXTERNAL");
+                            save();
+                            log.info("BLOCKED (terminal): PR #{} head {} feedback remains unresolved "
+                                    + "and delivery is disabled; awaiting a new head or operator action",
+                                    currentPr.get("number"), shortSha(head));
+                            return 1;
+                        }
                     }
                 }
 
@@ -614,15 +623,25 @@ final class WorkflowOrchestrator {
         // deviation supervisor can route it to delivery instead of treating the
         // head as permanently dead.
         if (!Engine.asString(state.get("stuck_head")).isEmpty()) {
-            try {
-                GitOperations probe = gitFactory.create();
-                if (probe.classifyWorktree(state) != GitOperations.WorktreeState.CLEAN) {
-                    log.info("STUCK-HEAD CLEARED: deliverable changes present; allowing delivery "
-                            + "of the new fix for head {}", shortSha(state.get("stuck_head")));
-                    state.remove("stuck_head");
+            // stuck_head is a "delivery-disabled terminal block" marker. If
+            // delivery is now enabled (e.g. the operator switched dry_run off or
+            // enabled allow_push after the marker was set), it is stale and must
+            // not block: clear it unconditionally so the live path can proceed.
+            if (!dryRun && Engine.asBool(workflow.get("allow_push"), false)) {
+                log.info("STUCK-HEAD CLEARED: delivery is enabled; discarding stale terminal "
+                        + "marker for head {}", shortSha(state.get("stuck_head")));
+                state.remove("stuck_head");
+            } else {
+                try {
+                    GitOperations probe = gitFactory.create();
+                    if (probe.classifyWorktree(state) != GitOperations.WorktreeState.CLEAN) {
+                        log.info("STUCK-HEAD CLEARED: deliverable changes present; allowing delivery "
+                                + "of the new fix for head {}", shortSha(state.get("stuck_head")));
+                        state.remove("stuck_head");
+                    }
+                } catch (RuntimeException ignored) {
+                    // If we cannot classify, leave the marker; the guard still caps loops.
                 }
-            } catch (RuntimeException ignored) {
-                // If we cannot classify, leave the marker; the guard still caps loops.
             }
         }
         Engine.Deviation deviation = Engine.detectDeviation(state, currentPr, maxPhaseAttempts);
@@ -1081,6 +1100,26 @@ final class WorkflowOrchestrator {
 
             save();
             log.info("RECONCILIATION ACCEPTED: " + state.get("decision_action") + " — " + outcome.detail());
+
+            // When reconciliation EXPLICITLY decides PROCESS_FEEDBACK, that is an
+            // authoritative instruction to re-attempt the feedback fix on this
+            // head. A stale last_feedback_result=BLOCKED (from an earlier failed
+            // FIXING_FEEDBACK on the same head) must be cleared here; otherwise
+            // the next tick's feedback guard immediately re-routes back to
+            // reconcile before feedback.md ever runs — an observed live loop:
+            //   feedback BLOCKED -> reconcile -> PROCESS_FEEDBACK -> feedback
+            //   BLOCKED -> ... (the fix and thread resolution never happen).
+            // Clearing the verdict (and the guard counters) lets the FIXING_
+            // FEEDBACK worker actually run. The feedback guard's own attempt cap
+            // still bounds it, and reconcile has its own ceiling, so this cannot
+            // loop unbounded.
+            if ("PROCESS_FEEDBACK".equals(Engine.asString(state.get("decision_action")))) {
+                state.remove("last_feedback_result");
+                state.remove("last_feedback_result_head");
+                state.remove("feedback_guard_head");
+                state.remove("feedback_attempts");
+                save();
+            }
             return 0;
         }
 
