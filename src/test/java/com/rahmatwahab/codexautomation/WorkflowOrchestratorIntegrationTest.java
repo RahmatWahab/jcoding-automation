@@ -1273,6 +1273,104 @@ class WorkflowOrchestratorIntegrationTest {
     }
 
     @Test
+    void liveUnrecoverableStuckHeadIsNotClearedInLiveMode(@TempDir Path root) throws Exception {
+        // Core regression (PR #187): the reconcile auto-deliver-abort marks a head
+        // UNRECOVERABLE (worker cannot produce a fix). A previous fix wrongly
+        // cleared ANY stuck_head when delivery was enabled, which re-enabled the
+        // reconcile/feedback loop. The reason-aware marker must keep an
+        // UNRECOVERABLE head terminally blocked EVEN in live mode (allow_push);
+        // only a NEW head clears it. This single deterministic tick proves the
+        // marker survives and the tick returns terminal-blocked rather than
+        // resuming the feedback path.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q");
+        Path prompts = root.resolve("prompts");
+        Files.createDirectories(prompts);
+        Files.writeString(prompts.resolve("common.md"), "COMMON");
+        Files.writeString(prompts.resolve("feedback.md"), "{{COMMON}}\nFix.");
+        Files.writeString(prompts.resolve("reconcile.md"), "{{COMMON}}\nReconcile.");
+        Files.createDirectories(root.resolve("state"));
+
+        String head = "53c56f1cba11";
+        Map<String, Object> prSnapshot = map(
+                "number", 187, "state", "OPEN", "mergedAt", null,
+                "headRefOid", head, "headRefName", "story/52-x", "url", "http://x/pr/187",
+                "reviewDecision", "CHANGES_REQUESTED", "statusCheckRollup", new ArrayList<>(),
+                "reviewThreadsAvailable", true, "comments", new ArrayList<>(),
+                "reviews", List.of(map("author", map("login", "chatgpt-codex-connector"),
+                        "submittedAt", "2026-02-01", "commit", map("oid", head))),
+                "reviewThreads", List.of(map("id", "PRRT_1", "isResolved", false,
+                        "comments", map("nodes", List.of(map("id", "PRRC_1",
+                                "body", "P1 finding", "createdAt", "2026-01-01",
+                                "author", map("login", "reviewer")))))));
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", false, "max_feedback_attempts", 3),
+                "budgets", map(),
+                "workflow", map("allow_push", true, "allow_comments", true,
+                        "allow_thread_resolution", true));
+
+        // Clean worktree: no new fix present.
+        GitOperations.GitRunner gitRunner = (r, args) -> {
+            String key = String.join(" ", args);
+            if (key.startsWith("status --porcelain")) {
+                return new GitOperations.GitResult(0, "", "");
+            }
+            if (key.startsWith("branch --show-current") || key.startsWith("branch --list")) {
+                return new GitOperations.GitResult(0, "story/52-x\n", "");
+            }
+            if (key.startsWith("rev-parse HEAD")) {
+                return new GitOperations.GitResult(0, head + "\n", "");
+            }
+            if (key.startsWith("ls-remote origin")) {
+                return new GitOperations.GitResult(0, head + "\trefs/heads/story/52-x\n", "");
+            }
+            return new GitOperations.GitResult(0, "", "");
+        };
+        Controller.GitOperationsFactory gitFactory = new Controller.GitOperationsFactory(repo) {
+            @Override
+            public GitOperations create() {
+                return new GitOperations(repo, gitRunner);
+            }
+        };
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #52", "url", "http://x/27");
+
+        Map<String, Object> state = store.load();
+        state.put("phase", "FIXING_FEEDBACK");
+        state.put("current_story", 52);
+        state.put("current_pr", 187);
+        state.put("branch", "story/52-x");
+        // Head previously determined UNRECOVERABLE by the reconcile abort path.
+        state.put("stuck_head", head);
+        state.put("stuck_head_reason", "UNRECOVERABLE");
+
+        WorkflowLock lock = WorkflowLock.acquire(
+                root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+        DeliveryGitHub github = new DeliveryGitHub(prSnapshot);
+        WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                config, state, store, github, repo, root, epic, 27, false,
+                gitFactory, new CodexRunner(), new ReviewCoordinator(), lock);
+        int code = orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
+        lock.release();
+
+        // Terminal block returned, and the UNRECOVERABLE marker is NOT cleared
+        // despite allow_push=true (the exact regression that re-enabled the loop).
+        assertThat(code).isEqualTo(1);
+        Map<String, Object> after = store.load();
+        assertThat(Engine.asString(after.get("stuck_head"))).isEqualTo(head);
+        assertThat(Engine.asString(after.get("stuck_head_reason"))).isEqualTo("UNRECOVERABLE");
+        assertThat(Engine.asString(after.get("phase"))).isEqualTo("BLOCKED_EXTERNAL");
+    }
+
+    @Test
     void autoDeliveryRepliesAndResolvesAllOpenThreads(@TempDir Path root) throws Exception {
         // Autonomous auto-delivery must also close the loop on review threads:
         // reply with fix evidence and resolve every currently-unresolved thread,

@@ -283,10 +283,25 @@ final class WorkflowOrchestrator {
                 // new deliverable fix clears it in the non-delivering case.
                 boolean deliveringMode = !dryRun && Engine.asBool(workflow.get("allow_push"), false);
                 if (head.equals(Engine.asString(state.get("stuck_head")))) {
+                    String stuckReason = Engine.asString(state.get("stuck_head_reason"));
+                    if ("UNRECOVERABLE".equals(stuckReason)) {
+                        // The worker genuinely cannot fix this head (repeated
+                        // attempts produced no deliverable change). Terminal in ALL
+                        // modes — do not resume the feedback loop just because
+                        // delivery is enabled; only a NEW head clears this. Hold
+                        // blocked quietly until the head advances or an operator acts.
+                        state.put("phase", "BLOCKED_EXTERNAL");
+                        save();
+                        log.info("BLOCKED (terminal): PR #{} head {} is unrecoverable by the automated "
+                                + "worker; holding until the head advances or an operator acts",
+                                currentPr.get("number"), shortSha(head));
+                        return 1;
+                    }
                     if (deliveringMode) {
                         log.info("STUCK-HEAD CLEARED: delivery is enabled for head {}; "
                                 + "resuming the normal feedback path", shortSha(head));
                         state.remove("stuck_head");
+                        state.remove("stuck_head_reason");
                     } else {
                         boolean newFix = false;
                         try {
@@ -299,6 +314,7 @@ final class WorkflowOrchestrator {
                             log.info("STUCK-HEAD CLEARED: deliverable changes present for head {}; "
                                     + "allowing a fresh feedback attempt", shortSha(head));
                             state.remove("stuck_head");
+                            state.remove("stuck_head_reason");
                         } else {
                             state.put("phase", "BLOCKED_EXTERNAL");
                             save();
@@ -417,6 +433,7 @@ final class WorkflowOrchestrator {
                         // to advance this one.
                         state.put("phase", "BLOCKED_EXTERNAL");
                         state.put("stuck_head", head);
+                        state.put("stuck_head_reason", "DELIVERY_DISABLED");
                         state.remove("feedback_guard_head");
                         state.remove("feedback_attempts");
                         state.put("error", "Feedback for PR #" + currentPr.get("number")
@@ -623,14 +640,29 @@ final class WorkflowOrchestrator {
         // deviation supervisor can route it to delivery instead of treating the
         // head as permanently dead.
         if (!Engine.asString(state.get("stuck_head")).isEmpty()) {
-            // stuck_head is a "delivery-disabled terminal block" marker. If
-            // delivery is now enabled (e.g. the operator switched dry_run off or
-            // enabled allow_push after the marker was set), it is stale and must
-            // not block: clear it unconditionally so the live path can proceed.
-            if (!dryRun && Engine.asBool(workflow.get("allow_push"), false)) {
-                log.info("STUCK-HEAD CLEARED: delivery is enabled; discarding stale terminal "
+            // stuck_head has two distinct meanings, tracked by stuck_head_reason:
+            //  - DELIVERY_DISABLED: stuck only because delivery is off (dry-run /
+            //    allow_push=false). Stale once delivery is enabled -> clear.
+            //  - UNRECOVERABLE: the worker genuinely cannot produce a fix on this
+            //    head after repeated attempts. Terminal in ALL modes; only a NEW
+            //    head (advanced commit) clears it (handled by Engine.detectDeviation
+            //    returning no deviation while stuck_head == currentHead). It must
+            //    NOT be cleared just because delivery is enabled — doing so
+            //    re-enabled the reconcile/feedback loop.
+            String stuckReason = Engine.asString(state.get("stuck_head_reason"));
+            boolean unrecoverable = "UNRECOVERABLE".equals(stuckReason);
+            if (unrecoverable) {
+                // Leave the terminal marker in place. detectDeviation returns no
+                // deviation for this head, so the controller holds it blocked
+                // quietly until the head changes or an operator intervenes.
+                log.info("STUCK-HEAD TERMINAL: PR head {} is unrecoverable by the automated worker; "
+                        + "holding blocked until the head advances or an operator acts",
+                        shortSha(state.get("stuck_head")));
+            } else if (!dryRun && Engine.asBool(workflow.get("allow_push"), false)) {
+                log.info("STUCK-HEAD CLEARED: delivery is enabled; discarding stale delivery-disabled "
                         + "marker for head {}", shortSha(state.get("stuck_head")));
                 state.remove("stuck_head");
+                state.remove("stuck_head_reason");
             } else {
                 try {
                     GitOperations probe = gitFactory.create();
@@ -638,6 +670,7 @@ final class WorkflowOrchestrator {
                         log.info("STUCK-HEAD CLEARED: deliverable changes present; allowing delivery "
                                 + "of the new fix for head {}", shortSha(state.get("stuck_head")));
                         state.remove("stuck_head");
+                        state.remove("stuck_head_reason");
                     }
                 } catch (RuntimeException ignored) {
                     // If we cannot classify, leave the marker; the guard still caps loops.
@@ -1064,7 +1097,12 @@ final class WorkflowOrchestrator {
                             + "for this head. Stopping to avoid an infinite loop.");
                     // Mark this head as terminally stuck so the deviation
                     // supervisor does not immediately re-escalate the same head.
+                    // This is UNRECOVERABLE (the worker cannot produce a fix on
+                    // this head), so it is terminal regardless of delivery mode —
+                    // only a new head (advanced commit) clears it. It must NOT be
+                    // cleared merely because delivery is enabled.
                     state.put("stuck_head", reconcileHead);
+                    state.put("stuck_head_reason", "UNRECOVERABLE");
                     state.remove("resume_guard_head");
                     state.remove("resume_attempts");
                     state.remove("resume_total_story");
@@ -1228,6 +1266,7 @@ final class WorkflowOrchestrator {
                     // The head advanced, so any prior terminal-stuck marker no
                     // longer applies.
                     state.remove("stuck_head");
+                    state.remove("stuck_head_reason");
                 }
                 if (currentPr != null) {
                     int attempts = (int) Engine.asLongOrDefault(
@@ -1434,7 +1473,7 @@ final class WorkflowOrchestrator {
                 "resume_total_story", "resume_total_attempts",
                 "feedback_guard_head", "feedback_attempts",
                 "last_feedback_result", "last_feedback_result_head",
-                "stuck_head",
+                "stuck_head", "stuck_head_reason",
                 "feedback_reconcile_pending",
                 "last_processed_commit", "last_connector_review_commit",
                 "last_review_trigger_commit", "review_trigger_pending",
