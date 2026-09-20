@@ -802,8 +802,11 @@ final class WorkflowOrchestrator {
 
         String workerStatus = result.exitCode() == 0 ? "SUCCEEDED"
                 : (result.exitCode() == 124 ? "TIMED_OUT" : "FAILED");
-        store.finishJob(jobId, workerStatus, result.exitCode(),
-                codexRunner.redactSensitive(tail(result.output(), 1000)));
+        // NOTE: the terminal job record is written once, below, as `journalStatus`
+        // (which downgrades a zero-exit-but-non-SUCCESS worker to BLOCKED). An
+        // earlier finishJob call here was redundant — it wrote a status that was
+        // immediately overwritten a few lines later — so it was removed to avoid
+        // duplicate state writes and a duplicate output redaction pass per phase.
 
         // Defensive post-Codex PR adoption: a worker or an interrupted
         // controller may have created a PR without persisting its number.
@@ -901,7 +904,19 @@ final class WorkflowOrchestrator {
             // controller-owned changes and route to WAITING_FOR_CI so CI (plus
             // the mandatory manual-merge gate) validates. This guarantees the
             // fix reaches the PR and the workflow never dead-ends or loops. A
-            // head that advances (a commit landed) resets the guard.
+            // head that advances (a commit landed) resets the same-head guard.
+            //
+            // The same-head guard alone is not sufficient: a story can loop for
+            // hours when EACH resume advances the head slightly (a tiny commit
+            // lands), which resets the same-head counter every cycle so the cap
+            // is never reached. Observed in production logs: a single story
+            // reached 300+ reconcile attempts over ~14h because the head kept
+            // moving. To bound that case we ALSO track a cumulative,
+            // head-independent resume counter per story. It resets only when the
+            // active story changes, and once it exceeds
+            // (max_resume_attempts * resume_loop_multiplier) it forces the same
+            // autonomous delivery/abort path. This caps total churn per story
+            // regardless of whether the head advances.
             String action = Engine.asString(state.get("decision_action"));
             boolean resumeAction = action.startsWith("RESUME") || action.equals("PROCESS_FEEDBACK");
             String reconcileHead = currentPr == null
@@ -919,6 +934,24 @@ final class WorkflowOrchestrator {
                 state.put("resume_attempts", resumeAttempts);
                 int maxResume = (int) Engine.asLongOrDefault(
                         automation.get("max_resume_attempts"), 3);
+
+                // Cumulative, head-independent guard: count every resume for the
+                // active story. Reset only on a story change, not a head change.
+                String totalGuardStory = Engine.asString(state.get("resume_total_story"));
+                String currentStoryKey = current == null ? "" : String.valueOf(current);
+                int totalResumeAttempts;
+                if (!currentStoryKey.isEmpty() && currentStoryKey.equals(totalGuardStory)) {
+                    totalResumeAttempts =
+                            (int) Engine.asLongOrDefault(state.get("resume_total_attempts"), 0) + 1;
+                } else {
+                    totalResumeAttempts = 1;
+                    state.put("resume_total_story", currentStoryKey);
+                }
+                state.put("resume_total_attempts", totalResumeAttempts);
+                int loopMultiplier = Math.max(1, (int) Engine.asLongOrDefault(
+                        automation.get("resume_loop_multiplier"), 4));
+                int maxTotalResume = maxResume * loopMultiplier;
+
                 if (resumeAttempts > maxResume) {
                     // Autonomous delivery: stop resuming, commit what exists, and
                     // let CI validate. Never block waiting for a human.
@@ -926,8 +959,25 @@ final class WorkflowOrchestrator {
                     log.info("AUTO-DELIVER: reconciliation resumed PR head {} {} times without "
                             + "advancing; delivering controller-owned changes and deferring "
                             + "validation to CI", shortSha(reconcileHead), resumeAttempts);
+                } else if (totalResumeAttempts > maxTotalResume) {
+                    // Cumulative cap reached: the story keeps resuming (even with
+                    // an advancing head) without converging. Force the same
+                    // autonomous delivery/abort path so a story can never loop
+                    // unbounded.
+                    forceDelivery = true;
+                    log.info("AUTO-DELIVER: story #{} accumulated {} resume decisions "
+                            + "(cap {}); the head keeps advancing without converging, "
+                            + "delivering controller-owned changes and deferring "
+                            + "validation to CI", current, totalResumeAttempts, maxTotalResume);
                 }
             } else {
+                // A non-resume decision (e.g. WAIT_FOR_CI, BLOCK_*) clears the
+                // consecutive same-head guard. The cumulative per-story counters
+                // (resume_total_*) are intentionally NOT cleared here: they must
+                // survive interleaved non-resume decisions so an advancing-head
+                // loop that keeps oscillating resume/non-resume still converges
+                // to the cumulative cap. They reset only on story advance or a
+                // completed auto-deliver (both handled explicitly).
                 state.remove("resume_guard_head");
                 state.remove("resume_attempts");
             }
@@ -958,6 +1008,8 @@ final class WorkflowOrchestrator {
                     state.put("stuck_head", reconcileHead);
                     state.remove("resume_guard_head");
                     state.remove("resume_attempts");
+                    state.remove("resume_total_story");
+                    state.remove("resume_total_attempts");
                     state.put("exit_code", result.exitCode());
                     state.put("run_finished_at", Controller.now());
                     save();
@@ -971,6 +1023,8 @@ final class WorkflowOrchestrator {
                 state.put("phase", "WAITING_FOR_CI");
                 state.remove("resume_guard_head");
                 state.remove("resume_attempts");
+                state.remove("resume_total_story");
+                state.remove("resume_total_attempts");
                 save();
                 int deliveryResult = runDeliveryPipeline(git, current, currentPr,
                         result.output(), feedbackToResolve, true);
@@ -1294,6 +1348,7 @@ final class WorkflowOrchestrator {
         for (String key : List.of(
                 "worktree_recovery", "worktree_baseline", "base_branch",
                 "resume_guard_head", "resume_attempts",
+                "resume_total_story", "resume_total_attempts",
                 "feedback_guard_head", "feedback_attempts",
                 "last_feedback_result", "last_feedback_result_head",
                 "stuck_head",

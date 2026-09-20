@@ -13,6 +13,7 @@ import java.time.ZoneOffset;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Top-level workflow orchestration.
@@ -32,6 +33,16 @@ public final class Controller {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() { };
+
+    /**
+     * Passive waiting phases: the controller cannot change their outcome; only
+     * external GitHub state (CI, review, merge) advances them. Used by the
+     * opt-in waiting-phase poll backoff to avoid re-reading GitHub every minute
+     * while nothing actionable can happen.
+     */
+    private static final Set<String> WAITING_PHASES = Set.of(
+            "WAITING_FOR_CI", "WAITING_FOR_CODEX_REVIEW",
+            "WAITING_FOR_HUMAN_REVIEW", "WAITING_FOR_MANUAL_MERGE");
 
     private Controller() {
     }
@@ -53,6 +64,32 @@ public final class Controller {
         }
     }
 
+    /** Outcome of the waiting-phase poll-backoff decision. */
+    enum WaitBackoff {
+        /** Skip this run: a passive wait is not yet due for its next poll. */
+        SKIP,
+        /** Proceed and schedule the next backoff window (a due passive wait). */
+        PROCEED_AND_SCHEDULE,
+        /** Proceed and clear any stale backoff marker (not a passive wait). */
+        PROCEED_AND_CLEAR
+    }
+
+    /**
+     * Pure waiting-phase poll-backoff decision. When {@code pollSeconds <= 0}
+     * (default) or the phase is not a passive wait, always proceed (and clear
+     * any stale marker), preserving the previous every-tick behavior. When a
+     * passive wait's {@code waitRetryAt} is not yet due, skip the run. A forced
+     * run never backs off.
+     */
+    static WaitBackoff waitBackoffDecision(String phase, String waitRetryAt,
+                                           int pollSeconds, boolean forceRun) {
+        boolean passiveWait = WAITING_PHASES.contains(phase == null ? "" : phase);
+        if (pollSeconds > 0 && passiveWait && !forceRun) {
+            return due(waitRetryAt) ? WaitBackoff.PROCEED_AND_SCHEDULE : WaitBackoff.SKIP;
+        }
+        return WaitBackoff.PROCEED_AND_CLEAR;
+    }
+
     /** The job-start gate: only a boolean {@code true} enables execution. */
     public static boolean readJobControl(Path path) {
         try {
@@ -60,6 +97,44 @@ public final class Controller {
             return Boolean.TRUE.equals(values.get("job_start"));
         } catch (IOException | RuntimeException exc) {
             return false;
+        }
+    }
+
+    /**
+     * Whether the current skip repeats the last logged skip (same active run in
+     * the same state). A blank/absent previous marker is never a repeat, so the
+     * first skip of a state always logs at INFO.
+     */
+    static boolean skipIsRepeat(String previousSignature, String currentSignature) {
+        return previousSignature != null && !previousSignature.isEmpty()
+                && previousSignature.equals(currentSignature);
+    }
+
+    /** Best-effort read of the last-skip marker; missing/unreadable → empty. */
+    private static String readMarker(Path marker) {
+        try {
+            return Files.exists(marker) ? Files.readString(marker).strip() : "";
+        } catch (IOException | RuntimeException exc) {
+            return "";
+        }
+    }
+
+    /** Best-effort write of the last-skip marker; failures are ignored. */
+    private static void writeMarker(Path marker, String signature) {
+        try {
+            Files.writeString(marker, signature);
+        } catch (IOException | RuntimeException ignored) {
+            // A marker write failure only means the next skip logs at INFO
+            // instead of DEBUG — never a correctness or safety concern.
+        }
+    }
+
+    /** Remove the last-skip marker (called once a run acquires the lock). */
+    private static void clearMarker(Path marker) {
+        try {
+            Files.deleteIfExists(marker);
+        } catch (IOException | RuntimeException ignored) {
+            // best-effort
         }
     }
 
@@ -139,22 +214,42 @@ public final class Controller {
                 (int) Engine.asLongOrDefault(automation.get("watchdog_grace_seconds"), 10));
         if (lock == null) {
             String detail = "";
+            String signature = "unknown";
             try {
                 Map<String, Object> active = new StateStore(statePath).load();
-                detail = " pid=" + active.getOrDefault("pid", "unknown")
-                        + " story=#" + active.getOrDefault("current_story", "unknown")
-                        + " pr=#" + active.getOrDefault("current_pr", "unknown")
-                        + " phase=" + active.getOrDefault("phase", "unknown")
-                        + " heartbeat=" + active.getOrDefault("heartbeat_at",
-                                active.getOrDefault("updated_at", "unknown"));
+                String pid = String.valueOf(active.getOrDefault("pid", "unknown"));
+                String story = String.valueOf(active.getOrDefault("current_story", "unknown"));
+                String pr = String.valueOf(active.getOrDefault("current_pr", "unknown"));
+                String phase = String.valueOf(active.getOrDefault("phase", "unknown"));
+                String heartbeat = String.valueOf(active.getOrDefault("heartbeat_at",
+                        active.getOrDefault("updated_at", "unknown")));
+                detail = " pid=" + pid + " story=#" + story + " pr=#" + pr
+                        + " phase=" + phase + " heartbeat=" + heartbeat;
+                // The active worker's heartbeat only advances when it makes
+                // progress, so pid|phase|heartbeat uniquely identifies "the same
+                // ongoing run in the same state". Consecutive 1-minute cron ticks
+                // that skip an unchanged run are pure noise (observed 20+ identical
+                // SKIPPED lines per long phase). Log the first at INFO and identical
+                // repeats at DEBUG so the signal is preserved without the flood.
+                signature = pid + "|" + phase + "|" + heartbeat;
             } catch (RuntimeException ignored) {
                 // If state cannot be read, still report the skip without detail.
             }
-            log.info("SKIPPED: another automation run is active;" + detail);
+            Path skipMarker = Path.of(lockPath + ".lastskip");
+            String message = "SKIPPED: another automation run is active;" + detail;
+            if (skipIsRepeat(readMarker(skipMarker), signature)) {
+                log.debug(message);
+            } else {
+                log.info(message);
+                writeMarker(skipMarker, signature);
+            }
             return 0;
         }
 
         String lockToken = lock.ownerToken();
+        // A run acquired the lock: clear any repeat-skip marker so the next time
+        // the controller is skipped it logs at INFO (a fresh skip), not DEBUG.
+        clearMarker(Path.of(lockPath + ".lastskip"));
         StateStore store = new StateStore(statePath);
         try {
             Map<String, Object> state = store.load();
@@ -194,6 +289,39 @@ public final class Controller {
             if ("PAUSED_QUOTA".equals(state.get("phase")) && !due(Engine.asString(state.get("retry_at")))) {
                 log.info("PAUSED_QUOTA: retry at " + state.get("retry_at"));
                 return 0;
+            }
+
+            // Opt-in waiting-phase backoff. On passive waits (CI, Codex review,
+            // human review, manual-merge gate) nothing the controller does can
+            // change the outcome until GitHub state changes, yet each 1-minute
+            // cron tick still performs a full EPIC issue read + PR list (both
+            // carry large bodies). When automation.wait_poll_seconds > 0 the
+            // controller polls those waits at that slower cadence instead of
+            // every minute, eliminating the majority of redundant GitHub reads
+            // while active work keeps the 1-minute cadence. Default 0 disables
+            // the backoff, preserving the previous every-tick behavior exactly.
+            // This reuses the same due()/retry_at machinery as PAUSED_QUOTA.
+            int waitPollSeconds = (int) Engine.asLongOrDefault(
+                    automation.get("wait_poll_seconds"), 0);
+            WaitBackoff backoff = waitBackoffDecision(
+                    Engine.asString(state.get("phase")),
+                    Engine.asString(state.get("wait_retry_at")),
+                    waitPollSeconds, options.forceRun());
+            if (backoff == WaitBackoff.SKIP) {
+                log.info("WAITING BACKOFF: phase=" + state.get("phase")
+                        + " next poll at " + state.get("wait_retry_at"));
+                return 0;
+            }
+            if (backoff == WaitBackoff.PROCEED_AND_SCHEDULE) {
+                // Due now: schedule the next backoff window and proceed to read.
+                state.put("wait_retry_at", OffsetDateTime.now(ZoneOffset.UTC)
+                        .plusSeconds(waitPollSeconds).toString());
+                store.save(state);
+            } else if (backoff == WaitBackoff.PROCEED_AND_CLEAR && state.containsKey("wait_retry_at")) {
+                // Not a passive wait (or backoff disabled): drop any stale marker
+                // so a resumed active phase is never delayed by it.
+                state.remove("wait_retry_at");
+                store.save(state);
             }
 
             Path repo = Path.of(Engine.asString(Config.section(config, "repository").get("local_path")));
@@ -236,6 +364,14 @@ public final class Controller {
                     new GitOperationsFactory(repo), new CodexRunner(),
                     new ReviewCoordinator(), lock);
             return orchestrator.reconcileAndExecute(prs, options.prompt());
+        } catch (WorkflowLock.LockOwnershipLost lost) {
+            // Another controller recovered this lock as stale and took over mid
+            // run. This is an expected, benign hand-off (not a fault): stop this
+            // run cleanly so we never mutate state we no longer own. The takeover
+            // process is now the authority; the next tick reconciles normally.
+            log.info("ENDED: workflow lock ownership lost mid-run (" + lost.getMessage()
+                    + "); another run has taken over");
+            return 0;
         } catch (RuntimeException exc) {
             log.error("BLOCKED: unexpected controller error: " + exc.getMessage());
             return 1;

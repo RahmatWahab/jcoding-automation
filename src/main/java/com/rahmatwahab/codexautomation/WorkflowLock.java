@@ -29,6 +29,19 @@ import java.util.Optional;
  */
 public final class WorkflowLock {
 
+    /**
+     * Thrown by {@link #refresh()} when this process can no longer prove it owns
+     * the lock — the owner file was removed (another controller recovered the
+     * lock as stale) or became unreadable. Extends {@link IllegalStateException}
+     * for backward compatibility with the previous ownership-changed contract.
+     * Callers treat this as an expected end-of-run condition, not a crash.
+     */
+    public static final class LockOwnershipLost extends IllegalStateException {
+        public LockOwnershipLost(String message) {
+            super(message);
+        }
+    }
+
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final TypeReference<LinkedHashMap<String, Object>> MAP_TYPE =
             new TypeReference<>() { };
@@ -148,13 +161,22 @@ public final class WorkflowLock {
         Map<String, Object> owner;
         try {
             owner = MAPPER.readValue(Files.readString(ownerFile), MAP_TYPE);
+        } catch (java.nio.file.NoSuchFileException gone) {
+            // Another controller recovered this lock as stale and removed the
+            // owner file between our refreshes. This is a lost-ownership
+            // condition, not an unexpected I/O failure: report it as such so the
+            // caller can end this run cleanly instead of crashing with an
+            // "unexpected controller error".
+            throw new LockOwnershipLost("workflow lock ownership lost: owner file removed");
         } catch (IOException exc) {
-            throw new UncheckedIOException(exc);
+            // A transient read failure (not a missing file) is treated the same
+            // way — we can no longer prove ownership, so we must not keep going.
+            throw new LockOwnershipLost("workflow lock ownership unverifiable: " + exc.getMessage());
         }
         Long ownerPid = asLong(owner.get("pid"));
         if (ownerPid == null || ownerPid != ProcessHandle.current().pid()
                 || owner.get("owner_token") == null) {
-            throw new IllegalStateException("workflow lock ownership changed");
+            throw new LockOwnershipLost("workflow lock ownership changed");
         }
         owner.put("heartbeat_at", now());
         writeOwner(path, owner);

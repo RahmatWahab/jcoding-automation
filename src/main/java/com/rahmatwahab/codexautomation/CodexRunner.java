@@ -41,21 +41,27 @@ public class CodexRunner {
             "(\\b(?:gh_token|github_token|password|secret|api[_-]?key)\\s*[=:]\\s*)[^\\s'\"]+",
             Pattern.CASE_INSENSITIVE);
 
-    private final Map<String, String> environment;
     private final Supplier<Long> monotonicMillis;
+    /**
+     * Sensitive environment values to redact, precomputed once in the same
+     * {@code entrySet()} iteration order the original per-call scan used, so
+     * redaction output is byte-identical while avoiding a full environment scan
+     * (and case-folding of every key) on every {@code redactSensitive} call.
+     */
+    private final List<String> sensitiveValues;
 
     public CodexRunner() {
         this(System.getenv(), System::nanoTime);
     }
 
     public CodexRunner(Map<String, String> environment, Supplier<Long> nanoTime) {
-        this.environment = environment;
         this.monotonicMillis = () -> nanoTime.get() / 1_000_000L;
+        this.sensitiveValues = computeSensitiveValues(environment);
     }
 
-    /** Redact known credential values before writing worker output to disk. */
-    public String redactSensitive(String text) {
-        String redacted = text;
+    /** Select the credential values to redact, preserving environment order. */
+    private static List<String> computeSensitiveValues(Map<String, String> environment) {
+        List<String> values = new ArrayList<>();
         for (Map.Entry<String, String> entry : environment.entrySet()) {
             String name = entry.getKey().toUpperCase();
             String value = entry.getValue();
@@ -64,8 +70,20 @@ public class CodexRunner {
                         || name.endsWith("PASSWORD") || name.endsWith("API_KEY")
                         || name.equals("GH_TOKEN") || name.equals("GITHUB_TOKEN"));
             if (sensitive) {
-                redacted = redacted.replace(value, "[REDACTED]");
+                values.add(value);
             }
+        }
+        return values;
+    }
+
+    /** Redact known credential values before writing worker output to disk. */
+    public String redactSensitive(String text) {
+        if (text == null || text.isEmpty()) {
+            return text;
+        }
+        String redacted = text;
+        for (String value : sensitiveValues) {
+            redacted = redacted.replace(value, "[REDACTED]");
         }
         redacted = AUTH_BEARER.matcher(redacted).replaceAll("$1[REDACTED]");
         redacted = SECRET_ASSIGNMENT.matcher(redacted).replaceAll("$1[REDACTED]");
@@ -151,13 +169,27 @@ public class CodexRunner {
 
         long deadline = monotonicMillis.get() + (long) timeout * 1000L;
         long lastProgress = monotonicMillis.get();
+        // Persist the durable heartbeat at most once per progress interval. The
+        // read loop spins every ~50 ms; calling the heartbeat (which writes the
+        // state file) on every iteration produced hundreds of redundant state
+        // writes per phase. Interval-gating keeps the liveness signal fresh for
+        // the stale-heartbeat monitor without the per-loop I/O churn.
+        long lastHeartbeat;
         try (BufferedReader reader = new BufferedReader(
                 new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+            // Initial heartbeat is inside the protected region so a lost-lock at
+            // the first beat also cleans up the child process (see catch below).
+            if (heartbeat != null) {
+                heartbeat.run();
+            }
+            lastHeartbeat = monotonicMillis.get();
             while (true) {
-                if (heartbeat != null) {
-                    heartbeat.run();
-                }
                 long nowMillis = monotonicMillis.get();
+                if (heartbeat != null
+                        && nowMillis - lastHeartbeat >= (long) progressInterval * 1000L) {
+                    heartbeat.run();
+                    lastHeartbeat = nowMillis;
+                }
                 if (nowMillis - lastProgress >= (long) progressInterval * 1000L) {
                     log.debug("CODEX HEARTBEAT: pid=" + process.pid()
                             + " elapsed_seconds=" + ((nowMillis - (deadline - (long) timeout * 1000L)) / 1000L));
@@ -174,7 +206,15 @@ public class CodexRunner {
                     String line = reader.readLine();
                     if (line != null) {
                         output.append(line).append('\n');
-                        System.out.print(redactSensitive(line + "\n"));
+                        // Worker stdout is captured in `output` (and journaled via
+                        // the phase result tail). Mirroring every line to the
+                        // console previously flooded the cron log with full EPIC
+                        // and PR/JSON payloads (hundreds of MB/day). Route it to
+                        // the logger at DEBUG so `--verbose` still surfaces the
+                        // live worker stream without bloating the default log.
+                        if (log.isDebugEnabled()) {
+                            log.debug("CODEX OUT: {}", redactSensitive(line));
+                        }
                     }
                 } else if (!process.isAlive()) {
                     output.append(drain(reader));
@@ -185,6 +225,15 @@ public class CodexRunner {
             }
         } catch (IOException exc) {
             // Stream closed; fall through to exit-code reporting.
+        } catch (RuntimeException abort) {
+            // The read loop was abandoned by a non-I/O runtime failure — most
+            // importantly a LockOwnershipLost thrown by the heartbeat when this
+            // run lost the lock mid-phase. Never orphan the child: force-destroy
+            // it and reap it, then rethrow so the controller ends the run
+            // cleanly (the takeover process is now the authority).
+            process.destroyForcibly();
+            waitQuietly(process);
+            throw abort;
         }
         waitQuietly(process);
         int code = process.exitValue();

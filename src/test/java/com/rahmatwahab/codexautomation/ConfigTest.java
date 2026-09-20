@@ -125,4 +125,46 @@ class ConfigTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("auto_merge");
     }
+
+    @Test
+    void resumeLoopMultiplierMustBePositiveInteger() {
+        Map<String, Object> config = valid();
+        config.put("automation", map("resume_loop_multiplier", 0));
+        assertThatThrownBy(() -> Config.validate(config))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("resume_loop_multiplier");
+    }
+
+    @Test
+    void maxResumeAttemptsMustBePositiveInteger() {
+        Map<String, Object> config = valid();
+        config.put("automation", map("max_resume_attempts", -1));
+        assertThatThrownBy(() -> Config.validate(config))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("max_resume_attempts");
+    }
+
+    @Test
+    void waitPollSecondsAllowsZeroButRejectsNegativeAndNonInteger() {
+        // Zero is the valid "disabled" default and must be accepted.
+        Map<String, Object> zero = valid();
+        zero.put("automation", map("wait_poll_seconds", 0));
+        assertThatCode(() -> Config.validate(zero)).doesNotThrowAnyException();
+
+        Map<String, Object> positive = valid();
+        positive.put("automation", map("wait_poll_seconds", 300));
+        assertThatCode(() -> Config.validate(positive)).doesNotThrowAnyException();
+
+        Map<String, Object> negative = valid();
+        negative.put("automation", map("wait_poll_seconds", -5));
+        assertThatThrownBy(() -> Config.validate(negative))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("wait_poll_seconds");
+
+        Map<String, Object> nonInteger = valid();
+        nonInteger.put("automation", map("wait_poll_seconds", "300"));
+        assertThatThrownBy(() -> Config.validate(nonInteger))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("wait_poll_seconds");
+    }
 }

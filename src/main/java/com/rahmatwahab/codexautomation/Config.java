@@ -109,10 +109,16 @@ public final class Config {
         }
 
         for (String key : List.of("stale_lock_seconds", "watchdog_observations", "watchdog_grace_seconds",
-                "max_feedback_attempts")) {
+                "max_feedback_attempts", "max_resume_attempts", "resume_loop_multiplier")) {
             if (automation.containsKey(key) && !isPositiveInt(automation.get(key))) {
                 missing.add("automation." + key + "(positive integer)");
             }
+        }
+        // wait_poll_seconds is a backoff cadence where 0 disables the feature,
+        // so it must permit zero (non-negative) rather than strictly positive.
+        if (automation.containsKey("wait_poll_seconds")
+                && !isNonNegativeInt(automation.get("wait_poll_seconds"))) {
+            missing.add("automation.wait_poll_seconds(non-negative integer)");
         }
 
         if (codex.containsKey("dangerously_bypass_sandbox")
@@ -146,6 +152,11 @@ public final class Config {
     /** Integer-typed and > 0. JSON numbers arrive as Integer/Long; reject booleans and floats. */
     static boolean isPositiveInt(Object value) {
         return isInt(value) && ((Number) value).longValue() > 0;
+    }
+
+    /** Integer-typed and >= 0. Used for knobs where zero is a valid "disabled" value. */
+    static boolean isNonNegativeInt(Object value) {
+        return isInt(value) && ((Number) value).longValue() >= 0;
     }
 
     /** True only for integral numeric types (booleans are excluded). */

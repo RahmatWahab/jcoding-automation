@@ -1,6 +1,7 @@
 package com.rahmatwahab.codexautomation;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -50,6 +51,33 @@ class WorkflowLockTest {
         Map<String, Object> owner = readOwner(lock.path());
         assertThat(((Number) owner.get("pid")).longValue()).isEqualTo(currentPid());
         assertThat(owner).containsKey("heartbeat_at");
+    }
+
+    @Test
+    void refreshAfterOwnerFileRemovedReportsLostOwnershipNotCrash(@TempDir Path tmp) throws Exception {
+        // Production race: another controller recovered this lock as stale and
+        // deleted owner.json between refreshes. refresh() must surface a clear
+        // LockOwnershipLost (so the controller ends the run cleanly) instead of
+        // an UncheckedIOException that becomes "unexpected controller error".
+        WorkflowLock lock = WorkflowLock.acquire(tmp.resolve("epic.lock"), 900, 3, 10);
+        assertThat(lock).isNotNull();
+        Files.delete(lock.path().resolve("owner.json"));
+        assertThatThrownBy(lock::refresh)
+                .isInstanceOf(WorkflowLock.LockOwnershipLost.class)
+                .isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void refreshAfterOwnershipChangedReportsLostOwnership(@TempDir Path tmp) throws Exception {
+        // Owner file present but owned by a different pid: also lost ownership.
+        WorkflowLock lock = WorkflowLock.acquire(tmp.resolve("epic.lock"), 900, 3, 10);
+        assertThat(lock).isNotNull();
+        Path ownerFile = lock.path().resolve("owner.json");
+        Map<String, Object> owner = readOwner(lock.path());
+        owner.put("pid", currentPid() + 1);
+        Files.writeString(ownerFile, MAPPER.writeValueAsString(owner));
+        assertThatThrownBy(lock::refresh)
+                .isInstanceOf(WorkflowLock.LockOwnershipLost.class);
     }
 
     @Test

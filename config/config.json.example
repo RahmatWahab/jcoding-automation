@@ -23,6 +23,8 @@
     "delivery_verification_delay_seconds": 2,
     "max_feedback_attempts": 3,
     "max_resume_attempts": 3,
+    "resume_loop_multiplier": 4,
+    "wait_poll_seconds": 0,
     "max_phase_attempts": 5
   },
   "codex": {

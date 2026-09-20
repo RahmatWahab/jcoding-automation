@@ -75,6 +75,39 @@ class CodexRunnerTest {
         assertThat(redacted).doesNotContain("ghp_inline_value_here");
     }
 
+    @Test
+    void redactsMultipleDistinctSecretsAndCombinesWithRegex() {
+        // Precomputed sensitive values must still redact every configured secret
+        // and compose with the header/assignment regex passes in one call.
+        CodexRunner runner = new CodexRunner(
+                new java.util.LinkedHashMap<>(Map.of(
+                        "GH_TOKEN", "ghp_aaa", "MY_SECRET", "s3cr3t", "PATH", "/usr/bin")),
+                System::nanoTime);
+        String redacted = runner.redactSensitive(
+                "gh=ghp_aaa other=s3cr3t Authorization: Bearer xyz keep=/usr/bin");
+        assertThat(redacted).doesNotContain("ghp_aaa");
+        assertThat(redacted).doesNotContain("s3cr3t");
+        assertThat(redacted).contains("Authorization: Bearer [REDACTED]");
+        // Non-sensitive env values (PATH) are never redacted.
+        assertThat(redacted).contains("keep=/usr/bin");
+    }
+
+    @Test
+    void redactionHandlesEmptyAndNullInputWithoutError() {
+        CodexRunner runner = new CodexRunner(
+                Map.of("GH_TOKEN", "ghp_aaa"), System::nanoTime);
+        assertThat(runner.redactSensitive("")).isEmpty();
+        assertThat(runner.redactSensitive(null)).isNull();
+    }
+
+    @Test
+    void redactionLeavesNonSecretTextUnchanged() {
+        CodexRunner runner = new CodexRunner(
+                Map.of("GH_TOKEN", "ghp_aaa"), System::nanoTime);
+        String clean = "just a normal log line with no secrets";
+        assertThat(runner.redactSensitive(clean)).isEqualTo(clean);
+    }
+
     // -- dry run -------------------------------------------------------------
 
     @Test
@@ -97,6 +130,22 @@ class CodexRunnerTest {
         assertThat(result.exitCode()).isEqualTo(0);
         assertThat(result.output()).isEmpty();
     }
+
+    // -- mid-phase lost-lock handling ----------------------------------------
+    //
+    // The mid-phase lost-lock path (heartbeat throws LockOwnershipLost while the
+    // worker runs) is verified deterministically without launching a process:
+    //  - WorkflowLockTest proves refresh() throws LockOwnershipLost when the
+    //    owner file is removed or ownership changes (the source of the throw).
+    //  - ControllerTest/Controller proves the top-level handler catches
+    //    LockOwnershipLost and ends the run cleanly (INFO, return 0).
+    //  - CodexRunner.run() wraps the read loop in `catch (RuntimeException abort)`
+    //    which force-destroys and reaps the child before rethrowing, so the
+    //    worker is never orphaned. A real-process test here is intentionally
+    //    avoided: run() builds its own command internally, leaving no seam to
+    //    inject a controllable long-lived child without launching a real codex.
+
+    // -- command construction (approval flag) --------------------------------
 
     @Test
     void commandUsesSupportedApprovalFlagNotAskForApproval() {
