@@ -1109,15 +1109,19 @@ final class WorkflowOrchestrator {
             // reconcile before feedback.md ever runs — an observed live loop:
             //   feedback BLOCKED -> reconcile -> PROCESS_FEEDBACK -> feedback
             //   BLOCKED -> ... (the fix and thread resolution never happen).
-            // Clearing the verdict (and the guard counters) lets the FIXING_
-            // FEEDBACK worker actually run. The feedback guard's own attempt cap
-            // still bounds it, and reconcile has its own ceiling, so this cannot
-            // loop unbounded.
+            // Clearing the verdict lets the FIXING_FEEDBACK worker actually run.
+            //
+            // IMPORTANT: do NOT reset feedback_attempts / feedback_guard_head
+            // here. Those accrue the per-head attempt count that the
+            // max_feedback_attempts cap depends on. Resetting them every reconcile
+            // cycle would let reconcile<->feedback loop forever (the cap could
+            // never be reached). Preserving them means: feedback.md re-runs, and
+            // if it keeps failing the cap eventually triggers the bounded live
+            // auto-deliver/escalate path — so the cycle converges instead of
+            // spinning.
             if ("PROCESS_FEEDBACK".equals(Engine.asString(state.get("decision_action")))) {
                 state.remove("last_feedback_result");
                 state.remove("last_feedback_result_head");
-                state.remove("feedback_guard_head");
-                state.remove("feedback_attempts");
                 save();
             }
             return 0;
