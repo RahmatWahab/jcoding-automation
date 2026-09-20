@@ -1029,15 +1029,43 @@ final class WorkflowOrchestrator {
 
                 // Cumulative, head-independent guard: count every resume for the
                 // active story. Reset only on a story change, not a head change.
+                // Cumulative, head-independent guard: count every resume for the
+                // active story. It resets on a story change AND on GENUINE
+                // PROGRESS — i.e. a review thread has been resolved since the
+                // counter last reset. A healthy PR advancing through review
+                // (fix -> resolve thread -> new finding -> fix) makes real
+                // progress every round and therefore never trips this cap; only
+                // a genuine no-progress spin (no threads resolved across the
+                // whole window) accrues to the cap. Field evidence: PR #187
+                // legitimately went through ~40 heads and ~200 thread
+                // resolutions, yet the old story-only reset falsely declared it
+                // UNRECOVERABLE. Progress is the correct reset signal, not merely
+                // head movement (a trivial head bump with no resolution is not
+                // progress) and not the local worktree state (committed work
+                // leaves a clean worktree).
                 String totalGuardStory = Engine.asString(state.get("resume_total_story"));
                 String currentStoryKey = current == null ? "" : String.valueOf(current);
+                int resolvedNow = resolvedThreadCount();
+                int resolvedAtReset = (int) Engine.asLongOrDefault(
+                        state.get("resume_total_resolved_baseline"), 0);
+                boolean madeProgress = resolvedNow > resolvedAtReset;
                 int totalResumeAttempts;
-                if (!currentStoryKey.isEmpty() && currentStoryKey.equals(totalGuardStory)) {
+                if (!currentStoryKey.isEmpty() && currentStoryKey.equals(totalGuardStory)
+                        && !madeProgress) {
                     totalResumeAttempts =
                             (int) Engine.asLongOrDefault(state.get("resume_total_attempts"), 0) + 1;
                 } else {
+                    // New story, or the worker resolved at least one thread since
+                    // the counter last reset — treat as fresh, and rebaseline the
+                    // resolved-thread watermark so future progress keeps resetting.
                     totalResumeAttempts = 1;
                     state.put("resume_total_story", currentStoryKey);
+                    state.put("resume_total_resolved_baseline", resolvedNow);
+                    if (madeProgress) {
+                        log.info("PROGRESS: story #{} resolved {} review thread(s) (was {}); "
+                                + "resetting cumulative resume guard — the PR is advancing",
+                                current, resolvedNow, resolvedAtReset);
+                    }
                 }
                 state.put("resume_total_attempts", totalResumeAttempts);
                 int loopMultiplier = Math.max(1, (int) Engine.asLongOrDefault(
@@ -1107,6 +1135,7 @@ final class WorkflowOrchestrator {
                     state.remove("resume_attempts");
                     state.remove("resume_total_story");
                     state.remove("resume_total_attempts");
+                    state.remove("resume_total_resolved_baseline");
                     state.put("exit_code", result.exitCode());
                     state.put("run_finished_at", Controller.now());
                     save();
@@ -1122,6 +1151,7 @@ final class WorkflowOrchestrator {
                 state.remove("resume_attempts");
                 state.remove("resume_total_story");
                 state.remove("resume_total_attempts");
+                state.remove("resume_total_resolved_baseline");
                 save();
                 int deliveryResult = runDeliveryPipeline(git, current, currentPr,
                         result.output(), feedbackToResolve, true);
@@ -1420,6 +1450,27 @@ final class WorkflowOrchestrator {
         state.put("thread_updates", updates);
     }
 
+    /**
+     * Count of review threads this run has RESOLVED for the active story, read
+     * from the durable {@code thread_updates} journal. Used as the "genuine
+     * progress" signal that resets the cumulative resume guard: a PR advancing
+     * through its review cycle resolves threads, so it must never be treated as
+     * a no-progress spin.
+     */
+    private int resolvedThreadCount() {
+        Object existing = state.get("thread_updates");
+        if (!(existing instanceof List<?> list)) {
+            return 0;
+        }
+        int resolved = 0;
+        for (Object item : list) {
+            if (item instanceof Map<?, ?> m && "RESOLVED".equals(String.valueOf(m.get("action")))) {
+                resolved++;
+            }
+        }
+        return resolved;
+    }
+
     private void cleanup(Path renderedPrompt) {
         try {
             Files.deleteIfExists(renderedPrompt);
@@ -1471,6 +1522,7 @@ final class WorkflowOrchestrator {
                 "worktree_recovery", "worktree_baseline", "base_branch",
                 "resume_guard_head", "resume_attempts",
                 "resume_total_story", "resume_total_attempts",
+                "resume_total_resolved_baseline",
                 "feedback_guard_head", "feedback_attempts",
                 "last_feedback_result", "last_feedback_result_head",
                 "stuck_head", "stuck_head_reason",

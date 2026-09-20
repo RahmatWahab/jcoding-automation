@@ -1273,6 +1273,140 @@ class WorkflowOrchestratorIntegrationTest {
     }
 
     @Test
+    void progressingPrResetsCumulativeGuardAndIsNotDeclaredUnrecoverable(@TempDir Path root)
+            throws Exception {
+        // Field regression (PR #187): a healthy PR advanced ~40 heads and resolved
+        // ~200 review threads over hours, yet the cumulative resume guard (which
+        // reset only on story change) reached its cap and the controller falsely
+        // declared the head UNRECOVERABLE. The guard must reset on GENUINE PROGRESS
+        // (a review thread resolved since the counter's baseline), so a PR that
+        // keeps resolving threads is never falsely blocked. Here the cumulative
+        // counter is pre-loaded near the cap, but thread_updates shows resolutions
+        // beyond the recorded baseline -> the reconcile tick must RESET the guard
+        // (not force-deliver/abort into UNRECOVERABLE).
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q");
+        Path prompts = root.resolve("prompts");
+        Files.createDirectories(prompts);
+        Files.writeString(prompts.resolve("common.md"), "COMMON");
+        Files.writeString(prompts.resolve("reconcile.md"), "{{COMMON}}\nReconcile.");
+        Files.writeString(prompts.resolve("feedback.md"), "{{COMMON}}\nFix.");
+        Files.createDirectories(root.resolve("state"));
+
+        String head = "3c6ac56b46ea";
+        Map<String, Object> prSnapshot = map(
+                "number", 187, "state", "OPEN", "mergedAt", null,
+                "headRefOid", head, "headRefName", "story/52-x", "url", "http://x/pr/187",
+                "reviewDecision", "CHANGES_REQUESTED", "statusCheckRollup", new ArrayList<>(),
+                "reviewThreadsAvailable", true, "comments", new ArrayList<>(),
+                "reviews", List.of(map("author", map("login", "chatgpt-codex-connector"),
+                        "submittedAt", "2026-02-01", "commit", map("oid", head))),
+                "reviewThreads", List.of(map("id", "PRRT_new", "isResolved", false,
+                        "comments", map("nodes", List.of(map("id", "PRRC_1",
+                                "body", "dependency fencing-label preservation",
+                                "createdAt", "2026-01-01",
+                                "author", map("login", "reviewer")))))));
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", false, "max_resume_attempts", 2,
+                        "resume_loop_multiplier", 2,  // cap = 4
+                        "max_feedback_attempts", 99, "delivery_verification_attempts", 1,
+                        "delivery_verification_delay_seconds", 0),
+                "budgets", map(),
+                "workflow", map("allow_push", true, "allow_comments", true,
+                        "allow_thread_resolution", true));
+
+        CodexRunner codex = new CodexRunner(Map.of(), System::nanoTime) {
+            @Override
+            public CodexResult run(Map<String, Object> cfg, Path prompt, Path r, boolean dry,
+                                   Runnable hb, Integer timeout) {
+                return new CodexResult(0,
+                        "DECISION_ACTION: PROCESS_FEEDBACK\n"
+                        + "DECISION_REASON: one actionable unresolved review thread remains\n"
+                        + "BLOCKER_CLASS: REVIEW_FEEDBACK\n"
+                        + "RECOVERY_ACTION: implement the bounded fix\n"
+                        + "RESULT_STATUS: SUCCESS\nRESULT_NEXT_PHASE: FIXING_FEEDBACK\n"
+                        + "RESULT_BLOCKER: NONE\nRESULT_EVIDENCE: COMPLETE\n");
+            }
+        };
+        GitOperations.GitRunner gitRunner = (r, args) -> {
+            String key = String.join(" ", args);
+            if (key.startsWith("status --porcelain")) {
+                return new GitOperations.GitResult(0, "", ""); // clean worktree
+            }
+            if (key.startsWith("branch --show-current") || key.startsWith("branch --list")) {
+                return new GitOperations.GitResult(0, "story/52-x\n", "");
+            }
+            if (key.startsWith("rev-parse HEAD")) {
+                return new GitOperations.GitResult(0, head + "\n", "");
+            }
+            if (key.startsWith("ls-remote origin")) {
+                return new GitOperations.GitResult(0, head + "\trefs/heads/story/52-x\n", "");
+            }
+            return new GitOperations.GitResult(0, "", "");
+        };
+        Controller.GitOperationsFactory gitFactory = new Controller.GitOperationsFactory(repo) {
+            @Override
+            public GitOperations create() {
+                return new GitOperations(repo, gitRunner);
+            }
+        };
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #52", "url", "http://x/27");
+
+        Map<String, Object> state = store.load();
+        state.put("phase", "BLOCKED_REQUIREMENTS"); // routes to reconcile.md
+        state.put("current_story", 52);
+        state.put("current_pr", 187);
+        state.put("branch", "story/52-x");
+        state.put("last_feedback_result", "BLOCKED");
+        state.put("last_feedback_result_head", head);
+        // Cumulative counter already AT the cap (=4) for this story...
+        state.put("resume_total_story", "52");
+        state.put("resume_total_attempts", 4);
+        state.put("resume_guard_head", head);
+        state.put("resume_attempts", 1);
+        // ...but the worker HAS made progress: 3 threads resolved, baseline was 0.
+        List<Object> updates = new ArrayList<>();
+        for (int i = 1; i <= 3; i++) {
+            Map<String, Object> u = new LinkedHashMap<>();
+            u.put("thread_id", "PRRT_old" + i);
+            u.put("head", "olderhead" + i);
+            u.put("action", "RESOLVED");
+            u.put("at", "2026-09-20T19:0" + i + ":00Z");
+            updates.add(u);
+        }
+        state.put("thread_updates", updates);
+        state.put("resume_total_resolved_baseline", 0);
+
+        WorkflowLock lock = WorkflowLock.acquire(
+                root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+        DeliveryGitHub github = new DeliveryGitHub(prSnapshot);
+        WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                config, state, store, github, repo, root, epic, 27, false,
+                gitFactory, codex, new ReviewCoordinator(), lock);
+        orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
+        lock.release();
+
+        Map<String, Object> after = store.load();
+        // The guard RESET on progress -> the head is NOT declared UNRECOVERABLE.
+        assertThat(Engine.asString(after.get("stuck_head_reason"))).isNotEqualTo("UNRECOVERABLE");
+        assertThat(after.get("stuck_head")).isNull();
+        // Cumulative counter was rebaselined to the current resolved count (3)
+        // and the attempt count reset to 1 — proving progress cleared the fatigue.
+        assertThat((int) Engine.asLongOrDefault(after.get("resume_total_attempts"), 99)).isEqualTo(1);
+        assertThat((int) Engine.asLongOrDefault(after.get("resume_total_resolved_baseline"), -1))
+                .isEqualTo(3);
+    }
+
+    @Test
     void liveUnrecoverableStuckHeadIsNotClearedInLiveMode(@TempDir Path root) throws Exception {
         // Core regression (PR #187): the reconcile auto-deliver-abort marks a head
         // UNRECOVERABLE (worker cannot produce a fix). A previous fix wrongly
