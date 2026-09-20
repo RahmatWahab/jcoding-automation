@@ -67,11 +67,44 @@ public final class GitOperations {
 
     /** Current branch, rejecting the default (main/master) branch. */
     public String gitBranch() {
-        String branch = checkedStdout("branch", "--show-current").strip();
+        String branch = currentBranchName();
         if (branch.isEmpty() || DEFAULT_BRANCHES.contains(branch)) {
             throw new IllegalStateException("Codex must work on a non-default feature branch");
         }
         return branch;
+    }
+
+    /** Return the current branch without applying the feature-branch guard. */
+    public String currentBranchName() {
+        return checkedStdout("branch", "--show-current").strip();
+    }
+
+    /**
+     * Recover a branch lost from durable state after a crash between branch
+     * creation and state persistence. This is deliberately fail-closed: only a
+     * branch generated for the currently selected story may be adopted.
+     */
+    public boolean recoverMissingStoryBranch(Map<String, Object> state) {
+        Object recorded = state.get("branch");
+        Object story = state.get("current_story");
+        if (recorded != null && !String.valueOf(recorded).isBlank()
+                || story == null || String.valueOf(story).isBlank()) {
+            return false;
+        }
+        int storyNumber;
+        try {
+            storyNumber = Engine.asInt(story);
+        } catch (RuntimeException exc) {
+            return false;
+        }
+        String branch = currentBranchName();
+        String prefix = "story/" + storyNumber + "-";
+        if (branch.isEmpty() || DEFAULT_BRANCHES.contains(branch)
+                || !branch.startsWith(prefix) || branch.length() == prefix.length()) {
+            return false;
+        }
+        state.put("branch", branch);
+        return true;
     }
 
     private List<String> sourceChanges() {
@@ -116,7 +149,7 @@ public final class GitOperations {
         if (changes.isEmpty()) {
             return WorktreeState.CLEAN;
         }
-        String branch = checkedStdout("branch", "--show-current").strip();
+        String branch = currentBranchName();
         if (branch.isEmpty() || DEFAULT_BRANCHES.contains(branch)) {
             return WorktreeState.DIRTY_DEFAULT_BRANCH;
         }

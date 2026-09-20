@@ -305,6 +305,28 @@ class GitOperationsTest {
                 .isEqualTo(GitOperations.WorktreeState.DIRTY_UNKNOWN_BRANCH);
     }
 
+    @Test
+    void recoverMissingStoryBranchAdoptsOnlyMatchingStoryBranch() {
+        FakeGit git = new FakeGit().output("branch --show-current",
+                "story/47-net\n");
+        GitOperations ops = new GitOperations(Path.of("/repo"), git);
+        Map<String, Object> state = map("current_story", 47);
+
+        assertThat(ops.recoverMissingStoryBranch(state)).isTrue();
+        assertThat(state.get("branch")).isEqualTo("story/47-net");
+    }
+
+    @Test
+    void recoverMissingStoryBranchRejectsUnrelatedBranch() {
+        FakeGit git = new FakeGit().output("branch --show-current",
+                "story/99-unrelated\n");
+        GitOperations ops = new GitOperations(Path.of("/repo"), git);
+        Map<String, Object> state = map("current_story", 47);
+
+        assertThat(ops.recoverMissingStoryBranch(state)).isFalse();
+        assertThat(state).doesNotContainKey("branch");
+    }
+
     // -- verify_delivered_head_with_retry ------------------------------------
 
     @Test

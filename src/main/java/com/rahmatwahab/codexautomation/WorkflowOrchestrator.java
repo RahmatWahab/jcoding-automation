@@ -744,6 +744,15 @@ final class WorkflowOrchestrator {
 
         GitOperations git = gitFactory.create();
 
+        // A crash can occur after a story branch is created but before its
+        // name is persisted. Recover only an unambiguous branch generated for
+        // the selected story; arbitrary dirty branches must remain blocked.
+        if (git.recoverMissingStoryBranch(state)) {
+            save();
+            log.warn("STATE RECOVERY: restored missing story branch {} for story #{}",
+                    state.get("branch"), current);
+        }
+
         // Full-loop fix: before validating the worktree, actively check out the
         // active story branch. Previously the controller validated the worktree
         // while the repo was still on the default branch, so a dirty default
