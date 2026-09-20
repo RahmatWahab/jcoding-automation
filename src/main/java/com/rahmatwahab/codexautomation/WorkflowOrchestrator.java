@@ -271,6 +271,36 @@ final class WorkflowOrchestrator {
 
                 String head = Engine.asString(currentPr.get("headRefOid"));
 
+                // Terminal stuck head: if this exact head was already determined
+                // unrecoverable in a non-delivering mode (dry-run/allow_push
+                // disabled), do NOT re-enter feedback and re-increment the attempt
+                // count every cron tick — that produced the unbounded "reprocessed
+                // N times" BLOCKED loop. Only a genuinely new deliverable fix in
+                // the worktree clears the marker (checked here so the block is not
+                // permanent when real work arrives). Otherwise stay blocked
+                // quietly and stop processing this head.
+                if (head.equals(Engine.asString(state.get("stuck_head")))) {
+                    boolean newFix = false;
+                    try {
+                        newFix = gitFactory.create().classifyWorktree(state)
+                                != GitOperations.WorktreeState.CLEAN;
+                    } catch (RuntimeException ignored) {
+                        newFix = false;
+                    }
+                    if (newFix) {
+                        log.info("STUCK-HEAD CLEARED: deliverable changes present for head {}; "
+                                + "allowing a fresh feedback attempt", shortSha(head));
+                        state.remove("stuck_head");
+                    } else {
+                        state.put("phase", "BLOCKED_EXTERNAL");
+                        save();
+                        log.info("BLOCKED (terminal): PR #{} head {} feedback remains unresolved and "
+                                + "delivery is disabled; awaiting a new head or operator action",
+                                currentPr.get("number"), shortSha(head));
+                        return 1;
+                    }
+                }
+
                 // Respect the worker's verdict: if the previous FIXING_FEEDBACK
                 // run on this exact head returned BLOCKED (it could not resolve
                 // the finding directly), do not re-dispatch the same feedback.
@@ -368,8 +398,18 @@ final class WorkflowOrchestrator {
                         // routes it to reconcile.
                     } else {
                         // Simulation (dry-run) or push disabled: record and stop
-                        // without pretending to deliver.
+                        // without pretending to deliver. Mark this head as
+                        // terminally stuck and clear the guard counters so the
+                        // controller does NOT re-enter feedback and re-increment
+                        // the attempt count on every subsequent cron tick — that
+                        // produced an unbounded "reprocessed N times" BLOCKED loop
+                        // in dry-run. A genuinely new head clears stuck_head and
+                        // allows a fresh attempt; a human/CI change is required
+                        // to advance this one.
                         state.put("phase", "BLOCKED_EXTERNAL");
+                        state.put("stuck_head", head);
+                        state.remove("feedback_guard_head");
+                        state.remove("feedback_attempts");
                         state.put("error", "Feedback for PR #" + currentPr.get("number")
                                 + " head " + shortSha(head) + " was reprocessed " + feedbackAttempts
                                 + " times without resolution and delivery is disabled (dry_run or "

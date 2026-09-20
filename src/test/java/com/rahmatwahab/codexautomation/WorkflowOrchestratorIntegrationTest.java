@@ -113,6 +113,90 @@ class WorkflowOrchestratorIntegrationTest {
     }
 
     @Test
+    void dryRunFeedbackCapBlocksOnceAndDoesNotLoopForever(@TempDir Path root) throws Exception {
+        // Regression for the production loop: in dry-run (delivery disabled), an
+        // unresolved review thread on a stable head drove FIXING_FEEDBACK past
+        // max_feedback_attempts, then every subsequent cron tick re-detected the
+        // same feedback and re-blocked with an ever-increasing "reprocessed N
+        // times" count — forever. After the fix the head is marked terminally
+        // stuck once the cap is exceeded, and later ticks stay blocked WITHOUT
+        // re-incrementing the attempt counter.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q");
+        Path prompts = root.resolve("prompts");
+        Files.createDirectories(prompts);
+        Files.writeString(prompts.resolve("common.md"), "COMMON");
+        Files.writeString(prompts.resolve("feedback.md"), "{{COMMON}}\nFix.");
+        Files.writeString(prompts.resolve("reconcile.md"), "{{COMMON}}\nReconcile.");
+        Files.createDirectories(root.resolve("state"));
+
+        String head = "stablehead1234";
+        Map<String, Object> prSnapshot = map(
+                "number", 187, "state", "OPEN", "mergedAt", null,
+                "headRefOid", head, "headRefName", "story/52-x", "url", "http://x/pr/187",
+                "reviewDecision", "CHANGES_REQUESTED", "statusCheckRollup", new ArrayList<>(),
+                "reviewThreadsAvailable", true, "comments", new ArrayList<>(),
+                "reviews", List.of(map("author", map("login", "chatgpt-codex-connector"),
+                        "submittedAt", "2026-02-01", "commit", map("oid", head))),
+                "reviewThreads", List.of(map("id", "PRRT_1", "isResolved", false,
+                        "comments", map("nodes", List.of(map("id", "PRRC_1",
+                                "body", "preserve phase route_refresh", "createdAt", "2026-01-01",
+                                "author", map("login", "reviewer")))))));
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", true, "max_feedback_attempts", 3),
+                "budgets", map(),
+                "workflow", map()); // delivery disabled (dry_run + no allow_push)
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #52", "url", "http://x/27");
+
+        int blockReturns = 0;
+        int maxAttemptsSeen = 0;
+        boolean stuckHeadSet = false;
+        for (int run = 1; run <= 12; run++) {
+            Map<String, Object> state = store.load();
+            state.put("phase", "FIXING_FEEDBACK");
+            state.put("current_story", 52);
+            state.put("current_pr", 187);
+            state.put("branch", "story/52-x");
+            WorkflowLock lock = WorkflowLock.acquire(
+                    root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+            DeliveryGitHub github = new DeliveryGitHub(prSnapshot);
+            WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                    config, state, store, github, repo, root, epic, 27, true,
+                    new Controller.GitOperationsFactory(repo), new CodexRunner(),
+                    new ReviewCoordinator(), lock);
+            int code = orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
+            if (code == 1 && "BLOCKED_EXTERNAL".equals(Engine.asString(state.get("phase")))) {
+                blockReturns++;
+            }
+            int attempts = (int) Engine.asLongOrDefault(store.load().get("feedback_attempts"), 0);
+            maxAttemptsSeen = Math.max(maxAttemptsSeen, attempts);
+            if (!Engine.asString(store.load().get("stuck_head")).isEmpty()) {
+                stuckHeadSet = true;
+            }
+            lock.release();
+        }
+
+        // The head is terminally marked stuck (block is idempotent).
+        assertThat(stuckHeadSet).isTrue();
+        // Crucially, feedback_attempts NEVER runs away: it is capped at/around
+        // max_feedback_attempts and cleared once stuck (never reaching 12+ as in
+        // the old unbounded loop).
+        assertThat(maxAttemptsSeen).isLessThanOrEqualTo(4);
+        // It keeps returning a blocked exit (does not falsely progress) but does
+        // so quietly/idempotently rather than re-incrementing forever.
+        assertThat(blockReturns).isGreaterThan(0);
+    }
+
+    @Test
     void ciDeferredFeedbackFixIsCommittedAndPushed(@TempDir Path root) throws Exception {
         // Robustness regression: when a feedback fix is complete but a heavy E2E
         // lane must run in CI, the worker returns SUCCESS + DEFERRED_TO_CI +
