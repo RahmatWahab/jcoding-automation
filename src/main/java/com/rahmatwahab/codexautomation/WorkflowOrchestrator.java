@@ -752,36 +752,7 @@ final class WorkflowOrchestrator {
 
         // Defensive post-Codex PR adoption: a worker or an interrupted
         // controller may have created a PR without persisting its number.
-        if (current != null && currentPr == null && !dryRun) {
-            try {
-                List<Map<String, Object>> refreshedPrs = new ArrayList<>();
-                Object refreshed = github.prs();
-                if (refreshed instanceof List<?> list) {
-                    for (Object p : list) {
-                        if (p instanceof Map<?, ?> m) {
-                            refreshedPrs.add(castMap(m));
-                        }
-                    }
-                }
-                List<Map<String, Object>> storyPrs = openPrsForStory(refreshedPrs, current);
-                if (storyPrs.size() > 1) {
-                    state.put("phase", "CONFLICT_DETECTED");
-                    state.put("error", "Multiple open PRs for story #" + current);
-                } else if (!storyPrs.isEmpty()) {
-                    currentPr = github.pr(Engine.asInt(storyPrs.get(0).get("number")));
-                    state.put("current_pr", currentPr.get("number"));
-                    state.put("current_pr_url", currentPr.get("url"));
-                    state.put("current_pr_head", currentPr.get("headRefOid"));
-                    state.put("branch", currentPr.get("headRefName"));
-                    log.info("PR ADOPTED AFTER CODEX: story #" + current
-                            + ", PR #" + currentPr.get("number"));
-                    review.ensureCodexReviewTrigger(github, currentPr, state, workflow, dryRun, this::save);
-                }
-            } catch (GitHubError exc) {
-                state.put("phase", "BLOCKED_EXTERNAL");
-                state.put("error", "Unable to reconcile PR after Codex execution: " + exc.getMessage());
-            }
-        }
+        currentPr = adoptPrAfterCodex(current, currentPr);
 
         state.putAll(Engine.applyCodexResult(state, result.exitCode(), result.output(),
                 (int) Engine.asLongOrDefault(automation.get("quota_retry_seconds"), 1800)));
@@ -1391,6 +1362,46 @@ final class WorkflowOrchestrator {
     }
 
     // -- helpers -------------------------------------------------------------
+
+    /**
+     * Defensive post-Codex PR adoption (Requirement 2). A worker or an
+     * interrupted controller may have created a PR without persisting its
+     * number; adopt an unambiguous open PR for the story. Returns the
+     * (possibly updated) current PR. Behavior-identical to the former inline block.
+     */
+    private Map<String, Object> adoptPrAfterCodex(Integer current, Map<String, Object> currentPr) {
+        if (current != null && currentPr == null && !dryRun) {
+            try {
+                List<Map<String, Object>> refreshedPrs = new ArrayList<>();
+                Object refreshed = github.prs();
+                if (refreshed instanceof List<?> list) {
+                    for (Object p : list) {
+                        if (p instanceof Map<?, ?> m) {
+                            refreshedPrs.add(castMap(m));
+                        }
+                    }
+                }
+                List<Map<String, Object>> storyPrs = openPrsForStory(refreshedPrs, current);
+                if (storyPrs.size() > 1) {
+                    state.put("phase", "CONFLICT_DETECTED");
+                    state.put("error", "Multiple open PRs for story #" + current);
+                } else if (!storyPrs.isEmpty()) {
+                    currentPr = github.pr(Engine.asInt(storyPrs.get(0).get("number")));
+                    state.put("current_pr", currentPr.get("number"));
+                    state.put("current_pr_url", currentPr.get("url"));
+                    state.put("current_pr_head", currentPr.get("headRefOid"));
+                    state.put("branch", currentPr.get("headRefName"));
+                    log.info("PR ADOPTED AFTER CODEX: story #" + current
+                            + ", PR #" + currentPr.get("number"));
+                    review.ensureCodexReviewTrigger(github, currentPr, state, workflow, dryRun, this::save);
+                }
+            } catch (GitHubError exc) {
+                state.put("phase", "BLOCKED_EXTERNAL");
+                state.put("error", "Unable to reconcile PR after Codex execution: " + exc.getMessage());
+            }
+        }
+        return currentPr;
+    }
 
     /** Result of story selection/adoption: non-null exitCode ends the run. */
     private record SelectionResult(Integer exitCode, Integer current, Map<String, Object> currentPr) {
