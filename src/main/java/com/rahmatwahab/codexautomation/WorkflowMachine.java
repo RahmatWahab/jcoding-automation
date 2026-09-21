@@ -40,7 +40,7 @@ public final class WorkflowMachine {
 
     /** Every phase the controller can occupy, including the non-PhaseModel operational phases. */
     public static final Set<String> KNOWN_PHASES = Set.of(
-            "IDLE", "IMPLEMENTING", "VERIFYING", "REVIEWING_CODE", "WAITING_FOR_CI",
+            "IDLE", "PLANNING", "IMPLEMENTING", "VERIFYING", "REVIEWING_CODE", "WAITING_FOR_CI",
             "WAITING_FOR_CODEX_REVIEW", "WAITING_FOR_HUMAN_REVIEW", "CHANGES_REQUESTED",
             "FIXING_FEEDBACK", "READY_TO_MERGE", "WAITING_FOR_MANUAL_MERGE", "PAUSED_QUOTA",
             "BLOCKED_REQUIREMENTS", "BLOCKED_EXTERNAL", "BLOCKED_REPOSITORY",
@@ -57,6 +57,7 @@ public final class WorkflowMachine {
 
     private static Map<String, String> buildPromptMap() {
         Map<String, String> m = new LinkedHashMap<>();
+        m.put("PLANNING", "prompts/plan.md");
         m.put("CHANGES_REQUESTED", "prompts/feedback.md");
         m.put("FIXING_FEEDBACK", "prompts/feedback.md");
         m.put("VERIFYING", "prompts/verify.md");
@@ -105,8 +106,10 @@ public final class WorkflowMachine {
                 "CONFLICT_DETECTED")) {
             m.put(recover, union(anyActive, waitingOrTerminal));
         }
-        // Idle selects a story and begins implementation, or completes the EPIC.
-        m.put("IDLE", union(anyActive, Set.of("EPIC_COMPLETE", "IDLE", "BLOCKED_REQUIREMENTS")));
+        // Idle selects a story and begins implementation (or planning), or completes the EPIC.
+        m.put("IDLE", union(anyActive, Set.of("PLANNING", "EPIC_COMPLETE", "IDLE", "BLOCKED_REQUIREMENTS")));
+        // Planning produces the plan then proceeds to implementation (or reconcile on ambiguity).
+        m.put("PLANNING", union(anyActive, Set.of("RECONCILING", "BLOCKED_REQUIREMENTS")));
         // Waiting phases resolve forward to review/feedback/merge or a block.
         for (String wait : Set.of("WAITING_FOR_CI", "WAITING_FOR_CODEX_REVIEW",
                 "WAITING_FOR_HUMAN_REVIEW", "WAITING_FOR_MANUAL_MERGE", "READY_TO_MERGE",

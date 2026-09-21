@@ -28,6 +28,7 @@ class WorkflowMachineTest {
         assertThat(WorkflowMachine.promptFor("CODEX_FAILURE")).isEqualTo("prompts/reconcile.md");
         assertThat(WorkflowMachine.promptFor("READY_TO_MERGE")).isEqualTo("prompts/final-review.md");
         assertThat(WorkflowMachine.promptFor("IDLE")).isEqualTo("prompts/discover.md");
+        assertThat(WorkflowMachine.promptFor("PLANNING")).isEqualTo("prompts/plan.md");
         // Default / unknown / implementation phases -> implement.md.
         assertThat(WorkflowMachine.promptFor("IMPLEMENTING")).isEqualTo("prompts/implement.md");
         assertThat(WorkflowMachine.promptFor("SOMETHING_UNKNOWN")).isEqualTo("prompts/implement.md");
@@ -64,6 +65,8 @@ class WorkflowMachineTest {
             WorkflowMachine.requireLegalTransition("FIXING_FEEDBACK", "RECONCILING");
             WorkflowMachine.requireLegalTransition("RECONCILING", "IMPLEMENTING");
             WorkflowMachine.requireLegalTransition("MERGED", "IDLE");
+            WorkflowMachine.requireLegalTransition("IDLE", "PLANNING");
+            WorkflowMachine.requireLegalTransition("PLANNING", "IMPLEMENTING");
             WorkflowMachine.requireLegalTransition("IMPLEMENTING", "IMPLEMENTING"); // retry
         }).doesNotThrowAnyException();
     }

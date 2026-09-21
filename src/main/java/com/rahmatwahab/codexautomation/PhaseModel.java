@@ -16,7 +16,7 @@ public final class PhaseModel {
 
     /** All recognized workflow phases. */
     public static final Set<String> PHASES = Set.of(
-            "IDLE", "IMPLEMENTING", "VERIFYING", "REVIEWING_CODE", "WAITING_FOR_CI",
+            "IDLE", "PLANNING", "IMPLEMENTING", "VERIFYING", "REVIEWING_CODE", "WAITING_FOR_CI",
             "WAITING_FOR_CODEX_REVIEW", "WAITING_FOR_HUMAN_REVIEW", "CHANGES_REQUESTED",
             "FIXING_FEEDBACK", "READY_TO_MERGE", "WAITING_FOR_MANUAL_MERGE", "PAUSED_QUOTA",
             "BLOCKED_REQUIREMENTS", "BLOCKED_EXTERNAL", "CONFLICT_DETECTED", "RECONCILING",

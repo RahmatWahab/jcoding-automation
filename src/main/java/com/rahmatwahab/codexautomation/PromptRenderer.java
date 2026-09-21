@@ -47,6 +47,7 @@ public final class PromptRenderer {
     }
 
     private static final Map<String, String> PHASE_BY_PROMPT = Map.of(
+            "plan.md", "PLANNING",
             "implement.md", "IMPLEMENTING",
             "verify.md", "VERIFYING",
             "review.md", "REVIEWING_CODE",

@@ -1520,7 +1520,16 @@ final class WorkflowOrchestrator {
                 state.put("current_story", current);
                 state.put("current_story_url", selected.get("url"));
                 state.put("current_story_title", selected.getOrDefault("title", ""));
-                state.put("phase", "IMPLEMENTING");
+                // PLANNING gate (Requirement 9, config-gated): when planning is
+                // enabled and no valid committed plan exists yet, run PLANNING
+                // first; otherwise (default, or a plan already present on resume)
+                // go straight to IMPLEMENTING — preserving the current path.
+                boolean planningEnabled = Engine.asBool(automation.get("enable_planning"), false);
+                if (planningEnabled && !PlanLedgerReader.hasValidPlan(repo)) {
+                    state.put("phase", "PLANNING");
+                } else {
+                    state.put("phase", "IMPLEMENTING");
+                }
                 save();
             }
         }
