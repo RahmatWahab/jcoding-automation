@@ -612,6 +612,21 @@ final class WorkflowOrchestrator {
                     deviation.code());
         }
 
+        // Phase dispatch: render the prompt and run the bounded worker, then
+        // apply the result / reconcile decision / delivery (Requirement 2:
+        // worker-phase handler). reconcileAndExecute is now a thin dispatcher.
+        return runWorkerPhase(current, currentPr, feedbackToResolve, forcedPrompt);
+    }
+
+    /**
+     * Render the phase prompt, run the bounded worker, and apply its result:
+     * worktree reconciliation, structured-result application, reconcile-decision
+     * handling (with the ProgressGuard resume anti-loop), and delivery. Extracted
+     * verbatim from the former inline tail of {@code reconcileAndExecute}
+     * (Requirement 2). Returns the run exit code.
+     */
+    private int runWorkerPhase(Integer current, Map<String, Object> currentPr,
+                               List<Map<String, Object>> feedbackToResolve, String forcedPrompt) {
         // Phase dispatch: render prompt and run the bounded worker.
         String phasePrompt = forcedPrompt != null ? forcedPrompt
                 : Controller.phasePromptFor(Engine.asString(state.get("phase")));
