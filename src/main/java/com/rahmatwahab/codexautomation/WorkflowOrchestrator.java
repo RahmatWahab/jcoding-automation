@@ -72,139 +72,15 @@ final class WorkflowOrchestrator {
         Integer current = currentObj == null ? null : Engine.asInt(currentObj);
         Map<String, Object> currentPr = null;
 
-        // Story selection when none is active.
-        if (current == null) {
-            List<Object[]> candidates = new ArrayList<>();
-            for (int story : Engine.linkedStoryNumbers(epic)) {
-                List<Map<String, Object>> matches = Engine.prForStory(prs, story);
-                List<Map<String, Object>> open = new ArrayList<>();
-                for (Map<String, Object> p : matches) {
-                    if ("OPEN".equals(p.get("state"))) {
-                        open.add(p);
-                    }
-                }
-                if (open.size() > 1) {
-                    return conflict("Multiple open PRs for story #" + story);
-                }
-                if (!open.isEmpty()) {
-                    candidates.add(new Object[] {story, open.get(0)});
-                }
-            }
-            if (candidates.size() > 1) {
-                return conflict("Multiple open story PRs");
-            }
-            if (!candidates.isEmpty()) {
-                current = (Integer) candidates.get(0)[0];
-                currentPr = castMap(candidates.get(0)[1]);
-                state.put("current_story", current);
-                state.put("current_pr", currentPr.get("number"));
-                state.put("current_pr_url", currentPr.get("url"));
-            } else {
-                List<Map<String, Object>> stories = new ArrayList<>();
-                try {
-                    for (int number : Engine.linkedStoryNumbers(epic)) {
-                        stories.add(castMap(github.issue(number)));
-                    }
-                } catch (GitHubError exc) {
-                    return blockedExternal("Unable to inspect linked stories: " + exc.getMessage());
-                }
-                Map<String, Object> selected = Engine.selectStory(stories, completedStories());
-                if (selected == null) {
-                    state.put("phase", "EPIC_COMPLETE");
-                    state.put("message", "No eligible incomplete stories remain");
-                    save();
-                    log.info("EPIC COMPLETE");
-                    return 0;
-                }
-                current = Engine.asInt(selected.get("number"));
-                state.put("current_story", current);
-                state.put("current_story_url", selected.get("url"));
-                state.put("current_story_title", selected.getOrDefault("title", ""));
-                state.put("phase", "IMPLEMENTING");
-                save();
-            }
+        // Story selection, PR adoption, and eligibility/dependency verification
+        // (Requirement 2: SelectStory handler). A non-null exitCode means the run
+        // ends here; otherwise the resolved current story/PR flow onward.
+        SelectionResult selection = selectAndAdoptStory(prs, current, currentPr);
+        if (selection.exitCode() != null) {
+            return selection.exitCode();
         }
-
-        // Adopt an unambiguous open PR for the active story if not recorded.
-        currentPr = findRecordedPr(prs, currentPr);
-        if (current != null && currentPr == null) {
-            List<Map<String, Object>> storyPrs = openPrsForStory(prs, current);
-            if (storyPrs.size() > 1) {
-                return conflict("Multiple open PRs for story #" + current);
-            }
-            if (!storyPrs.isEmpty()) {
-                currentPr = storyPrs.get(0);
-                state.put("current_pr", currentPr.get("number"));
-                state.put("current_pr_url", currentPr.get("url"));
-                state.put("branch", currentPr.get("headRefName"));
-                // Persist immediately: recovery and reconciliation require a
-                // durable branch to resume, and a crash before the next save
-                // must not lose it (this was a root cause of the recovery loop).
-                save();
-                log.info("PR ADOPTED: story #" + current + ", PR #" + currentPr.get("number"));
-            }
-        }
-
-        // Verify current story eligibility and dependencies.
-        if (current != null) {
-            Map<String, Object> currentIssue;
-            try {
-                currentIssue = castMap(github.issue(current));
-            } catch (GitHubError exc) {
-                return blockedExternal("Unable to verify current story #" + current + ": " + exc.getMessage());
-            }
-            boolean linked = Engine.linkedStoryNumbers(epic).contains(current);
-            boolean mergedCurrentPr = currentPr != null && currentPr.get("mergedAt") != null;
-            if (!linked || (!"OPEN".equals(Engine.asString(currentIssue.get("state")).toUpperCase()) && !mergedCurrentPr)) {
-                state.put("phase", "BLOCKED_REQUIREMENTS");
-                state.put("error", "Current story #" + current + " is no longer an eligible linked open story");
-                save();
-                log.error("BLOCKED: " + state.get("error"));
-                return 1;
-            }
-            state.put("current_story_url", currentIssue.get("url"));
-            state.put("current_story_title",
-                    currentIssue.getOrDefault("title", state.getOrDefault("current_story_title", "")));
-            if (currentPr == null && StateRecovery.clearStaleStorySelectionState(state)) {
-                save();
-                log.info("RECOVERY: cleared stale story-selection blocker for story #" + current);
-            }
-            Set<Integer> completed = completedStories();
-            for (int dependency : Engine.storyDependencies(currentIssue)) {
-                if (completed.contains(dependency)) {
-                    continue;
-                }
-                Map<String, Object> dependencyIssue;
-                try {
-                    dependencyIssue = castMap(github.issue(dependency));
-                } catch (GitHubError exc) {
-                    return blockedExternal("Unable to inspect dependency #" + dependency + ": " + exc.getMessage());
-                }
-                if (!"CLOSED".equals(Engine.asString(dependencyIssue.get("state")).toUpperCase())) {
-                    state.put("phase", "BLOCKED_REQUIREMENTS");
-                    state.put("error", "Story #" + current + " dependency #" + dependency + " is not complete");
-                    save();
-                    log.error("BLOCKED: " + state.get("error"));
-                    return 1;
-                }
-            }
-        }
-
-        // PR-scoped data is cleared when there is no active PR, so stale review
-        // threads, CI, or cursors are not misattributed to the next story.
-        if (currentPr == null && state.get("current_pr") == null) {
-            state.put("current_pr_url", null);
-            state.put("current_pr_head", null);
-            state.put("pr_state", null);
-            state.put("pr_review_decision", null);
-            state.put("ci_status", new ArrayList<>());
-            state.put("unresolved_feedback", new ArrayList<>());
-            state.put("last_feedback_id", null);
-            state.put("last_processed_review_id", null);
-            state.put("last_review_trigger_commit", null);
-            state.put("last_review_trigger_verified_commit", null);
-            state.put("review_gate_head", null);
-        }
+        current = selection.current();
+        currentPr = selection.currentPr();
 
         List<Map<String, Object>> feedbackToResolve = new ArrayList<>();
         // PR-scoped reconciliation and wait/merge/blocked short-circuits.
@@ -1515,6 +1391,162 @@ final class WorkflowOrchestrator {
     }
 
     // -- helpers -------------------------------------------------------------
+
+    /** Result of story selection/adoption: non-null exitCode ends the run. */
+    private record SelectionResult(Integer exitCode, Integer current, Map<String, Object> currentPr) {
+        static SelectionResult exit(int code) {
+            return new SelectionResult(code, null, null);
+        }
+        static SelectionResult proceed(Integer current, Map<String, Object> currentPr) {
+            return new SelectionResult(null, current, currentPr);
+        }
+    }
+
+    /**
+     * Select the active story, adopt an unambiguous open PR, verify eligibility
+     * and dependencies, and clear PR-scoped state when idle (Requirement 2:
+     * SelectStory handler). Behavior-identical to the former inline block.
+     */
+    private SelectionResult selectAndAdoptStory(List<Map<String, Object>> prs,
+                                                Integer current, Map<String, Object> currentPr) {
+        // Story selection when none is active.
+        if (current == null) {
+            List<Object[]> candidates = new ArrayList<>();
+            for (int story : Engine.linkedStoryNumbers(epic)) {
+                List<Map<String, Object>> matches = Engine.prForStory(prs, story);
+                List<Map<String, Object>> open = new ArrayList<>();
+                for (Map<String, Object> p : matches) {
+                    if ("OPEN".equals(p.get("state"))) {
+                        open.add(p);
+                    }
+                }
+                if (open.size() > 1) {
+                    return SelectionResult.exit(conflict("Multiple open PRs for story #" + story));
+                }
+                if (!open.isEmpty()) {
+                    candidates.add(new Object[] {story, open.get(0)});
+                }
+            }
+            if (candidates.size() > 1) {
+                return SelectionResult.exit(conflict("Multiple open story PRs"));
+            }
+            if (!candidates.isEmpty()) {
+                current = (Integer) candidates.get(0)[0];
+                currentPr = castMap(candidates.get(0)[1]);
+                state.put("current_story", current);
+                state.put("current_pr", currentPr.get("number"));
+                state.put("current_pr_url", currentPr.get("url"));
+            } else {
+                List<Map<String, Object>> stories = new ArrayList<>();
+                try {
+                    for (int number : Engine.linkedStoryNumbers(epic)) {
+                        stories.add(castMap(github.issue(number)));
+                    }
+                } catch (GitHubError exc) {
+                    return SelectionResult.exit(
+                            blockedExternal("Unable to inspect linked stories: " + exc.getMessage()));
+                }
+                Map<String, Object> selected = Engine.selectStory(stories, completedStories());
+                if (selected == null) {
+                    state.put("phase", "EPIC_COMPLETE");
+                    state.put("message", "No eligible incomplete stories remain");
+                    save();
+                    log.info("EPIC COMPLETE");
+                    return SelectionResult.exit(0);
+                }
+                current = Engine.asInt(selected.get("number"));
+                state.put("current_story", current);
+                state.put("current_story_url", selected.get("url"));
+                state.put("current_story_title", selected.getOrDefault("title", ""));
+                state.put("phase", "IMPLEMENTING");
+                save();
+            }
+        }
+
+        // Adopt an unambiguous open PR for the active story if not recorded.
+        currentPr = findRecordedPr(prs, currentPr);
+        if (current != null && currentPr == null) {
+            List<Map<String, Object>> storyPrs = openPrsForStory(prs, current);
+            if (storyPrs.size() > 1) {
+                return SelectionResult.exit(conflict("Multiple open PRs for story #" + current));
+            }
+            if (!storyPrs.isEmpty()) {
+                currentPr = storyPrs.get(0);
+                state.put("current_pr", currentPr.get("number"));
+                state.put("current_pr_url", currentPr.get("url"));
+                state.put("branch", currentPr.get("headRefName"));
+                // Persist immediately: recovery and reconciliation require a
+                // durable branch to resume, and a crash before the next save
+                // must not lose it (this was a root cause of the recovery loop).
+                save();
+                log.info("PR ADOPTED: story #" + current + ", PR #" + currentPr.get("number"));
+            }
+        }
+
+        // Verify current story eligibility and dependencies.
+        if (current != null) {
+            Map<String, Object> currentIssue;
+            try {
+                currentIssue = castMap(github.issue(current));
+            } catch (GitHubError exc) {
+                return SelectionResult.exit(
+                        blockedExternal("Unable to verify current story #" + current + ": " + exc.getMessage()));
+            }
+            boolean linked = Engine.linkedStoryNumbers(epic).contains(current);
+            boolean mergedCurrentPr = currentPr != null && currentPr.get("mergedAt") != null;
+            if (!linked || (!"OPEN".equals(Engine.asString(currentIssue.get("state")).toUpperCase()) && !mergedCurrentPr)) {
+                state.put("phase", "BLOCKED_REQUIREMENTS");
+                state.put("error", "Current story #" + current + " is no longer an eligible linked open story");
+                save();
+                log.error("BLOCKED: " + state.get("error"));
+                return SelectionResult.exit(1);
+            }
+            state.put("current_story_url", currentIssue.get("url"));
+            state.put("current_story_title",
+                    currentIssue.getOrDefault("title", state.getOrDefault("current_story_title", "")));
+            if (currentPr == null && StateRecovery.clearStaleStorySelectionState(state)) {
+                save();
+                log.info("RECOVERY: cleared stale story-selection blocker for story #" + current);
+            }
+            Set<Integer> completed = completedStories();
+            for (int dependency : Engine.storyDependencies(currentIssue)) {
+                if (completed.contains(dependency)) {
+                    continue;
+                }
+                Map<String, Object> dependencyIssue;
+                try {
+                    dependencyIssue = castMap(github.issue(dependency));
+                } catch (GitHubError exc) {
+                    return SelectionResult.exit(
+                            blockedExternal("Unable to inspect dependency #" + dependency + ": " + exc.getMessage()));
+                }
+                if (!"CLOSED".equals(Engine.asString(dependencyIssue.get("state")).toUpperCase())) {
+                    state.put("phase", "BLOCKED_REQUIREMENTS");
+                    state.put("error", "Story #" + current + " dependency #" + dependency + " is not complete");
+                    save();
+                    log.error("BLOCKED: " + state.get("error"));
+                    return SelectionResult.exit(1);
+                }
+            }
+        }
+
+        // PR-scoped data is cleared when there is no active PR, so stale review
+        // threads, CI, or cursors are not misattributed to the next story.
+        if (currentPr == null && state.get("current_pr") == null) {
+            state.put("current_pr_url", null);
+            state.put("current_pr_head", null);
+            state.put("pr_state", null);
+            state.put("pr_review_decision", null);
+            state.put("ci_status", new ArrayList<>());
+            state.put("unresolved_feedback", new ArrayList<>());
+            state.put("last_feedback_id", null);
+            state.put("last_processed_review_id", null);
+            state.put("last_review_trigger_commit", null);
+            state.put("last_review_trigger_verified_commit", null);
+            state.put("review_gate_head", null);
+        }
+        return SelectionResult.proceed(current, currentPr);
+    }
 
     /**
      * Handle the terminal wait / merge-gate phases for the current PR. Returns
