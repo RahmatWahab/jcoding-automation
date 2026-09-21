@@ -404,26 +404,21 @@ final class WorkflowOrchestrator {
                 String findingKey = activeFinding == null
                         ? "unknown" : ReviewFindingQueue.key(activeFinding);
                 String lastGuardKey = Engine.asString(state.get("feedback_guard_key"));
-                // Migrate state written by the pre-queue controller. The old
-                // guard was keyed only by PR head; attach it to the current
-                // active finding so an in-flight retry keeps its budget.
-                if (lastGuardKey.isEmpty()
-                        && head.equals(Engine.asString(state.get("feedback_guard_head")))) {
-                    lastGuardKey = head + ":" + findingKey;
-                    state.put("feedback_guard_key", lastGuardKey);
-                }
-                int feedbackAttempts;
-                if ((head + ":" + findingKey).equals(lastGuardKey)) {
-                    feedbackAttempts = (int) Engine.asLongOrDefault(
-                            state.get("feedback_attempts"), 0) + 1;
-                } else {
-                    feedbackAttempts = 1;
-                    state.put("feedback_guard_key", head + ":" + findingKey);
-                }
-                state.put("feedback_attempts", feedbackAttempts);
                 int maxAttempts = (int) Engine.asLongOrDefault(
                         automation.get("max_feedback_attempts"), 3);
-                if (feedbackAttempts > maxAttempts) {
+                // Single source of truth for the per-finding feedback guard
+                // (Requirement 10): ProgressGuard owns the key migration and the
+                // increment/reset semantics; state writes below preserve the
+                // exact prior persisted shape.
+                ProgressGuard.FeedbackOutcome fb = ProgressGuard.observeFeedback(
+                        head, findingKey, lastGuardKey,
+                        Engine.asString(state.get("feedback_guard_head")),
+                        (int) Engine.asLongOrDefault(state.get("feedback_attempts"), 0),
+                        maxAttempts);
+                state.put("feedback_guard_key", fb.guardKey());
+                int feedbackAttempts = fb.attempts();
+                state.put("feedback_attempts", feedbackAttempts);
+                if (fb.capExceeded()) {
                     // Fully autonomous: do not dead-end at "manual review". After
                     // the feedback cap on an unchanging head, if the worker has
                     // produced deliverable changes, commit them, auto-resolve

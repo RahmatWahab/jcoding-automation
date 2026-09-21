@@ -141,4 +141,50 @@ public final class ProgressGuard {
         return new GuardOutcome(next, forceDelivery,
                 madeProgress || !sameStory, sameHeadAttempts, cumulativeAttempts, maxTotalResume);
     }
+
+    /**
+     * Result of the per-finding feedback guard: the (possibly migrated) guard
+     * key, the attempt count for it, and whether the cap is exceeded.
+     */
+    public record FeedbackOutcome(String guardKey, int attempts, boolean capExceeded) {
+    }
+
+    /**
+     * Compute the feedback attempt count for the active finding on a head,
+     * preserving the historical semantics exactly (Requirement 10):
+     * <ul>
+     *   <li>the guard is keyed by {@code head:findingKey};</li>
+     *   <li>a legacy guard written by the pre-queue controller (empty key but a
+     *       matching {@code feedback_guard_head}) is migrated to the current key
+     *       so an in-flight retry keeps its budget;</li>
+     *   <li>a matching key increments the count; any other key rebaselines to 1;</li>
+     *   <li>the cap is exceeded when the incremented count exceeds
+     *       {@code maxFeedbackAttempts}.</li>
+     * </ul>
+     *
+     * @param head             current PR head
+     * @param findingKey       active finding key ("unknown" when none)
+     * @param priorGuardKey    persisted {@code feedback_guard_key} (may be empty)
+     * @param priorGuardHead   persisted {@code feedback_guard_head} (for legacy migration)
+     * @param priorAttempts    persisted {@code feedback_attempts}
+     * @param maxFeedbackAttempts the cap
+     */
+    public static FeedbackOutcome observeFeedback(
+            String head, String findingKey, String priorGuardKey, String priorGuardHead,
+            int priorAttempts, int maxFeedbackAttempts) {
+        String guardKey = priorGuardKey == null ? "" : priorGuardKey;
+        // Legacy migration: old guard keyed by head only.
+        if (guardKey.isEmpty() && head.equals(priorGuardHead)) {
+            guardKey = head + ":" + findingKey;
+        }
+        String currentKey = head + ":" + findingKey;
+        int attempts;
+        if (currentKey.equals(guardKey)) {
+            attempts = priorAttempts + 1;
+        } else {
+            attempts = 1;
+            guardKey = currentKey;
+        }
+        return new FeedbackOutcome(guardKey, attempts, attempts > maxFeedbackAttempts);
+    }
 }

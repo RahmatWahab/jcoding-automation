@@ -96,6 +96,37 @@ class ProgressGuardTest {
     }
 
     @Test
+    void feedbackGuardIncrementsOnSameFindingAndResetsOnChange() {
+        // Same head:finding increments the feedback attempt count; a different
+        // finding (or head) rebaselines to 1.
+        ProgressGuard.FeedbackOutcome a =
+                ProgressGuard.observeFeedback("H1", "F1", "H1:F1", "", 2, 3);
+        assertThat(a.attempts()).isEqualTo(3);
+        assertThat(a.capExceeded()).isFalse();
+
+        ProgressGuard.FeedbackOutcome capped =
+                ProgressGuard.observeFeedback("H1", "F1", "H1:F1", "", 3, 3);
+        assertThat(capped.attempts()).isEqualTo(4);
+        assertThat(capped.capExceeded()).as("cap exceeded past maxFeedbackAttempts").isTrue();
+
+        ProgressGuard.FeedbackOutcome reset =
+                ProgressGuard.observeFeedback("H1", "F2", "H1:F1", "", 3, 3);
+        assertThat(reset.attempts()).as("different finding rebaselines").isEqualTo(1);
+        assertThat(reset.guardKey()).isEqualTo("H1:F2");
+    }
+
+    @Test
+    void feedbackGuardMigratesLegacyHeadOnlyKey() {
+        // Pre-queue state stored only feedback_guard_head. When the empty key's
+        // head matches, the guard adopts head:finding and the in-flight retry
+        // keeps its budget (increments rather than resetting to 1).
+        ProgressGuard.FeedbackOutcome migrated =
+                ProgressGuard.observeFeedback("H1", "F1", "", "H1", 2, 3);
+        assertThat(migrated.guardKey()).isEqualTo("H1:F1");
+        assertThat(migrated.attempts()).as("legacy budget preserved").isEqualTo(3);
+    }
+
+    @Test
     void storyChangeRebaselinesCumulativeGuard() {
         // Moving to a new story resets the cumulative guard so one story's churn
         // never penalizes the next.
