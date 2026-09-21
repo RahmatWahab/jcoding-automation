@@ -94,6 +94,16 @@ final class WorkflowOrchestrator {
             state.put("current_pr_head", currentPr.get("headRefOid"));
             state.put("pr_state", currentPr.get("state"));
             state.put("pr_review_decision", currentPr.get("reviewDecision"));
+            // Park-and-advance (Requirement 5): a parked story whose head has
+            // advanced (a new commit landed) is automatically un-parked and
+            // resumes the normal cycle. No-op under the default "hold" policy.
+            if (current != null && ParkPolicy.enabled(workflow)
+                    && ParkPolicy.unparkIfHeadAdvanced(state, current,
+                            Engine.asString(currentPr.get("headRefOid")))) {
+                log.info("UNPARKED: story #{} head advanced to {}; resuming normal cycle",
+                        current, shortSha(currentPr.get("headRefOid")));
+                save();
+            }
             // Persist the story branch from the PR head so a later worktree
             // recovery can match the active branch even when the PR was already
             // recorded in state (and thus not re-adopted this run).
@@ -491,6 +501,37 @@ final class WorkflowOrchestrator {
             //    re-enabled the reconcile/feedback loop.
             String stuckReason = Engine.asString(state.get("stuck_head_reason"));
             boolean unrecoverable = "UNRECOVERABLE".equals(stuckReason);
+            if (unrecoverable && ParkPolicy.enabled(workflow) && current != null) {
+                // Park-and-advance (Requirement 5): instead of holding this story
+                // forever, record it as parked on the current head, notify once,
+                // reset its story-scoped state, and go IDLE so the next tick
+                // selects a different eligible story. It auto-unparks when the
+                // head advances (handled at PR reconciliation).
+                String parkHead = Engine.asString(state.get("stuck_head"));
+                boolean newlyParked = ParkPolicy.park(state, current, parkHead,
+                        "UNRECOVERABLE", Controller.now());
+                if (newlyParked && !dryRun && Engine.asBool(workflow.get("allow_comments"), false)
+                        && currentPr != null) {
+                    try {
+                        github.comment(Engine.asInt(currentPr.get("number")),
+                                "⏸️ PARKED — story #" + current + " could not be advanced on head "
+                                + shortSha(parkHead) + " after repeated automated attempts. The "
+                                + "controller has parked it and will continue with the next eligible "
+                                + "story; it auto-resumes if this head advances. Operator action may "
+                                + "be needed.");
+                    } catch (GitHubError ignored) {
+                        // notification is best-effort; parking still proceeds
+                    }
+                }
+                log.info("PARKED: story #{} on head {} (reason UNRECOVERABLE); advancing to the "
+                        + "next eligible story", current, shortSha(parkHead));
+                WorkflowStateCodec.clearStoryScoped(state);
+                state.put("current_story", null);
+                state.put("current_pr", null);
+                state.put("phase", "IDLE");
+                save();
+                return 0;
+            }
             if (unrecoverable) {
                 // Leave the terminal marker in place. detectDeviation returns no
                 // deviation for this head, so the controller holds it blocked
@@ -1460,7 +1501,14 @@ final class WorkflowOrchestrator {
                     return SelectionResult.exit(
                             blockedExternal("Unable to inspect linked stories: " + exc.getMessage()));
                 }
-                Map<String, Object> selected = Engine.selectStory(stories, completedStories());
+                // Park-and-advance (Requirement 5, config-gated): exclude
+                // stories parked as terminally unrecoverable so the controller
+                // continues with the next eligible story. Under the default
+                // "hold" policy the parked set is empty and selection is
+                // unchanged.
+                List<Map<String, Object>> selectable = ParkPolicy.enabled(workflow)
+                        ? ParkPolicy.excludeParked(stories, state) : stories;
+                Map<String, Object> selected = Engine.selectStory(selectable, completedStories());
                 if (selected == null) {
                     state.put("phase", "EPIC_COMPLETE");
                     state.put("message", "No eligible incomplete stories remain");

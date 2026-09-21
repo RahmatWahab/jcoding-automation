@@ -50,6 +50,7 @@
     "allow_comments": false,
     "allow_thread_resolution": false,
     "auto_merge": false,
-    "merge_method": "squash"
+    "merge_method": "squash",
+    "terminal_policy": "hold"
   }
 }
