@@ -697,98 +697,13 @@ final class WorkflowOrchestrator {
 
         GitOperations git = gitFactory.create();
 
-        // A crash can occur after a story branch is created but before its
-        // name is persisted. Recover only an unambiguous branch generated for
-        // the selected story; arbitrary dirty branches must remain blocked.
-        if (git.recoverMissingStoryBranch(state)) {
-            save();
-            log.warn("STATE RECOVERY: restored missing story branch {} for story #{}",
-                    state.get("branch"), current);
-        }
-
-        // Full-loop fix: before validating the worktree, actively check out the
-        // active story branch. Previously the controller validated the worktree
-        // while the repo was still on the default branch, so a dirty default
-        // branch threw an unrecoverable IllegalStateException that pinned
-        // BLOCKED_REPOSITORY and looped forever without ever committing.
-        String activeBranch = Engine.asString(state.get("branch"));
-        if (!activeBranch.isEmpty()) {
-            try {
-                git.checkoutStoryBranch(activeBranch);
-            } catch (RuntimeException exc) {
-                // A failed checkout is a genuine repository problem; route it to
-                // bounded reconciliation rather than a permanent hard block.
-                state.put("phase", "BLOCKED_REQUIREMENTS");
-                state.put("error", "Unable to check out story branch " + activeBranch
-                        + ": " + exc.getMessage());
-                save();
-                log.error("RECONCILE: " + state.get("error"));
-                return 1;
-            }
-        }
-
-        // Classify the worktree without throwing so a dirty default branch or a
-        // stray-changes situation is routed to bounded reconciliation (which can
-        // resume, isolate, or block with a clear operator message) instead of an
-        // infinite BLOCKED_REPOSITORY loop.
-        GitOperations.WorktreeState worktreeState = git.classifyWorktree(state);
-        switch (worktreeState) {
-            case CLEAN, RECOVERABLE_STORY_BRANCH -> {
-                try {
-                    git.ensureRecoverableWorktree(state);
-                } catch (RuntimeException exc) {
-                    state.put("phase", "BLOCKED_REQUIREMENTS");
-                    state.put("error", "Unsafe working tree: " + exc.getMessage());
-                    save();
-                    log.error("RECONCILE: Unsafe working tree: " + exc.getMessage());
-                    return 1;
-                }
-            }
-            case DIRTY_DEFAULT_BRANCH -> {
-                state.put("phase", "BLOCKED_REQUIREMENTS");
-                state.put("error", "Working tree has uncommitted changes on the default branch; "
-                        + "reconcile before proceeding. Commit or relocate these changes onto a "
-                        + "story branch, or remove them, then rerun.");
-                save();
-                log.error("RECONCILE: uncommitted changes on the default branch require reconciliation");
-                return 1;
-            }
-            case DIRTY_UNKNOWN_BRANCH -> {
-                state.put("phase", "BLOCKED_REQUIREMENTS");
-                state.put("error", "Working tree has changes on a branch that is not the active "
-                        + "story branch; reconcile before proceeding.");
-                save();
-                log.error("RECONCILE: changes outside the active story branch require reconciliation");
-                return 1;
-            }
-            default -> { }
-        }
-
-        if (!dryRun && !Engine.asBool(workflow.get("allow_push"), false)) {
-            return blockedExternal("real Codex execution requires workflow.allow_push=true; "
-                    + "use dry_run=true for simulation");
-        }
-
-        // Create a fresh, synchronized story branch when none exists yet.
-        if (currentPr == null && Engine.asString(state.get("branch")).isEmpty()) {
-            try {
-                String baseBranch = Engine.asString(
-                        Config.section(config, "repository").getOrDefault("base_branch", "main"));
-                GitOperations.StoryBranch prepared = git.prepareStoryBranch(
-                        baseBranch, current, Engine.asString(state.get("current_story_title")));
-                state.put("branch", prepared.branch());
-                state.put("base_branch", baseBranch);
-                state.put("base_commit", prepared.baseHead());
-                state.put("worktree_baseline", prepared.baseHead());
-                save();
-                log.info("BRANCH READY: " + prepared.branch() + " from " + prepared.baseHead());
-            } catch (RuntimeException exc) {
-                state.put("phase", "BLOCKED_REPOSITORY");
-                state.put("error", "Unable to prepare synchronized story branch: " + exc.getMessage());
-                save();
-                log.error("BLOCKED: " + state.get("error"));
-                return 1;
-            }
+        // Reconcile the worktree (recover/checkout the story branch, classify the
+        // tree, enforce the allow_push gate, and cut a fresh branch when needed)
+        // before dispatching the worker. Returns a non-null exit code when the
+        // run must end here (blocked/reconcile), or null to proceed.
+        Integer prep = prepareWorktreeForPhase(git, current, currentPr);
+        if (prep != null) {
+            return prep;
         }
 
         Map<String, Object> context = new LinkedHashMap<>();
@@ -1789,6 +1704,105 @@ final class WorkflowOrchestrator {
                 Engine.asList(currentPr.get("statusCheckRollup")).size(),
                 shortSha(currentPr.get("headRefOid")));
         return 0;
+    }
+
+    /**
+     * Reconcile the worktree before a worker phase (Requirement 2): recover a
+     * missing story branch, check it out, classify the tree (routing a dirty
+     * default/unknown branch to bounded reconciliation), enforce the allow_push
+     * gate, and cut a fresh synchronized story branch when none exists. Returns
+     * a non-null exit code when the run must end here, or {@code null} to
+     * proceed. Behavior-identical to the former inline preamble.
+     */
+    private Integer prepareWorktreeForPhase(GitOperations git, Integer current,
+                                            Map<String, Object> currentPr) {
+        // A crash can occur after a story branch is created but before its name
+        // is persisted. Recover only an unambiguous branch generated for the
+        // selected story; arbitrary dirty branches must remain blocked.
+        if (git.recoverMissingStoryBranch(state)) {
+            save();
+            log.warn("STATE RECOVERY: restored missing story branch {} for story #{}",
+                    state.get("branch"), current);
+        }
+
+        // Before validating the worktree, actively check out the active story
+        // branch so validation never runs on the default branch.
+        String activeBranch = Engine.asString(state.get("branch"));
+        if (!activeBranch.isEmpty()) {
+            try {
+                git.checkoutStoryBranch(activeBranch);
+            } catch (RuntimeException exc) {
+                state.put("phase", "BLOCKED_REQUIREMENTS");
+                state.put("error", "Unable to check out story branch " + activeBranch
+                        + ": " + exc.getMessage());
+                save();
+                log.error("RECONCILE: " + state.get("error"));
+                return 1;
+            }
+        }
+
+        // Classify the worktree without throwing so a dirty default branch or a
+        // stray-changes situation is routed to bounded reconciliation.
+        GitOperations.WorktreeState worktreeState = git.classifyWorktree(state);
+        switch (worktreeState) {
+            case CLEAN, RECOVERABLE_STORY_BRANCH -> {
+                try {
+                    git.ensureRecoverableWorktree(state);
+                } catch (RuntimeException exc) {
+                    state.put("phase", "BLOCKED_REQUIREMENTS");
+                    state.put("error", "Unsafe working tree: " + exc.getMessage());
+                    save();
+                    log.error("RECONCILE: Unsafe working tree: " + exc.getMessage());
+                    return 1;
+                }
+            }
+            case DIRTY_DEFAULT_BRANCH -> {
+                state.put("phase", "BLOCKED_REQUIREMENTS");
+                state.put("error", "Working tree has uncommitted changes on the default branch; "
+                        + "reconcile before proceeding. Commit or relocate these changes onto a "
+                        + "story branch, or remove them, then rerun.");
+                save();
+                log.error("RECONCILE: uncommitted changes on the default branch require reconciliation");
+                return 1;
+            }
+            case DIRTY_UNKNOWN_BRANCH -> {
+                state.put("phase", "BLOCKED_REQUIREMENTS");
+                state.put("error", "Working tree has changes on a branch that is not the active "
+                        + "story branch; reconcile before proceeding.");
+                save();
+                log.error("RECONCILE: changes outside the active story branch require reconciliation");
+                return 1;
+            }
+            default -> { }
+        }
+
+        if (!dryRun && !Engine.asBool(workflow.get("allow_push"), false)) {
+            return blockedExternal("real Codex execution requires workflow.allow_push=true; "
+                    + "use dry_run=true for simulation");
+        }
+
+        // Create a fresh, synchronized story branch when none exists yet.
+        if (currentPr == null && Engine.asString(state.get("branch")).isEmpty()) {
+            try {
+                String baseBranch = Engine.asString(
+                        Config.section(config, "repository").getOrDefault("base_branch", "main"));
+                GitOperations.StoryBranch prepared = git.prepareStoryBranch(
+                        baseBranch, current, Engine.asString(state.get("current_story_title")));
+                state.put("branch", prepared.branch());
+                state.put("base_branch", baseBranch);
+                state.put("base_commit", prepared.baseHead());
+                state.put("worktree_baseline", prepared.baseHead());
+                save();
+                log.info("BRANCH READY: " + prepared.branch() + " from " + prepared.baseHead());
+            } catch (RuntimeException exc) {
+                state.put("phase", "BLOCKED_REPOSITORY");
+                state.put("error", "Unable to prepare synchronized story branch: " + exc.getMessage());
+                save();
+                log.error("BLOCKED: " + state.get("error"));
+                return 1;
+            }
+        }
+        return null;
     }
 
     private void advanceStory(int current) {
