@@ -469,7 +469,7 @@ final class WorkflowOrchestrator {
         }
         Engine.Deviation deviation = Engine.detectDeviation(state, currentPr, maxPhaseAttempts);
         if (deviation != null && deviation.recoverable()) {
-            log.info("DEVIATION DETECTED: code={} — {}", deviation.code(), deviation.detail());
+            log.info("DEVIATION DETECTED: reason={} detail={}", deviation.code(), deviation.detail());
             state.put("deviation_code", deviation.code());
             state.put("deviation_detail", deviation.detail());
 
@@ -1642,7 +1642,8 @@ final class WorkflowOrchestrator {
         }
 
         save();
-        log.info("RECONCILIATION ACCEPTED: " + state.get("decision_action") + " — " + outcome.detail());
+        log.info("RECONCILIATION ACCEPTED: reason={} action={} detail={}",
+                state.get("blocker_class"), state.get("decision_action"), outcome.detail());
 
         // When reconciliation EXPLICITLY decides PROCESS_FEEDBACK, clear the stale
         // last_feedback_result=BLOCKED so the FIXING_FEEDBACK worker actually runs
