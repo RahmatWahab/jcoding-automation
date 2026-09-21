@@ -83,13 +83,53 @@ final class WorkflowOrchestrator {
         currentPr = selection.currentPr();
 
         List<Map<String, Object>> feedbackToResolve = new ArrayList<>();
-        // PR-scoped reconciliation and wait/merge/blocked short-circuits.
+        // PR-scoped reconciliation and wait/merge/blocked short-circuits
+        // (Requirement 2: Feedback/PR handler). A non-null exitCode ends the run;
+        // otherwise the (possibly updated) currentPr flows onward and
+        // feedbackToResolve is populated in place.
+        PrScopedResult prScoped = reconcilePrScoped(current, currentPr, feedbackToResolve);
+        if (prScoped.exitCode() != null) {
+            return prScoped.exitCode();
+        }
+        currentPr = prScoped.currentPr();
+
+        // Generic deviation supervisor (Requirement 2): detect any deviation/
+        // stall and either recover deterministically (returning an exit code) or
+        // route to the reasoning reconcile prompt.
+        DeviationResult deviationResult = runDeviationSupervisor(current, currentPr, forcedPrompt);
+        if (deviationResult.exitCode() != null) {
+            return deviationResult.exitCode();
+        }
+        forcedPrompt = deviationResult.forcedPrompt();
+        return runWorkerPhase(current, currentPr, feedbackToResolve, forcedPrompt);
+    }
+
+    /** Result of PR-scoped reconciliation: non-null exitCode ends the run. */
+    private record PrScopedResult(Integer exitCode, Map<String, Object> currentPr) {
+        static PrScopedResult exit(int code) {
+            return new PrScopedResult(code, null);
+        }
+        static PrScopedResult proceed(Map<String, Object> currentPr) {
+            return new PrScopedResult(null, currentPr);
+        }
+    }
+
+    /**
+     * PR-scoped reconciliation (Requirement 2): fetch PR detail, detect
+     * actionable feedback and manage the per-finding queue + feedback anti-loop
+     * guard, handle stuck-head/terminal routing, post the Codex review trigger,
+     * and short-circuit wait/merge/blocked phases. Behavior-identical to the
+     * former inline block. Populates {@code feedbackToResolve} in place; returns
+     * a carrier whose non-null exitCode ends the run.
+     */
+    private PrScopedResult reconcilePrScoped(Integer current, Map<String, Object> currentPr,
+                                             List<Map<String, Object>> feedbackToResolve) {
         if (currentPr != null) {
             try {
                 log.info("PHASE: GitHub PR detail #" + currentPr.get("number"));
                 currentPr = github.pr(Engine.asInt(currentPr.get("number")));
             } catch (GitHubError exc) {
-                return blockedExternal("Unable to inspect PR: " + exc.getMessage());
+                return PrScopedResult.exit(blockedExternal("Unable to inspect PR: " + exc.getMessage()));
             }
             state.put("current_pr_head", currentPr.get("headRefOid"));
             state.put("pr_state", currentPr.get("state"));
@@ -134,7 +174,7 @@ final class WorkflowOrchestrator {
                                     "RESOLVED_AFTER_DELIVERED_REPLY");
                             log.info("PR THREAD RESOLVED: " + thread.get("id") + " (recovered)");
                         } catch (GitHubError exc) {
-                            return blockedExternal("Unable to resolve delivered review feedback: " + exc.getMessage());
+                            return PrScopedResult.exit(blockedExternal("Unable to resolve delivered review feedback: " + exc.getMessage()));
                         }
                     }
                 }
@@ -228,7 +268,7 @@ final class WorkflowOrchestrator {
                                     currentPr.get("number"),
                                     activeFinding == null ? "all-findings"
                                             : ReviewFindingQueue.key(activeFinding), shortSha(head));
-                            return 1;
+                            return PrScopedResult.exit(1);
                         }
                     }
                     if (deliveringMode) {
@@ -255,7 +295,7 @@ final class WorkflowOrchestrator {
                             log.info("BLOCKED (terminal): PR #{} head {} feedback remains unresolved "
                                     + "and delivery is disabled; awaiting a new head or operator action",
                                     currentPr.get("number"), shortSha(head));
-                            return 1;
+                            return PrScopedResult.exit(1);
                         }
                     }
                 }
@@ -345,7 +385,7 @@ final class WorkflowOrchestrator {
                             save();
                             log.info("FEEDBACK AUTO-DELIVER COMPLETE: PR #{} phase={}",
                                     currentPr.get("number"), state.get("phase"));
-                            return deliveryResult == Integer.MIN_VALUE ? 0 : deliveryResult;
+                            return PrScopedResult.exit(deliveryResult == Integer.MIN_VALUE ? 0 : deliveryResult);
                         }
                         // Nothing to deliver: the worker cannot fix the findings.
                         // Route to the reasoning supervisor via the existing
@@ -386,7 +426,7 @@ final class WorkflowOrchestrator {
                                 + "allow_push=false)");
                         save();
                         log.error("BLOCKED: " + state.get("error"));
-                        return 1;
+                        return PrScopedResult.exit(1);
                     }
                 }
                 }
@@ -395,7 +435,10 @@ final class WorkflowOrchestrator {
                 state.remove("feedback_guard_key");
                 state.remove("feedback_attempts");
             }
-            feedbackToResolve = new ArrayList<>(activeFeedback);
+            // Mutate the caller's list in place (do not reassign the parameter)
+            // so the populated feedback reaches runWorkerPhase's delivery.
+            feedbackToResolve.clear();
+            feedbackToResolve.addAll(activeFeedback);
             String[] reconciled = Engine.reconcile(state, currentPr, !feedback.isEmpty());
             String detectedPhase = reconciled[0];
             // Do not demote a manual-merge wait back to READY_TO_MERGE for a
@@ -422,7 +465,7 @@ final class WorkflowOrchestrator {
                     log.info("PR COMMENT POSTED: @codex review on PR #" + currentPr.get("number"));
                 }
             } catch (GitHubError exc) {
-                return blockedExternal("Unable to post Codex review trigger: " + exc.getMessage());
+                return PrScopedResult.exit(blockedExternal("Unable to post Codex review trigger: " + exc.getMessage()));
             }
 
             if (ReviewCoordinator.reviewGateOpen(currentPr)) {
@@ -432,7 +475,7 @@ final class WorkflowOrchestrator {
                 save();
                 logStableState("WAIT_CODEX|" + current + "|" + shortSha(currentPr.get("headRefOid")),
                         "WAITING: story #{}, phase=WAITING_FOR_CODEX_REVIEW", current);
-                return 0;
+                return PrScopedResult.exit(0);
             }
             // The gate has closed for this head; record the connector review.
             if (Engine.asString(state.get("review_gate_head"))
@@ -447,14 +490,14 @@ final class WorkflowOrchestrator {
                     "READY_TO_MERGE", "WAITING_FOR_MANUAL_MERGE").contains(phase)) {
                 Integer gate = handleWaitAndMergeGate(current, currentPr, phase);
                 if (gate != null) {
-                    return gate;
+                    return PrScopedResult.exit(gate);
                 }
             }
             if (phase.equals("MERGED")) {
                 advanceStory(current);
                 save();
                 log.info("MERGED: story #" + current + "; next run may select another story");
-                return 0;
+                return PrScopedResult.exit(0);
             }
             if (Set.of("BLOCKED_EXTERNAL", "CONFLICT_DETECTED").contains(phase)) {
                 // Do not dead-end: let the generic deviation supervisor below
@@ -467,7 +510,7 @@ final class WorkflowOrchestrator {
                     save();
                     logStableState("STOPPED|" + current + "|" + state.get("phase"),
                             "STOPPED: story #{}, phase={}", current, state.get("phase"));
-                    return 1;
+                    return PrScopedResult.exit(1);
                 }
                 log.info("STOP DEFERRED: story #{} phase={} — escalating to supervisor",
                         current, phase);
@@ -475,26 +518,9 @@ final class WorkflowOrchestrator {
             }
         }
 
-        // ── Generic deviation supervisor (intelligence on exception) ──────────
-        // The controller deterministically detects any deviation, stall, or
-        // inability to complete, then routes to the reasoning layer instead of
-        // re-running the same phase or dead-ending. Codex (reconcile) diagnoses
-        // and proposes a bounded recovery; the controller validates and applies
-        // it. This is the single, general mechanism that replaces per-case
-        // patches — "if the controller sees anything incorrect, think and fix".
-        // Generic deviation supervisor (Requirement 2): detect any deviation/
-        // stall and either recover deterministically (returning an exit code) or
-        // route to the reasoning reconcile prompt.
-        DeviationResult deviationResult = runDeviationSupervisor(current, currentPr, forcedPrompt);
-        if (deviationResult.exitCode() != null) {
-            return deviationResult.exitCode();
-        }
-        forcedPrompt = deviationResult.forcedPrompt();
-
-        // Phase dispatch: render the prompt and run the bounded worker, then
-        // apply the result / reconcile decision / delivery (Requirement 2:
-        // worker-phase handler). reconcileAndExecute is now a thin dispatcher.
-        return runWorkerPhase(current, currentPr, feedbackToResolve, forcedPrompt);
+        // No PR yet (or the PR-scoped block fell through): continue with the
+        // (possibly updated) current PR.
+        return PrScopedResult.proceed(currentPr);
     }
 
     /** Result of the deviation supervisor: non-null exitCode ends the run. */
