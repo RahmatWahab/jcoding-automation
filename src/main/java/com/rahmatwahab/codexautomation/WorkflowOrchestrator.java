@@ -80,8 +80,11 @@ final class WorkflowOrchestrator {
     }
 
     int reconcileAndExecute(List<Map<String, Object>> prs, String forcedPrompt) {
-        Object currentObj = state.get("current_story");
-        Integer current = currentObj == null ? null : Engine.asInt(currentObj);
+        // R3: read control-relevant state through the typed model rather than
+        // ad-hoc string keys. The codec is the single typed view over the durable
+        // map (backward compatible; unknown keys preserved on write).
+        WorkflowStateCodec.WorkflowState typed = WorkflowStateCodec.load(state);
+        Integer current = typed.currentStory();
         Map<String, Object> currentPr = null;
 
         // Story selection, PR adoption, and eligibility/dependency verification
