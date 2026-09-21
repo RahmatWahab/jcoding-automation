@@ -134,7 +134,10 @@ implement → PR → review → feedback loop, set in `config/config.json`:
 
 ```json
 {
-  "automation": { "dry_run": false },
+  "automation": {
+    "dry_run": false,
+    "max_feedback_batch_size": 3
+  },
   "workflow": {
     "allow_push": true,
     "allow_pr_creation": true,
@@ -153,6 +156,7 @@ What each flag unlocks (all default to `false`):
 | `allow_pr_creation` | opening a pull request for a ready story |
 | `allow_comments` | posting the `@codex review` trigger and fix replies |
 | `allow_thread_resolution` | resolving review threads after a verified fix |
+| `automation.max_feedback_batch_size` | maximum number of compatible unresolved findings revalidated and fixed in one worker execution (default `3`) |
 | `auto_merge` | merge policy (single flag). `false` (default): the controller never merges — it posts `READY TO MERGE` and waits for a maintainer. `true`: fully autonomous — the controller merges a ready PR itself (clean Codex review + green CI + no unresolved threads) and advances to the next story. It never force-merges: a conflicting PR is routed to reconciliation to rebase/resolve, pending mergeability waits and retries, and branch-protection blocks are surfaced (never bypassed). Optional `merge_method` selects `squash` (default), `merge`, or `rebase` — the method must be enabled in the repo's merge settings. |
 
 and in `config/job-control.json`:

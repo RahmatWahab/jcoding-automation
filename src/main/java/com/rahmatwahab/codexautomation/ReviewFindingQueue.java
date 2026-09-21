@@ -20,6 +20,8 @@ final class ReviewFindingQueue {
 
     static final String STATE_KEY = "review_findings";
     static final String ACTIVE_KEY = "active_review_finding";
+    static final String ACTIVE_BATCH_KEY = "active_review_findings";
+    static final int DEFAULT_BATCH_SIZE = 3;
 
     private ReviewFindingQueue() {
     }
@@ -28,6 +30,13 @@ final class ReviewFindingQueue {
     @SuppressWarnings("unchecked")
     static List<Map<String, Object>> synchronize(Map<String, Object> state,
                                                   List<Map<String, Object>> feedback) {
+        return synchronize(state, feedback, 1);
+    }
+
+    /** Synchronize feedback and select a bounded batch of pending findings. */
+    static List<Map<String, Object>> synchronize(Map<String, Object> state,
+                                                  List<Map<String, Object>> feedback,
+                                                  int batchSize) {
         Map<String, Map<String, Object>> existing = new LinkedHashMap<>();
         Object stored = state.get(STATE_KEY);
         if (stored instanceof List<?> list) {
@@ -53,7 +62,8 @@ final class ReviewFindingQueue {
             Map<String, Object> finding = existing.computeIfAbsent(itemKey,
                     ignored -> newFinding(item));
             copyAuthoritativeFields(finding, item);
-            if ("VERIFIED".equals(finding.get("status"))) {
+            if ("VERIFIED".equals(finding.get("status"))
+                    && !value(finding.get("verified_commit")).equals(value(item.get("commit")))) {
                 finding.put("status", "PENDING");
             }
         }
@@ -71,11 +81,13 @@ final class ReviewFindingQueue {
 
         List<Map<String, Object>> ordered = new ArrayList<>(existing.values());
         state.put(STATE_KEY, ordered);
-        Map<String, Object> active = next(ordered);
-        if (active == null) {
+        List<Map<String, Object>> activeBatch = nextBatch(ordered, batchSize);
+        if (activeBatch.isEmpty()) {
             state.remove(ACTIVE_KEY);
+            state.remove(ACTIVE_BATCH_KEY);
         } else {
-            state.put(ACTIVE_KEY, new LinkedHashMap<>(active));
+            state.put(ACTIVE_KEY, new LinkedHashMap<>(activeBatch.get(0)));
+            state.put(ACTIVE_BATCH_KEY, copies(activeBatch));
         }
         return ordered;
     }
@@ -88,6 +100,38 @@ final class ReviewFindingQueue {
             }
         }
         return null;
+    }
+
+    static List<Map<String, Object>> nextBatch(List<Map<String, Object>> findings, int batchSize) {
+        int limit = Math.max(1, batchSize);
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Map<String, Object> finding : findings) {
+            String status = String.valueOf(finding.getOrDefault("status", "PENDING"));
+            if ("PENDING".equals(status) || "IN_PROGRESS".equals(status)) {
+                result.add(finding);
+                if (result.size() == limit) {
+                    break;
+                }
+            }
+        }
+        return result;
+    }
+
+    static List<Map<String, Object>> activeBatch(Map<String, Object> state) {
+        Object value = state.get(ACTIVE_BATCH_KEY);
+        if (!(value instanceof List<?> list)) {
+            Map<String, Object> active = active(state);
+            return active == null ? List.of() : List.of(active);
+        }
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Object item : list) {
+            if (item instanceof Map<?, ?> raw) {
+                Map<String, Object> finding = new LinkedHashMap<>();
+                raw.forEach((key, valueItem) -> finding.put(String.valueOf(key), valueItem));
+                result.add(finding);
+            }
+        }
+        return result;
     }
 
     @SuppressWarnings("unchecked")
@@ -120,8 +164,7 @@ final class ReviewFindingQueue {
 
     /** Mark the active finding as dispatched only when a worker is actually launched. */
     static void markActiveDispatched(Map<String, Object> state) {
-        Map<String, Object> finding = active(state);
-        if (finding != null) {
+        for (Map<String, Object> finding : activeBatch(state)) {
             markDispatched(state, finding);
         }
     }
@@ -158,13 +201,13 @@ final class ReviewFindingQueue {
 
     static void recordWorkerResult(Map<String, Object> state, int exitCode,
                                    String resultStatus, String detail) {
-        Object activeObject = state.get(ACTIVE_KEY);
-        if (!(activeObject instanceof Map<?, ?> raw)) {
+        Set<String> activeKeys = new LinkedHashSet<>();
+        for (Map<String, Object> finding : activeBatch(state)) {
+            activeKeys.add(key(finding));
+        }
+        if (activeKeys.isEmpty()) {
             return;
         }
-        @SuppressWarnings("unchecked") Map<String, Object> active =
-                (Map<String, Object>) raw;
-        String activeKey = key(active);
         Object stored = state.get(STATE_KEY);
         if (!(stored instanceof List<?> list)) {
             return;
@@ -173,7 +216,7 @@ final class ReviewFindingQueue {
             if (item instanceof Map<?, ?> rawItem) {
                 @SuppressWarnings("unchecked") Map<String, Object> finding =
                         (Map<String, Object>) rawItem;
-                if (activeKey.equals(key(finding))) {
+                if (activeKeys.contains(key(finding))) {
                     finding.put("last_exit_code", exitCode);
                     finding.put("last_result_status", resultStatus);
                     finding.put("last_detail", detail == null ? "" : detail);
@@ -183,10 +226,46 @@ final class ReviewFindingQueue {
                         finding.put("status", "PENDING");
                     }
                     finding.put("last_finished_at", now());
-                    state.put(ACTIVE_KEY, new LinkedHashMap<>(finding));
-                    return;
                 }
             }
+        }
+        refreshActiveBatch(state);
+    }
+
+    /** Mark only worker-declared findings as complete after delivery verification. */
+    static void markVerified(Map<String, Object> state, Set<String> threadIds,
+                             String commit, String status) {
+        if (threadIds == null || threadIds.isEmpty()) {
+            return;
+        }
+        Object stored = state.get(STATE_KEY);
+        if (!(stored instanceof List<?> list)) {
+            return;
+        }
+        for (Object item : list) {
+            if (item instanceof Map<?, ?> raw) {
+                @SuppressWarnings("unchecked") Map<String, Object> finding =
+                        (Map<String, Object>) raw;
+                if (threadIds.contains(value(finding.get("thread_id")))) {
+                    finding.put("status", status);
+                    finding.put("verified_commit", commit == null ? "" : commit);
+                    finding.put("verified_at", now());
+                }
+            }
+        }
+        refreshActiveBatch(state);
+    }
+
+    static void refreshActiveBatch(Map<String, Object> state) {
+        List<Map<String, Object>> findings = findings(state);
+        int batchSize = ((Number) state.getOrDefault("feedback_batch_size", DEFAULT_BATCH_SIZE)).intValue();
+        List<Map<String, Object>> batch = nextBatch(findings, batchSize);
+        if (batch.isEmpty()) {
+            state.remove(ACTIVE_KEY);
+            state.remove(ACTIVE_BATCH_KEY);
+        } else {
+            state.put(ACTIVE_KEY, new LinkedHashMap<>(batch.get(0)));
+            state.put(ACTIVE_BATCH_KEY, copies(batch));
         }
     }
 
@@ -234,6 +313,14 @@ final class ReviewFindingQueue {
 
     private static String value(Object value) {
         return value == null ? "" : String.valueOf(value).strip();
+    }
+
+    private static List<Map<String, Object>> copies(List<Map<String, Object>> source) {
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Map<String, Object> item : source) {
+            result.add(new LinkedHashMap<>(item));
+        }
+        return result;
     }
 
     private static String now() {

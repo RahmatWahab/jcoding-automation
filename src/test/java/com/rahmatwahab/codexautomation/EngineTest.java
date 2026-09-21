@@ -42,6 +42,17 @@ class EngineTest {
     }
 
     @Test
+    void prerequisiteReferenceDoesNotClaimPrForAnotherStory() {
+        List<Map<String, Object>> prs = list(map(
+                "number", 189,
+                "title", "feat: implement story #188",
+                "body", "Closes #188\n\nPrerequisite: #52 (closed)"));
+
+        assertThat(Engine.prForStory(prs, 188)).hasSize(1);
+        assertThat(Engine.prForStory(prs, 52)).isEmpty();
+    }
+
+    @Test
     void classifyPrWaitsForCi() {
         Map<String, Object> pr = map("state", "OPEN",
                 "statusCheckRollup", List.of(map("status", "IN_PROGRESS")));

@@ -258,14 +258,17 @@ final class WorkflowOrchestrator {
                     currentPr, Engine.asString(state.get("last_feedback_id")).isEmpty()
                             ? null : Engine.asString(state.get("last_feedback_id")));
             boolean legacyPrLevelFindingState = !state.containsKey(ReviewFindingQueue.STATE_KEY);
-            // Persist each unresolved finding independently. The worker is
-            // instructed to complete only the active finding, so a large PR
-            // review cannot consume one shared retry budget or time out while
-            // attempting unrelated fixes.
-            ReviewFindingQueue.synchronize(state, feedback);
+            // Persist each unresolved finding independently, then select a
+            // bounded compatible work batch. A large PR review cannot consume
+            // one shared retry budget or time out while attempting the entire
+            // backlog in one execution.
+            int feedbackBatchSize = (int) Engine.asLongOrDefault(
+                    automation.get("max_feedback_batch_size"),
+                    ReviewFindingQueue.DEFAULT_BATCH_SIZE);
+            state.put("feedback_batch_size", Math.max(1, feedbackBatchSize));
+            ReviewFindingQueue.synchronize(state, feedback, feedbackBatchSize);
             Map<String, Object> activeFinding = ReviewFindingQueue.active(state);
-            List<Map<String, Object>> activeFeedback = activeFinding == null
-                    ? List.of() : List.of(new LinkedHashMap<>(activeFinding));
+            List<Map<String, Object>> activeFeedback = ReviewFindingQueue.activeBatch(state);
             List<Map<String, Object>> events = Engine.reviewEvents(
                     currentPr, Engine.asString(state.get("last_processed_review_id")).isEmpty()
                             ? null : Engine.asString(state.get("last_processed_review_id")));
@@ -389,6 +392,12 @@ final class WorkflowOrchestrator {
                             currentPr.get("number"), shortSha(head));
                 }
 
+                // Do not consume a worker retry while the current head is still
+                // waiting for connector review. Cron observes this state once
+                // per minute; counting observations as executions previously
+                // produced misleading FEEDBACK ESCALATION messages and could
+                // exhaust the guard before the worker was dispatched.
+                if (!ReviewCoordinator.reviewGateOpen(currentPr)) {
                 // Bounded loop guard: if the same finding on the same PR head
                 // is retried repeatedly without progress, isolate that finding
                 // instead of consuming the retry budget for the whole PR.
@@ -498,6 +507,7 @@ final class WorkflowOrchestrator {
                         log.error("BLOCKED: " + state.get("error"));
                         return 1;
                     }
+                }
                 }
             } else {
                 // No actionable feedback on this head: reset the guard.
@@ -1373,6 +1383,8 @@ final class WorkflowOrchestrator {
         String deliveredCommit = null;
         boolean newCommitDelivered = false;
         Set<String> declaredFixedIds = ReviewCoordinator.fixedThreadIds(output);
+        Set<String> declaredSupersededIds = ReviewCoordinator.supersededThreadIds(output);
+        declaredFixedIds.addAll(declaredSupersededIds);
 
         // On autonomous auto-delivery there is no per-thread FIXED_THREAD
         // declaration (the worker returned a reconcile decision). Treat all
@@ -1510,6 +1522,32 @@ final class WorkflowOrchestrator {
                 state.put("phase", "BLOCKED_EXTERNAL");
                 state.put("error", "Unable to resolve delivered review feedback: " + exc.getMessage());
             }
+        }
+
+        // Advance the durable batch only after the delivered head was verified.
+        // A successful worker result without a verified delivery must remain
+        // retryable; otherwise an interrupted push could make unresolved
+        // findings disappear from the queue.
+        if (deliveryVerified && deliveredCommit != null && !mapping.canonical().isEmpty()) {
+            Set<String> batchThreadIds = new LinkedHashSet<>();
+            for (Map<String, Object> item : feedbackToResolve) {
+                String threadId = Engine.asString(item.get("thread_id"));
+                if (!threadId.isEmpty()) {
+                    batchThreadIds.add(threadId);
+                }
+            }
+            Set<String> fixedThreads = new LinkedHashSet<>(mapping.canonical());
+            fixedThreads.retainAll(batchThreadIds);
+            Set<String> supersededThreads = new LinkedHashSet<>();
+            ReviewCoordinator.ThreadIdMapping supersededMapping =
+                    ReviewCoordinator.canonicalFixedThreadIds(
+                            currentPr != null ? currentPr : new LinkedHashMap<>(),
+                            declaredSupersededIds);
+            supersededThreads.addAll(supersededMapping.canonical());
+            supersededThreads.retainAll(batchThreadIds);
+            ReviewFindingQueue.markVerified(state, fixedThreads, deliveredCommit, "VERIFIED");
+            ReviewFindingQueue.markVerified(state, supersededThreads, deliveredCommit, "SUPERSEDED");
+            save();
         }
 
         // Create a PR for a story that has delivered work but no PR yet. This

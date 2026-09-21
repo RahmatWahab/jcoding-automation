@@ -26,6 +26,65 @@ class ReviewFindingQueueTest {
     }
 
     @Test
+    void selectsAndDispatchesAStableBoundedBatch() {
+        Map<String, Object> state = new LinkedHashMap<>();
+        List<Map<String, Object>> feedback = List.of(
+                finding("PRRT_1", "first"), finding("PRRT_2", "second"),
+                finding("PRRT_3", "third"), finding("PRRT_4", "fourth"));
+
+        ReviewFindingQueue.synchronize(state, feedback, 3);
+        ReviewFindingQueue.markActiveDispatched(state);
+
+        assertThat(ReviewFindingQueue.activeBatch(state))
+                .extracting(item -> item.get("thread_id"))
+                .containsExactly("PRRT_1", "PRRT_2", "PRRT_3");
+        assertThat(ReviewFindingQueue.findings(state)).allSatisfy(item -> {
+            if (List.of("PRRT_1", "PRRT_2", "PRRT_3").contains(item.get("thread_id"))) {
+                assertThat(item.get("status")).isEqualTo("IN_PROGRESS");
+                assertThat(item.get("attempts")).isEqualTo(1);
+            }
+        });
+    }
+
+    @Test
+    void advancesOnlyDeclaredBatchItemsAndLeavesTheRestPending() {
+        Map<String, Object> state = new LinkedHashMap<>();
+        ReviewFindingQueue.synchronize(state, List.of(
+                finding("PRRT_1", "first"), finding("PRRT_2", "second"),
+                finding("PRRT_3", "third")), 2);
+        ReviewFindingQueue.markActiveDispatched(state);
+
+        ReviewFindingQueue.markVerified(state, java.util.Set.of("PRRT_1"), "commit-1", "VERIFIED");
+
+        assertThat(ReviewFindingQueue.activeBatch(state))
+                .extracting(item -> item.get("thread_id"))
+                .containsExactly("PRRT_2", "PRRT_3");
+        assertThat(ReviewFindingQueue.findings(state)).anySatisfy(item -> {
+            assertThat(item.get("thread_id")).isEqualTo("PRRT_1");
+            assertThat(item.get("status")).isEqualTo("VERIFIED");
+            assertThat(item.get("verified_commit")).isEqualTo("commit-1");
+        });
+    }
+
+    @Test
+    void reopensVerifiedFindingOnlyWhenAuthoritativeCommitChanges() {
+        Map<String, Object> state = new LinkedHashMap<>();
+        Map<String, Object> initial = finding("PRRT_1", "finding");
+        initial.put("commit", "head-1");
+        ReviewFindingQueue.synchronize(state, List.of(initial), 1);
+        ReviewFindingQueue.markActiveDispatched(state);
+        ReviewFindingQueue.markVerified(state, java.util.Set.of("PRRT_1"), "head-1", "VERIFIED");
+
+        ReviewFindingQueue.synchronize(state, List.of(initial), 1);
+        assertThat(ReviewFindingQueue.active(state)).isNull();
+
+        Map<String, Object> changedHead = finding("PRRT_1", "finding");
+        changedHead.put("commit", "head-2");
+        ReviewFindingQueue.synchronize(state, List.of(changedHead), 1);
+        assertThat(ReviewFindingQueue.active(state).get("status")).isEqualTo("PENDING");
+    }
+
+    @Test
     void timeoutIsCheckpointedWithoutMakingFindingUnrecoverable() {
         Map<String, Object> state = new LinkedHashMap<>();
         ReviewFindingQueue.synchronize(state, List.of(finding("PRRT_1", "finding")));

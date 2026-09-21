@@ -7,6 +7,16 @@ cd "$ROOT"
 mkdir -p "$ROOT/logs"
 LOG_FILE="$ROOT/logs/run-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
 
+# Do not rebuild the distribution when the execution gate is disabled. Apart
+# from wasting resources, rebuilding here can race a developer's test task
+# because the controller's job_start check otherwise occurs only after the
+# distribution has been built.
+if [[ -f "$ROOT/config/job-control.json" ]] \
+    && ! jq -e '.job_start == true' "$ROOT/config/job-control.json" >/dev/null 2>&1; then
+  echo "SKIPPED: job_start is not true"
+  exit 0
+fi
+
 # Extract the local --verbose flag (maps to DEBUG logging) and pass the rest
 # of the arguments through to the application unchanged.
 LOG_LEVEL="INFO"

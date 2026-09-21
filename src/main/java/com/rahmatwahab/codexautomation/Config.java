@@ -109,7 +109,8 @@ public final class Config {
         }
 
         for (String key : List.of("stale_lock_seconds", "watchdog_observations", "watchdog_grace_seconds",
-                "max_feedback_attempts", "max_resume_attempts", "resume_loop_multiplier")) {
+                "max_feedback_attempts", "max_feedback_batch_size", "max_resume_attempts",
+                "resume_loop_multiplier")) {
             if (automation.containsKey(key) && !isPositiveInt(automation.get(key))) {
                 missing.add("automation." + key + "(positive integer)");
             }

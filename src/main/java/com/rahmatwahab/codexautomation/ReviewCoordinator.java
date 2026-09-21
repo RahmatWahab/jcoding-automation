@@ -28,6 +28,8 @@ public final class ReviewCoordinator {
 
     private static final Pattern FIXED_THREAD = Pattern.compile(
             "^FIXED_THREAD:\\s*((?:PRRT|PRRC)_[A-Za-z0-9_-]+)\\s*$", Pattern.MULTILINE);
+    private static final Pattern SUPERSEDED_THREAD = Pattern.compile(
+            "^SUPERSEDED_THREAD:\\s*((?:PRRT|PRRC)_[A-Za-z0-9_-]+)\\s*$", Pattern.MULTILINE);
     private static final Pattern PASS_LINE = Pattern.compile("\\b(pass|passed|success)\\b", Pattern.CASE_INSENSITIVE);
     private static final Pattern FIX_REPLY_HEAD = Pattern.compile(
             "codex-automation-fix:thread=[^:]+:head=([0-9a-f]{7,64})");
@@ -44,8 +46,17 @@ public final class ReviewCoordinator {
 
     /** Only review threads the worker explicitly says it fixed (PRRT_/PRRC_). */
     public static Set<String> fixedThreadIds(String output) {
+        return declaredThreadIds(output, FIXED_THREAD);
+    }
+
+    /** Thread ids whose findings the worker proved obsolete on the current head. */
+    public static Set<String> supersededThreadIds(String output) {
+        return declaredThreadIds(output, SUPERSEDED_THREAD);
+    }
+
+    private static Set<String> declaredThreadIds(String output, Pattern pattern) {
         Set<String> ids = new LinkedHashSet<>();
-        Matcher matcher = FIXED_THREAD.matcher(output);
+        Matcher matcher = pattern.matcher(output == null ? "" : output);
         while (matcher.find()) {
             String id = matcher.group(1).strip();
             if (!id.isEmpty()) {

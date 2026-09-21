@@ -99,14 +99,27 @@ public final class Engine {
 
     // -- pr_for_story --------------------------------------------------------
 
-    /** PRs whose title or body reference {@code #story} as a whole token. */
+    /**
+     * PRs explicitly associated with {@code story}.
+     *
+     * <p>References in a PR body are not all ownership signals: prerequisite,
+     * related, and dependency references commonly mention other stories. Use
+     * the story branch, title, or explicit ownership language instead.</p>
+     */
     public static List<Map<String, Object>> prForStory(List<Map<String, Object>> prs, int story) {
         Pattern marker = Pattern.compile("(?<![A-Za-z0-9_])#" + story + "(?![0-9])");
+        Pattern branch = Pattern.compile("^story/" + story + "(?:-|$)");
+        Pattern bodyOwnership = Pattern.compile(
+                "(?i)\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\s+#"
+                        + story + "\\b|\\bimplements\\s+story\\s+#" + story + "\\b");
         List<Map<String, Object>> result = new ArrayList<>();
         for (Map<String, Object> pr : prs) {
             String body = asString(pr.get("body"));
             String title = asString(pr.get("title"));
-            if (marker.matcher(body).find() || marker.matcher(title).find()) {
+            String headRefName = asString(pr.get("headRefName"));
+            if (branch.matcher(headRefName).matches()
+                    || marker.matcher(title).find()
+                    || bodyOwnership.matcher(body).find()) {
                 result.add(pr);
             }
         }

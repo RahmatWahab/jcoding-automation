@@ -9,13 +9,17 @@
 - Did I make a clear ?
 - If you're understand then proceed.
 
-Phase: FEEDBACK. Process only the supplied new PR feedback or CI failure.
-The controller supplies `state.active_review_finding` in the authoritative
-context. Process that one finding first and completely; do not attempt to fix
-all unresolved PR findings in one execution. The controller will checkpoint
-and dispatch the remaining findings in later executions. If the worker times
-out or is interrupted, leave the current finding in a resumable state and
-report the exact last completed operation.
+Phase: FEEDBACK. Process only the supplied PR feedback or CI failure batch.
+The controller supplies `state.active_review_findings` in the authoritative
+context. Revalidate every item in that bounded batch against the current PR
+head before editing. Fix all still-valid compatible findings in the batch in
+one coherent worker execution, and identify findings that are already fixed or
+obsolete because later commits changed the affected code.
+
+Do not attempt unrelated findings outside the supplied batch. If the worker
+times out or is interrupted, leave every unfinished batch item resumable and
+report the exact last completed operation for each item. The controller will
+checkpoint and dispatch the next bounded batch after delivery and review.
 Verify each finding against the story and source. Fix valid findings completely
 and add regression tests where appropriate. Do not implement ambiguous feedback.
 Run relevant validation and report the result.
@@ -41,9 +45,18 @@ decision, and test evidence for every finding.
 Do not commit or push changes; the external controller performs those actions
 only when its configuration explicitly permits pushing.
 
-Process every unresolved valid finding, including inline comments from review
-bots. Preserve unrelated behavior. For each finding, record VALID, INVALID, or
-BLOCKED with file/line evidence and reasoning. After fixes, rerun the complete
-relevant verification and deep review; a partial fix or a skipped check is not
-SUCCESS. Do not resolve a review thread merely because code was changed; it may
-be resolved only after the finding is demonstrably addressed.
+Process every unresolved valid finding in the supplied batch, including inline
+comments from review bots. Preserve unrelated behavior. For each finding,
+record VALID, INVALID, or BLOCKED with file/line evidence and reasoning. After
+fixes, rerun the complete relevant verification and deep review; a partial fix
+or a skipped check is not SUCCESS. Do not resolve a review thread merely
+because code was changed; it may be resolved only after the finding is
+demonstrably addressed.
+
+For a finding that is no longer applicable, do not change code merely to
+appease its old line reference. Prove why it is obsolete on the current head
+and report `SUPERSEDED_THREAD: <thread-id>`. For each finding actually fixed,
+report `FIXED_THREAD: <thread-id>`. Report one of these declarations for every
+completed item in the supplied batch; a BLOCKED item must have no declaration
+and remains pending for a later attempt. The controller resolves only those
+declared after delivery verification.

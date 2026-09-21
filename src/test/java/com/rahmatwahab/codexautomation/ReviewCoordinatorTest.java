@@ -70,6 +70,14 @@ class ReviewCoordinatorTest {
         assertThat(ids).containsExactly("PRRC_real_comment");
     }
 
+    @Test
+    void workerCanIdentifySupersededThreads() {
+        Set<String> ids = ReviewCoordinator.supersededThreadIds(
+                "SUPERSEDED_THREAD: PRRT_old\nSUPERSEDED_THREAD: PRRC_comment\n");
+
+        assertThat(ids).containsExactly("PRRT_old", "PRRC_comment");
+    }
+
     // -- canonical_fixed_thread_ids ------------------------------------------
 
     @Test
