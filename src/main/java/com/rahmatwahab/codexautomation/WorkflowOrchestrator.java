@@ -817,258 +817,8 @@ final class WorkflowOrchestrator {
 
         // Reconciliation phase applies a bounded decision, not completion.
         if (prompt.getFileName().toString().equals("reconcile.md")) {
-            StateRecovery.ReconciliationOutcome outcome =
-                    StateRecovery.applyReconciliationDecision(state, result.output());
-            if (!outcome.accepted()) {
-                int attempts = (int) Engine.asLongOrDefault(state.get("reconciliation_attempts"), 0) + 1;
-                state.put("phase", "BLOCKED_REQUIREMENTS");
-                state.put("reconciliation_attempts", attempts);
-                state.put("error", outcome.detail());
-                state.put("decision_rejection", outcome.detail());
-                if (attempts >= 3) {
-                    state.put("phase", "BLOCKED_EXTERNAL");
-                    state.put("error", "reconciliation failed three consecutive times; manual intervention required");
-                }
-                state.put("exit_code", result.exitCode());
-                state.put("run_finished_at", Controller.now());
-                save();
-                log.info("RECONCILIATION REJECTED: " + outcome.detail());
-                return 1;
-            }
-            Map<String, String> parsed = StateRecovery.parseResult(result.output());
-            state.put("worker_result_status", parsed.getOrDefault("result_status", "UNKNOWN"));
-            state.put("worker_result_evidence", parsed.getOrDefault("result_evidence", "BLOCKED"));
-            state.put("result_status", "RECONCILIATION_ACCEPTED");
-            state.put("result_evidence", "DECISION_COMPLETE");
-            state.put("exit_code", result.exitCode());
-            state.put("run_finished_at", Controller.now());
-
-            // Deterministic anti-loop mechanism for a fully autonomous system:
-            // reconciliation that repeatedly resumes work (RESUME_* /
-            // PROCESS_FEEDBACK) on the SAME PR head without the head ever
-            // advancing means the resumed phase keeps failing to fully validate
-            // and nothing is being committed. There is no human in the loop, so
-            // instead of blocking we DELIVER: after a bounded number of
-            // consecutive same-head resume decisions, commit and push the
-            // controller-owned changes and route to WAITING_FOR_CI so CI (plus
-            // the mandatory manual-merge gate) validates. This guarantees the
-            // fix reaches the PR and the workflow never dead-ends or loops. A
-            // head that advances (a commit landed) resets the same-head guard.
-            //
-            // The same-head guard alone is not sufficient: a story can loop for
-            // hours when EACH resume advances the head slightly (a tiny commit
-            // lands), which resets the same-head counter every cycle so the cap
-            // is never reached. Observed in production logs: a single story
-            // reached 300+ reconcile attempts over ~14h because the head kept
-            // moving. To bound that case we ALSO track a cumulative,
-            // head-independent resume counter per story. It resets only when the
-            // active story changes, and once it exceeds
-            // (max_resume_attempts * resume_loop_multiplier) it forces the same
-            // autonomous delivery/abort path. This caps total churn per story
-            // regardless of whether the head advances.
-            String action = Engine.asString(state.get("decision_action"));
-            boolean resumeAction = action.startsWith("RESUME") || action.equals("PROCESS_FEEDBACK");
-            String reconcileHead = currentPr == null
-                    ? "" : Engine.asString(currentPr.get("headRefOid"));
-            boolean forceDelivery = false;
-            // Single source of truth for the resume anti-loop counters
-            // (Requirements 4 & 10): ProgressGuard owns the same-head consecutive
-            // guard and the cumulative per-story guard, including the reset rules
-            // (progress = resolved-thread increase; head movement alone is not
-            // progress — the PR #187 field case). The outcome is mirrored back
-            // into the legacy state keys so persistence and the reset sites
-            // elsewhere remain behavior-identical.
-            int maxResume = (int) Engine.asLongOrDefault(
-                    automation.get("max_resume_attempts"), 3);
-            int loopMultiplier = Math.max(1, (int) Engine.asLongOrDefault(
-                    automation.get("resume_loop_multiplier"), 4));
-            String currentStoryKey = current == null ? "" : String.valueOf(current);
-            int resolvedNow = resolvedThreadCount();
-            int resolvedAtReset = (int) Engine.asLongOrDefault(
-                    state.get("resume_total_resolved_baseline"), 0);
-            ProgressGuard.ProgressState priorProgress = new ProgressGuard.ProgressState(
-                    Engine.asString(state.get("resume_guard_head")),
-                    (int) Engine.asLongOrDefault(state.get("resume_attempts"), 0),
-                    Engine.asString(state.get("resume_total_story")),
-                    (int) Engine.asLongOrDefault(state.get("resume_total_attempts"), 0),
-                    resolvedAtReset);
-            ProgressGuard.GuardOutcome guard = ProgressGuard.observe(priorProgress,
-                    new ProgressGuard.GuardInput(resumeAction, reconcileHead, currentStoryKey,
-                            resolvedNow, maxResume, loopMultiplier));
-            ProgressGuard.ProgressState progress = guard.state();
-            if (resumeAction) {
-                // Mirror the guard's counters back into the durable keys via the
-                // single codec authority (Requirement 3), logging a reset the
-                // same way as before.
-                boolean madeProgress = resolvedNow > resolvedAtReset;
-                WorkflowStateCodec.writeProgress(state, progress);
-                if (madeProgress && progress.cumulativeAttempts() == 1) {
-                    log.info("PROGRESS: story #{} resolved {} review thread(s) (was {}); "
-                            + "resetting cumulative resume guard — the PR is advancing",
-                            current, resolvedNow, resolvedAtReset);
-                }
-                forceDelivery = guard.forceDelivery();
-                if (forceDelivery && progress.sameHeadAttempts() > maxResume) {
-                    log.info("AUTO-DELIVER: reconciliation resumed PR head {} {} times without "
-                            + "advancing; delivering controller-owned changes and deferring "
-                            + "validation to CI", shortSha(reconcileHead), progress.sameHeadAttempts());
-                } else if (forceDelivery) {
-                    log.info("AUTO-DELIVER: story #{} accumulated {} resume decisions "
-                            + "(cap {}); the head keeps advancing without converging, "
-                            + "delivering controller-owned changes and deferring "
-                            + "validation to CI", current, progress.cumulativeAttempts(),
-                            guard.maxTotalResume());
-                }
-            } else {
-                // A non-resume decision (e.g. WAIT_FOR_CI, BLOCK_*) clears the
-                // consecutive same-head guard. The cumulative per-story counters
-                // (resume_total_*) are intentionally NOT cleared here: they must
-                // survive interleaved non-resume decisions so an advancing-head
-                // loop that keeps oscillating resume/non-resume still converges
-                // to the cumulative cap. They reset only on story advance or a
-                // completed auto-deliver (both handled explicitly).
-                state.remove("resume_guard_head");
-                state.remove("resume_attempts");
-            }
-
-            if (forceDelivery && currentPr != null) {
-                // Only auto-deliver if there are REAL uncommitted changes to
-                // deliver. If the active finding cannot advance, isolate that
-                // finding and continue with independent findings where possible.
-                boolean hasDeliverable;
-                try {
-                    hasDeliverable = git.classifyWorktree(state) != GitOperations.WorktreeState.CLEAN;
-                } catch (RuntimeException exc) {
-                    hasDeliverable = false;
-                }
-                if (!hasDeliverable) {
-                    String noProgressError = "Story #" + current + " PR #" + currentPr.get("number")
-                            + " head " + shortSha(reconcileHead) + " could not be advanced after "
-                            + "repeated resume attempts and the worker produced no deliverable "
-                            + "change for the active review finding.";
-                    ReviewFindingQueue.markActiveBlocked(state, noProgressError);
-                    Map<String, Object> nextFinding = ReviewFindingQueue.next(
-                            ReviewFindingQueue.findings(state));
-                    if (nextFinding != null) {
-                        // Isolate one impossible finding and continue processing
-                        // independent findings on the same PR head.
-                        state.put("phase", "FIXING_FEEDBACK");
-                        state.put("next_action", "FIXING_FEEDBACK");
-                        state.remove("stuck_head");
-                        state.remove("stuck_head_reason");
-                        state.remove("stuck_finding_key");
-                        state.remove("resume_guard_head");
-                        state.remove("resume_attempts");
-                        state.remove("resume_total_story");
-                        state.remove("resume_total_attempts");
-                        state.remove("resume_total_resolved_baseline");
-                        state.remove("last_feedback_result");
-                        state.remove("last_feedback_result_head");
-                        state.put("error", noProgressError + " Continuing with the next finding.");
-                        state.put("exit_code", result.exitCode());
-                        state.put("run_finished_at", Controller.now());
-                        save();
-                        cleanup(renderedPrompt);
-                        log.warn("REVIEW FINDING BLOCKED: {}; continuing with next finding",
-                                noProgressError);
-                        return 0;
-                    }
-                    state.put("phase", "BLOCKED_EXTERNAL");
-                    state.put("error", noProgressError
-                            + " No independent findings remain; operator intervention is required.");
-                    // Mark this head as terminally stuck so the deviation
-                    // supervisor does not immediately re-escalate the same head.
-                    // This is UNRECOVERABLE (the worker cannot produce a fix on
-                    // this head), so it is terminal regardless of delivery mode —
-                    // only a new head (advanced commit) clears it. It must NOT be
-                    // cleared merely because delivery is enabled.
-                    state.put("stuck_head", reconcileHead);
-                    state.put("stuck_head_reason", "UNRECOVERABLE");
-                    Map<String, Object> blockedFinding = ReviewFindingQueue.active(state);
-                    if (blockedFinding != null) {
-                        state.put("stuck_finding_key", ReviewFindingQueue.key(blockedFinding));
-                    }
-                    state.remove("resume_guard_head");
-                    state.remove("resume_attempts");
-                    state.remove("resume_total_story");
-                    state.remove("resume_total_attempts");
-                    state.remove("resume_total_resolved_baseline");
-                    state.put("exit_code", result.exitCode());
-                    state.put("run_finished_at", Controller.now());
-                    save();
-                    cleanup(renderedPrompt);
-                    log.error("AUTO-DELIVER ABORTED (nothing to deliver): {}", state.get("error"));
-                    return 1;
-                }
-                state.put("result_status", "SUCCESS");
-                state.put("result_evidence", "DEFERRED_TO_CI");
-                state.put("delivery_mode", "CI_DEFERRED");
-                state.put("phase", "WAITING_FOR_CI");
-                state.remove("resume_guard_head");
-                state.remove("resume_attempts");
-                state.remove("resume_total_story");
-                state.remove("resume_total_attempts");
-                state.remove("resume_total_resolved_baseline");
-                save();
-                int deliveryResult = runDeliveryPipeline(git, current, currentPr,
-                        result.output(), feedbackToResolve, true);
-                cleanup(renderedPrompt);
-                if (deliveryResult != Integer.MIN_VALUE) {
-                    return deliveryResult;
-                }
-                state.put("exit_code", result.exitCode());
-                state.put("run_finished_at", Controller.now());
-                save();
-                log.info("AUTO-DELIVER COMPLETE: story #{} phase={}", current, state.get("phase"));
-                return 0;
-            }
-
-            save();
-            log.info("RECONCILIATION ACCEPTED: " + state.get("decision_action") + " — " + outcome.detail());
-
-            // When reconciliation EXPLICITLY decides PROCESS_FEEDBACK, that is an
-            // authoritative instruction to re-attempt the feedback fix on this
-            // head. A stale last_feedback_result=BLOCKED (from an earlier failed
-            // FIXING_FEEDBACK on the same head) must be cleared here; otherwise
-            // the next tick's feedback guard immediately re-routes back to
-            // reconcile before feedback.md ever runs — an observed live loop:
-            //   feedback BLOCKED -> reconcile -> PROCESS_FEEDBACK -> feedback
-            //   BLOCKED -> ... (the fix and thread resolution never happen).
-            // Clearing the verdict lets the FIXING_FEEDBACK worker actually run.
-            //
-            // IMPORTANT: do NOT reset feedback_attempts / feedback_guard_key
-            // here. Those accrue the per-head attempt count that the
-            // max_feedback_attempts cap depends on. Resetting them every reconcile
-            // cycle would let reconcile<->feedback loop forever (the cap could
-            // never be reached). Preserving them means: feedback.md re-runs, and
-            // if it keeps failing the cap eventually triggers the bounded live
-            // auto-deliver/escalate path — so the cycle converges instead of
-            // spinning.
-            if ("PROCESS_FEEDBACK".equals(Engine.asString(state.get("decision_action")))) {
-                state.remove("last_feedback_result");
-                state.remove("last_feedback_result_head");
-                // Reconciliation has explicitly authorized a new feedback
-                // execution. Clear stale global watchdog state so an old
-                // FIXING_FEEDBACK attempt cannot bounce the workflow back to
-                // RECONCILING before the active finding is dispatched.
-                state.put("phase", "FIXING_FEEDBACK");
-                state.put("phase_attempt", 0);
-                state.remove("deviation_code");
-                state.remove("deviation_detail");
-                // A legacy PR-level guard is not evidence that the active
-                // queue item has been attempted. The queue is authoritative;
-                // discard that counter for a never-dispatched finding so the
-                // first real worker execution is not rejected as exhausted.
-                Map<String, Object> queuedFinding = ReviewFindingQueue.active(state);
-                if (queuedFinding != null
-                        && Engine.asLongOrDefault(queuedFinding.get("attempts"), 0) == 0) {
-                    state.remove("feedback_guard_head");
-                    state.remove("feedback_guard_key");
-                    state.remove("feedback_attempts");
-                }
-                save();
-            }
-            return 0;
+            return handleReconcileDecision(git, current, currentPr, result, renderedPrompt,
+                    feedbackToResolve);
         }
 
         if (result.exitCode() != 0) {
@@ -1714,6 +1464,204 @@ final class WorkflowOrchestrator {
      * a non-null exit code when the run must end here, or {@code null} to
      * proceed. Behavior-identical to the former inline preamble.
      */
+    /**
+     * Apply the reconcile-worker decision (Requirement 2): accept/reject the
+     * bounded decision, run the ProgressGuard resume anti-loop, and perform the
+     * autonomous auto-deliver / terminal-block / PROCESS_FEEDBACK routing.
+     * Behavior-identical to the former inline reconcile.md branch. Returns the
+     * run exit code.
+     */
+    private int handleReconcileDecision(GitOperations git, Integer current, Map<String, Object> currentPr,
+                                        CodexRunner.CodexResult result, Path renderedPrompt,
+                                        List<Map<String, Object>> feedbackToResolve) {
+        StateRecovery.ReconciliationOutcome outcome =
+                StateRecovery.applyReconciliationDecision(state, result.output());
+        if (!outcome.accepted()) {
+            int attempts = (int) Engine.asLongOrDefault(state.get("reconciliation_attempts"), 0) + 1;
+            state.put("phase", "BLOCKED_REQUIREMENTS");
+            state.put("reconciliation_attempts", attempts);
+            state.put("error", outcome.detail());
+            state.put("decision_rejection", outcome.detail());
+            if (attempts >= 3) {
+                state.put("phase", "BLOCKED_EXTERNAL");
+                state.put("error", "reconciliation failed three consecutive times; manual intervention required");
+            }
+            state.put("exit_code", result.exitCode());
+            state.put("run_finished_at", Controller.now());
+            save();
+            log.info("RECONCILIATION REJECTED: " + outcome.detail());
+            return 1;
+        }
+        Map<String, String> parsed = StateRecovery.parseResult(result.output());
+        state.put("worker_result_status", parsed.getOrDefault("result_status", "UNKNOWN"));
+        state.put("worker_result_evidence", parsed.getOrDefault("result_evidence", "BLOCKED"));
+        state.put("result_status", "RECONCILIATION_ACCEPTED");
+        state.put("result_evidence", "DECISION_COMPLETE");
+        state.put("exit_code", result.exitCode());
+        state.put("run_finished_at", Controller.now());
+
+        // Deterministic anti-loop mechanism for a fully autonomous system:
+        // reconciliation that repeatedly resumes work (RESUME_* / PROCESS_FEEDBACK)
+        // on the SAME PR head without the head ever advancing means the resumed
+        // phase keeps failing to fully validate and nothing is being committed.
+        // Instead of blocking we DELIVER after a bounded number of consecutive
+        // same-head resumes; a cumulative per-story counter also bounds the case
+        // where each resume advances the head slightly (see ProgressGuard).
+        String action = Engine.asString(state.get("decision_action"));
+        boolean resumeAction = action.startsWith("RESUME") || action.equals("PROCESS_FEEDBACK");
+        String reconcileHead = currentPr == null
+                ? "" : Engine.asString(currentPr.get("headRefOid"));
+        boolean forceDelivery = false;
+        int maxResume = (int) Engine.asLongOrDefault(
+                automation.get("max_resume_attempts"), 3);
+        int loopMultiplier = Math.max(1, (int) Engine.asLongOrDefault(
+                automation.get("resume_loop_multiplier"), 4));
+        String currentStoryKey = current == null ? "" : String.valueOf(current);
+        int resolvedNow = resolvedThreadCount();
+        int resolvedAtReset = (int) Engine.asLongOrDefault(
+                state.get("resume_total_resolved_baseline"), 0);
+        ProgressGuard.ProgressState priorProgress = new ProgressGuard.ProgressState(
+                Engine.asString(state.get("resume_guard_head")),
+                (int) Engine.asLongOrDefault(state.get("resume_attempts"), 0),
+                Engine.asString(state.get("resume_total_story")),
+                (int) Engine.asLongOrDefault(state.get("resume_total_attempts"), 0),
+                resolvedAtReset);
+        ProgressGuard.GuardOutcome guard = ProgressGuard.observe(priorProgress,
+                new ProgressGuard.GuardInput(resumeAction, reconcileHead, currentStoryKey,
+                        resolvedNow, maxResume, loopMultiplier));
+        ProgressGuard.ProgressState progress = guard.state();
+        if (resumeAction) {
+            boolean madeProgress = resolvedNow > resolvedAtReset;
+            WorkflowStateCodec.writeProgress(state, progress);
+            if (madeProgress && progress.cumulativeAttempts() == 1) {
+                log.info("PROGRESS: story #{} resolved {} review thread(s) (was {}); "
+                        + "resetting cumulative resume guard — the PR is advancing",
+                        current, resolvedNow, resolvedAtReset);
+            }
+            forceDelivery = guard.forceDelivery();
+            if (forceDelivery && progress.sameHeadAttempts() > maxResume) {
+                log.info("AUTO-DELIVER: reconciliation resumed PR head {} {} times without "
+                        + "advancing; delivering controller-owned changes and deferring "
+                        + "validation to CI", shortSha(reconcileHead), progress.sameHeadAttempts());
+            } else if (forceDelivery) {
+                log.info("AUTO-DELIVER: story #{} accumulated {} resume decisions "
+                        + "(cap {}); the head keeps advancing without converging, "
+                        + "delivering controller-owned changes and deferring "
+                        + "validation to CI", current, progress.cumulativeAttempts(),
+                        guard.maxTotalResume());
+            }
+        } else {
+            state.remove("resume_guard_head");
+            state.remove("resume_attempts");
+        }
+
+        if (forceDelivery && currentPr != null) {
+            boolean hasDeliverable;
+            try {
+                hasDeliverable = git.classifyWorktree(state) != GitOperations.WorktreeState.CLEAN;
+            } catch (RuntimeException exc) {
+                hasDeliverable = false;
+            }
+            if (!hasDeliverable) {
+                String noProgressError = "Story #" + current + " PR #" + currentPr.get("number")
+                        + " head " + shortSha(reconcileHead) + " could not be advanced after "
+                        + "repeated resume attempts and the worker produced no deliverable "
+                        + "change for the active review finding.";
+                ReviewFindingQueue.markActiveBlocked(state, noProgressError);
+                Map<String, Object> nextFinding = ReviewFindingQueue.next(
+                        ReviewFindingQueue.findings(state));
+                if (nextFinding != null) {
+                    state.put("phase", "FIXING_FEEDBACK");
+                    state.put("next_action", "FIXING_FEEDBACK");
+                    state.remove("stuck_head");
+                    state.remove("stuck_head_reason");
+                    state.remove("stuck_finding_key");
+                    state.remove("resume_guard_head");
+                    state.remove("resume_attempts");
+                    state.remove("resume_total_story");
+                    state.remove("resume_total_attempts");
+                    state.remove("resume_total_resolved_baseline");
+                    state.remove("last_feedback_result");
+                    state.remove("last_feedback_result_head");
+                    state.put("error", noProgressError + " Continuing with the next finding.");
+                    state.put("exit_code", result.exitCode());
+                    state.put("run_finished_at", Controller.now());
+                    save();
+                    cleanup(renderedPrompt);
+                    log.warn("REVIEW FINDING BLOCKED: {}; continuing with next finding",
+                            noProgressError);
+                    return 0;
+                }
+                state.put("phase", "BLOCKED_EXTERNAL");
+                state.put("error", noProgressError
+                        + " No independent findings remain; operator intervention is required.");
+                state.put("stuck_head", reconcileHead);
+                state.put("stuck_head_reason", "UNRECOVERABLE");
+                Map<String, Object> blockedFinding = ReviewFindingQueue.active(state);
+                if (blockedFinding != null) {
+                    state.put("stuck_finding_key", ReviewFindingQueue.key(blockedFinding));
+                }
+                state.remove("resume_guard_head");
+                state.remove("resume_attempts");
+                state.remove("resume_total_story");
+                state.remove("resume_total_attempts");
+                state.remove("resume_total_resolved_baseline");
+                state.put("exit_code", result.exitCode());
+                state.put("run_finished_at", Controller.now());
+                save();
+                cleanup(renderedPrompt);
+                log.error("AUTO-DELIVER ABORTED (nothing to deliver): {}", state.get("error"));
+                return 1;
+            }
+            state.put("result_status", "SUCCESS");
+            state.put("result_evidence", "DEFERRED_TO_CI");
+            state.put("delivery_mode", "CI_DEFERRED");
+            state.put("phase", "WAITING_FOR_CI");
+            state.remove("resume_guard_head");
+            state.remove("resume_attempts");
+            state.remove("resume_total_story");
+            state.remove("resume_total_attempts");
+            state.remove("resume_total_resolved_baseline");
+            save();
+            int deliveryResult = runDeliveryPipeline(git, current, currentPr,
+                    result.output(), feedbackToResolve, true);
+            cleanup(renderedPrompt);
+            if (deliveryResult != Integer.MIN_VALUE) {
+                return deliveryResult;
+            }
+            state.put("exit_code", result.exitCode());
+            state.put("run_finished_at", Controller.now());
+            save();
+            log.info("AUTO-DELIVER COMPLETE: story #{} phase={}", current, state.get("phase"));
+            return 0;
+        }
+
+        save();
+        log.info("RECONCILIATION ACCEPTED: " + state.get("decision_action") + " — " + outcome.detail());
+
+        // When reconciliation EXPLICITLY decides PROCESS_FEEDBACK, clear the stale
+        // last_feedback_result=BLOCKED so the FIXING_FEEDBACK worker actually runs
+        // (otherwise the feedback guard re-routes to reconcile forever). Do NOT
+        // reset feedback_attempts/guard_key — those accrue the cap the loop needs.
+        if ("PROCESS_FEEDBACK".equals(Engine.asString(state.get("decision_action")))) {
+            state.remove("last_feedback_result");
+            state.remove("last_feedback_result_head");
+            state.put("phase", "FIXING_FEEDBACK");
+            state.put("phase_attempt", 0);
+            state.remove("deviation_code");
+            state.remove("deviation_detail");
+            Map<String, Object> queuedFinding = ReviewFindingQueue.active(state);
+            if (queuedFinding != null
+                    && Engine.asLongOrDefault(queuedFinding.get("attempts"), 0) == 0) {
+                state.remove("feedback_guard_head");
+                state.remove("feedback_guard_key");
+                state.remove("feedback_attempts");
+            }
+            save();
+        }
+        return 0;
+    }
+
     private Integer prepareWorktreeForPhase(GitOperations git, Integer current,
                                             Map<String, Object> currentPr) {
         // A crash can occur after a story branch is created but before its name
