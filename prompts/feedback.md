@@ -10,6 +10,12 @@
 - If you're understand then proceed.
 
 Phase: FEEDBACK. Process only the supplied new PR feedback or CI failure.
+The controller supplies `state.active_review_finding` in the authoritative
+context. Process that one finding first and completely; do not attempt to fix
+all unresolved PR findings in one execution. The controller will checkpoint
+and dispatch the remaining findings in later executions. If the worker times
+out or is interrupted, leave the current finding in a resumable state and
+report the exact last completed operation.
 Verify each finding against the story and source. Fix valid findings completely
 and add regression tests where appropriate. Do not implement ambiguous feedback.
 Run relevant validation and report the result.

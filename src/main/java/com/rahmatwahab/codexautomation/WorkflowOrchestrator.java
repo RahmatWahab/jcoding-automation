@@ -257,6 +257,15 @@ final class WorkflowOrchestrator {
             List<Map<String, Object>> feedback = Engine.actionableFeedback(
                     currentPr, Engine.asString(state.get("last_feedback_id")).isEmpty()
                             ? null : Engine.asString(state.get("last_feedback_id")));
+            boolean legacyPrLevelFindingState = !state.containsKey(ReviewFindingQueue.STATE_KEY);
+            // Persist each unresolved finding independently. The worker is
+            // instructed to complete only the active finding, so a large PR
+            // review cannot consume one shared retry budget or time out while
+            // attempting unrelated fixes.
+            ReviewFindingQueue.synchronize(state, feedback);
+            Map<String, Object> activeFinding = ReviewFindingQueue.active(state);
+            List<Map<String, Object>> activeFeedback = activeFinding == null
+                    ? List.of() : List.of(new LinkedHashMap<>(activeFinding));
             List<Map<String, Object>> events = Engine.reviewEvents(
                     currentPr, Engine.asString(state.get("last_processed_review_id")).isEmpty()
                             ? null : Engine.asString(state.get("last_processed_review_id")));
@@ -285,17 +294,53 @@ final class WorkflowOrchestrator {
                 if (head.equals(Engine.asString(state.get("stuck_head")))) {
                     String stuckReason = Engine.asString(state.get("stuck_head_reason"));
                     if ("UNRECOVERABLE".equals(stuckReason)) {
-                        // The worker genuinely cannot fix this head (repeated
-                        // attempts produced no deliverable change). Terminal in ALL
-                        // modes — do not resume the feedback loop just because
-                        // delivery is enabled; only a NEW head clears this. Hold
-                        // blocked quietly until the head advances or an operator acts.
-                        state.put("phase", "BLOCKED_EXTERNAL");
-                        save();
-                        log.info("BLOCKED (terminal): PR #{} head {} is unrecoverable by the automated "
-                                + "worker; holding until the head advances or an operator acts",
-                                currentPr.get("number"), shortSha(head));
-                        return 1;
+                        boolean legacyMarker = legacyPrLevelFindingState
+                                || Engine.asString(state.get("stuck_finding_key")).isEmpty();
+                        if (legacyMarker) {
+                            // The old controller stored an unrecoverable marker
+                            // for the entire PR head. The finding queue makes
+                            // that marker obsolete: migrate it once and let
+                            // each unresolved finding receive its own bounded
+                            // execution/checkpoint.
+                            state.remove("stuck_head");
+                            state.remove("stuck_head_reason");
+                            state.remove("feedback_guard_head");
+                            state.remove("feedback_guard_key");
+                            state.remove("feedback_attempts");
+                            // The legacy PR-level block may have left the
+                            // global phase watchdog exhausted. Once the
+                            // marker is migrated, the finding queue owns
+                            // progress and the next feedback attempt must get
+                            // a fresh phase budget.
+                            state.put("phase_attempt", 0);
+                            state.remove("deviation_code");
+                            state.remove("deviation_detail");
+                            log.info("STUCK-HEAD MIGRATED: replacing legacy PR-level marker "
+                                    + "with per-finding feedback checkpoints");
+                        } else if (activeFinding != null
+                                && !Engine.asString(state.get("stuck_finding_key")).isEmpty()
+                                && !ReviewFindingQueue.key(activeFinding).equals(
+                                        Engine.asString(state.get("stuck_finding_key")))) {
+                            // A different finding is now active. The old
+                            // finding remains blocked, but it must not suppress
+                            // independent review work on the same PR head.
+                            state.remove("stuck_head");
+                            state.remove("stuck_head_reason");
+                            state.remove("stuck_finding_key");
+                            log.info("STUCK-FINDING BYPASSED: continuing with independent "
+                                    + "review finding on head {}", shortSha(head));
+                        } else {
+                            // This specific finding is terminal, but it must
+                            // not be retried on every cron tick.
+                            state.put("phase", "BLOCKED_EXTERNAL");
+                            save();
+                            log.info("BLOCKED (terminal): PR #{} finding {} on head {} is unrecoverable; "
+                                            + "holding until the finding or head changes",
+                                    currentPr.get("number"),
+                                    activeFinding == null ? "all-findings"
+                                            : ReviewFindingQueue.key(activeFinding), shortSha(head));
+                            return 1;
+                        }
                     }
                     if (deliveringMode) {
                         log.info("STUCK-HEAD CLEARED: delivery is enabled for head {}; "
@@ -344,18 +389,27 @@ final class WorkflowOrchestrator {
                             currentPr.get("number"), shortSha(head));
                 }
 
-                // Bounded loop guard: if the same PR head has been in
-                // FIXING_FEEDBACK for the same feedback repeatedly without the
-                // head advancing, stop and require human review instead of
-                // looping (and burning quota) forever.
-                String lastGuardHead = Engine.asString(state.get("feedback_guard_head"));
+                // Bounded loop guard: if the same finding on the same PR head
+                // is retried repeatedly without progress, isolate that finding
+                // instead of consuming the retry budget for the whole PR.
+                String findingKey = activeFinding == null
+                        ? "unknown" : ReviewFindingQueue.key(activeFinding);
+                String lastGuardKey = Engine.asString(state.get("feedback_guard_key"));
+                // Migrate state written by the pre-queue controller. The old
+                // guard was keyed only by PR head; attach it to the current
+                // active finding so an in-flight retry keeps its budget.
+                if (lastGuardKey.isEmpty()
+                        && head.equals(Engine.asString(state.get("feedback_guard_head")))) {
+                    lastGuardKey = head + ":" + findingKey;
+                    state.put("feedback_guard_key", lastGuardKey);
+                }
                 int feedbackAttempts;
-                if (head.equals(lastGuardHead)) {
+                if ((head + ":" + findingKey).equals(lastGuardKey)) {
                     feedbackAttempts = (int) Engine.asLongOrDefault(
                             state.get("feedback_attempts"), 0) + 1;
                 } else {
                     feedbackAttempts = 1;
-                    state.put("feedback_guard_head", head);
+                    state.put("feedback_guard_key", head + ":" + findingKey);
                 }
                 state.put("feedback_attempts", feedbackAttempts);
                 int maxAttempts = (int) Engine.asLongOrDefault(
@@ -391,12 +445,12 @@ final class WorkflowOrchestrator {
                             state.put("result_status", "SUCCESS");
                             state.put("result_evidence", "DEFERRED_TO_CI");
                             state.put("delivery_mode", "CI_DEFERRED");
-                            state.remove("feedback_guard_head");
+                            state.remove("feedback_guard_key");
                             state.remove("feedback_attempts");
                             state.remove("error");
                             save();
                             int deliveryResult = runDeliveryPipeline(
-                                    fbGit, current, currentPr, "", new ArrayList<>(feedback), true);
+                                    fbGit, current, currentPr, "", new ArrayList<>(activeFeedback), false);
                             state.put("run_finished_at", Controller.now());
                             save();
                             log.info("FEEDBACK AUTO-DELIVER COMPLETE: PR #{} phase={}",
@@ -413,7 +467,7 @@ final class WorkflowOrchestrator {
                                 + " head " + shortSha(head) + " reprocessed " + feedbackAttempts
                                 + " times and the worker produced no deliverable fix; escalating "
                                 + "to the reasoning supervisor.");
-                        state.remove("feedback_guard_head");
+                        state.remove("feedback_guard_key");
                         state.remove("feedback_attempts");
                         save();
                         log.info("FEEDBACK ESCALATION: PR #{} no deliverable fix after {} attempts; "
@@ -434,7 +488,7 @@ final class WorkflowOrchestrator {
                         state.put("phase", "BLOCKED_EXTERNAL");
                         state.put("stuck_head", head);
                         state.put("stuck_head_reason", "DELIVERY_DISABLED");
-                        state.remove("feedback_guard_head");
+                        state.remove("feedback_guard_key");
                         state.remove("feedback_attempts");
                         state.put("error", "Feedback for PR #" + currentPr.get("number")
                                 + " head " + shortSha(head) + " was reprocessed " + feedbackAttempts
@@ -447,10 +501,10 @@ final class WorkflowOrchestrator {
                 }
             } else {
                 // No actionable feedback on this head: reset the guard.
-                state.remove("feedback_guard_head");
+                state.remove("feedback_guard_key");
                 state.remove("feedback_attempts");
             }
-            feedbackToResolve = new ArrayList<>(feedback);
+            feedbackToResolve = new ArrayList<>(activeFeedback);
             String[] reconciled = Engine.reconcile(state, currentPr, !feedback.isEmpty());
             String detectedPhase = reconciled[0];
             // Do not demote a manual-merge wait back to READY_TO_MERGE for a
@@ -861,6 +915,9 @@ final class WorkflowOrchestrator {
                 : (Engine.asString(state.get("phase_started_at")).isEmpty()
                         ? Controller.now() : state.get("phase_started_at")));
         state.put("phase_attempt", (int) Engine.asLongOrDefault(state.get("phase_attempt"), 0) + 1);
+        if ("FIXING_FEEDBACK".equals(executionPhase)) {
+            ReviewFindingQueue.markActiveDispatched(state);
+        }
         save();
 
         String executionId = Engine.asString(state.get("execution_id")).isEmpty()
@@ -944,6 +1001,12 @@ final class WorkflowOrchestrator {
 
         state.putAll(Engine.applyCodexResult(state, result.exitCode(), result.output(),
                 (int) Engine.asLongOrDefault(automation.get("quota_retry_seconds"), 1800)));
+
+        if ("FIXING_FEEDBACK".equals(executionPhase)) {
+            ReviewFindingQueue.recordWorkerResult(state, result.exitCode(),
+                    Engine.asString(state.get("result_status")),
+                    codexRunner.redactSensitive(tail(result.output(), 1000)));
+        }
 
         // Record the FIXING_FEEDBACK verdict per head so a repeated BLOCKED
         // result escalates to human review instead of being re-dispatched.
@@ -1113,12 +1176,8 @@ final class WorkflowOrchestrator {
 
             if (forceDelivery && currentPr != null) {
                 // Only auto-deliver if there are REAL uncommitted changes to
-                // deliver. If the head cannot advance and there is nothing to
-                // commit (the worker keeps producing nothing), delivering is a
-                // no-op that re-loops forever. In that genuinely-unrecoverable
-                // case, stop re-processing this head: record a terminal blocked
-                // state keyed to the head so the next run does not immediately
-                // re-enter feedback/reconcile on the same unchanged head.
+                // deliver. If the active finding cannot advance, isolate that
+                // finding and continue with independent findings where possible.
                 boolean hasDeliverable;
                 try {
                     hasDeliverable = git.classifyWorktree(state) != GitOperations.WorktreeState.CLEAN;
@@ -1126,12 +1185,40 @@ final class WorkflowOrchestrator {
                     hasDeliverable = false;
                 }
                 if (!hasDeliverable) {
-                    state.put("phase", "BLOCKED_EXTERNAL");
-                    state.put("error", "Story #" + current + " PR #" + currentPr.get("number")
+                    String noProgressError = "Story #" + current + " PR #" + currentPr.get("number")
                             + " head " + shortSha(reconcileHead) + " could not be advanced after "
                             + "repeated resume attempts and the worker produced no deliverable "
-                            + "change; the automated worker cannot resolve the remaining feedback "
-                            + "for this head. Stopping to avoid an infinite loop.");
+                            + "change for the active review finding.";
+                    ReviewFindingQueue.markActiveBlocked(state, noProgressError);
+                    Map<String, Object> nextFinding = ReviewFindingQueue.next(
+                            ReviewFindingQueue.findings(state));
+                    if (nextFinding != null) {
+                        // Isolate one impossible finding and continue processing
+                        // independent findings on the same PR head.
+                        state.put("phase", "FIXING_FEEDBACK");
+                        state.put("next_action", "FIXING_FEEDBACK");
+                        state.remove("stuck_head");
+                        state.remove("stuck_head_reason");
+                        state.remove("stuck_finding_key");
+                        state.remove("resume_guard_head");
+                        state.remove("resume_attempts");
+                        state.remove("resume_total_story");
+                        state.remove("resume_total_attempts");
+                        state.remove("resume_total_resolved_baseline");
+                        state.remove("last_feedback_result");
+                        state.remove("last_feedback_result_head");
+                        state.put("error", noProgressError + " Continuing with the next finding.");
+                        state.put("exit_code", result.exitCode());
+                        state.put("run_finished_at", Controller.now());
+                        save();
+                        cleanup(renderedPrompt);
+                        log.warn("REVIEW FINDING BLOCKED: {}; continuing with next finding",
+                                noProgressError);
+                        return 0;
+                    }
+                    state.put("phase", "BLOCKED_EXTERNAL");
+                    state.put("error", noProgressError
+                            + " No independent findings remain; operator intervention is required.");
                     // Mark this head as terminally stuck so the deviation
                     // supervisor does not immediately re-escalate the same head.
                     // This is UNRECOVERABLE (the worker cannot produce a fix on
@@ -1140,6 +1227,10 @@ final class WorkflowOrchestrator {
                     // cleared merely because delivery is enabled.
                     state.put("stuck_head", reconcileHead);
                     state.put("stuck_head_reason", "UNRECOVERABLE");
+                    Map<String, Object> blockedFinding = ReviewFindingQueue.active(state);
+                    if (blockedFinding != null) {
+                        state.put("stuck_finding_key", ReviewFindingQueue.key(blockedFinding));
+                    }
                     state.remove("resume_guard_head");
                     state.remove("resume_attempts");
                     state.remove("resume_total_story");
@@ -1188,7 +1279,7 @@ final class WorkflowOrchestrator {
             //   BLOCKED -> ... (the fix and thread resolution never happen).
             // Clearing the verdict lets the FIXING_FEEDBACK worker actually run.
             //
-            // IMPORTANT: do NOT reset feedback_attempts / feedback_guard_head
+            // IMPORTANT: do NOT reset feedback_attempts / feedback_guard_key
             // here. Those accrue the per-head attempt count that the
             // max_feedback_attempts cap depends on. Resetting them every reconcile
             // cycle would let reconcile<->feedback loop forever (the cap could
@@ -1199,6 +1290,25 @@ final class WorkflowOrchestrator {
             if ("PROCESS_FEEDBACK".equals(Engine.asString(state.get("decision_action")))) {
                 state.remove("last_feedback_result");
                 state.remove("last_feedback_result_head");
+                // Reconciliation has explicitly authorized a new feedback
+                // execution. Clear stale global watchdog state so an old
+                // FIXING_FEEDBACK attempt cannot bounce the workflow back to
+                // RECONCILING before the active finding is dispatched.
+                state.put("phase", "FIXING_FEEDBACK");
+                state.put("phase_attempt", 0);
+                state.remove("deviation_code");
+                state.remove("deviation_detail");
+                // A legacy PR-level guard is not evidence that the active
+                // queue item has been attempted. The queue is authoritative;
+                // discard that counter for a never-dispatched finding so the
+                // first real worker execution is not rejected as exhausted.
+                Map<String, Object> queuedFinding = ReviewFindingQueue.active(state);
+                if (queuedFinding != null
+                        && Engine.asLongOrDefault(queuedFinding.get("attempts"), 0) == 0) {
+                    state.remove("feedback_guard_head");
+                    state.remove("feedback_guard_key");
+                    state.remove("feedback_attempts");
+                }
                 save();
             }
             return 0;
@@ -1532,9 +1642,10 @@ final class WorkflowOrchestrator {
                 "resume_guard_head", "resume_attempts",
                 "resume_total_story", "resume_total_attempts",
                 "resume_total_resolved_baseline",
-                "feedback_guard_head", "feedback_attempts",
+                "feedback_guard_head", "feedback_guard_key", "feedback_attempts",
                 "last_feedback_result", "last_feedback_result_head",
                 "stuck_head", "stuck_head_reason",
+                "stuck_finding_key",
                 "feedback_reconcile_pending",
                 "last_processed_commit", "last_connector_review_commit",
                 "last_review_trigger_commit", "review_trigger_pending",

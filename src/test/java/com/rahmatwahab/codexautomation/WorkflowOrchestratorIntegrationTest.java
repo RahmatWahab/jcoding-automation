@@ -1407,15 +1407,10 @@ class WorkflowOrchestratorIntegrationTest {
     }
 
     @Test
-    void liveUnrecoverableStuckHeadIsNotClearedInLiveMode(@TempDir Path root) throws Exception {
-        // Core regression (PR #187): the reconcile auto-deliver-abort marks a head
-        // UNRECOVERABLE (worker cannot produce a fix). A previous fix wrongly
-        // cleared ANY stuck_head when delivery was enabled, which re-enabled the
-        // reconcile/feedback loop. The reason-aware marker must keep an
-        // UNRECOVERABLE head terminally blocked EVEN in live mode (allow_push);
-        // only a NEW head clears it. This single deterministic tick proves the
-        // marker survives and the tick returns terminal-blocked rather than
-        // resuming the feedback path.
+    void legacyPrLevelStuckHeadMigratesToFindingQueue(@TempDir Path root) throws Exception {
+        // The old controller stored UNRECOVERABLE for the entire PR head. The
+        // per-finding controller must migrate that marker and resume the
+        // unresolved finding instead of permanently suppressing the whole PR.
         Path repo = root.resolve("repo");
         Files.createDirectories(repo);
         runGit(repo, "init", "-q");
@@ -1495,13 +1490,12 @@ class WorkflowOrchestratorIntegrationTest {
         int code = orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
         lock.release();
 
-        // Terminal block returned, and the UNRECOVERABLE marker is NOT cleared
-        // despite allow_push=true (the exact regression that re-enabled the loop).
+        // The old PR-level marker is cleared before dispatching the finding.
         assertThat(code).isEqualTo(1);
         Map<String, Object> after = store.load();
-        assertThat(Engine.asString(after.get("stuck_head"))).isEqualTo(head);
-        assertThat(Engine.asString(after.get("stuck_head_reason"))).isEqualTo("UNRECOVERABLE");
-        assertThat(Engine.asString(after.get("phase"))).isEqualTo("BLOCKED_EXTERNAL");
+        assertThat(after.get("stuck_head")).isNull();
+        assertThat(after.get("stuck_head_reason")).isNull();
+        assertThat(after.get("active_review_finding")).isNotNull();
     }
 
     @Test
