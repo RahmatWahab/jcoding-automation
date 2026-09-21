@@ -17,11 +17,11 @@ repository architecture (AGENTS.md first), existing branches, and any prior plan
 directory for this story. Separate fact from inference: state what the story and
 repository actually require versus what you infer.
 
-PLAN DIRECTORY (deterministic, per story)
+PLAN ARTIFACTS (deterministic, per story)
 
-Resolve the plan directory as `docs/plans/<story>/` (use the bare story number,
-or an existing descriptive `<story>-<slug>` directory if one is already present
-— do not create a duplicate). Produce exactly these artifacts:
+Resolve the plan on the current story branch as two files at the repository
+root: `plan.md` and `ledger.md` (a single plan per story — do not create
+per-task report files; the ledger note column carries per-task detail). Produce:
 
 - `plan.md` — the implementation plan:
   - Goal: one paragraph tying the plan to the story's business outcome.
@@ -41,7 +41,7 @@ or an existing descriptive `<story>-<slug>` directory if one is already present
 
 RESUME RECONCILIATION (mandatory)
 
-If a plan directory already exists for this story, do NOT blindly trust a
+If `plan.md`/`ledger.md` already exist for this story, do NOT blindly trust a
 `done` ledger. Re-validate the existing plan against the CURRENT acceptance
 criteria:
 - If the criteria are unchanged and tasks remain, keep the plan and report the

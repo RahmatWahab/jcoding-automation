@@ -68,7 +68,7 @@ Diagnosed root causes, in causal order:
   and the merge gate.
 - **Worker** — the bounded `codex exec` process invoked per phase.
 - **Phase** — a controller workflow state (e.g. `PLANNING`, `IMPLEMENTING`,
-  `VERIFYING`, `REVIEWING_CODE`, `FIXING_FEEDBACK`, `RECONCILING`, `SUPERVISING`,
+  `VERIFYING`, `REVIEWING_CODE`, `FIXING_FEEDBACK`, `RECONCILING`,
   `WAITING_FOR_CI`, `WAITING_FOR_CODEX_REVIEW`, `WAITING_FOR_MANUAL_MERGE`,
   `READY_TO_MERGE`, `BLOCKED_*`, `IDLE`, `EPIC_COMPLETE`).
 - **Head** — the PR branch head commit SHA (`headRefOid`).
@@ -84,15 +84,6 @@ Diagnosed root causes, in causal order:
   to its acceptance criteria (Requirement 9).
 - **Ledger** — a committed `ledger.md` tracking per-task status, commit, and
   notes; the durable "where am I" record a resumed worker reads (Requirement 9).
-- **Task report** — a committed `task-<n>-report.md` recording what a task
-  implemented, its tests, files changed, verification, and concerns.
-- **WorkerSupervisor** — the component that drives and monitors ONE worker phase
-  (renders prompt, starts the job, owns the heartbeat, enforces the budget, maps
-  the exit code to a typed result). Per-phase scope (Requirement 10).
-- **WorkflowSupervisor** — the higher, cross-tick layer that watches end-to-end
-  health, detects stalls, runs the diagnostic `SUPERVISING` phase, and applies a
-  bounded whitelisted remediation. Never bypasses controller authority
-  (Requirement 11).
 - **Head** — the PR branch head commit SHA (`headRefOid`).
 - **Progress** — an objective, observable advance in the delivery of the active
   story (see FR-4 for the authoritative definition).
@@ -245,133 +236,64 @@ big-bang rewrite, so that the working system stays working throughout.
 - WHERE a step must change behavior (e.g. FR-5 park policy), THE SYSTEM SHALL
   gate it behind config defaulting to current behavior until explicitly enabled.
 
-### Requirement 9: Persisted plan, ledger, and per-task reports (durable worker plan)
+### Requirement 9: Durable per-story plan and ledger (resumable planning)
 
 **User Story:** As an operator of a bounded, resumable worker, I want each story
-to be decomposed into an explicit, committed plan with a status ledger and
-per-task reports, so that a timed-out or freshly-spawned worker resumes
-deterministically from a written record instead of re-deriving scope every tick,
-and so progress is objective and auditable.
+decomposed into a committed plan with a status ledger, so that a timed-out or
+freshly-spawned worker resumes from a written record instead of re-deriving
+scope every tick, and progress is objective.
 
-*(Motivation: today the story's task breakdown lives only inside a single
-`IMPLEMENT` phase in the worker's head. Nothing is persisted, so a resumed worker
-re-plans from scratch and the controller has no task-level progress signal. The
-agentic-consumer project demonstrates a durable `docs/plans/<id>/{plan.md,
-ledger.md,task-N-report.md}` convention that makes resume deterministic and
-progress measurable; this requirement adapts that pattern to the Codex/cron/SQLite
-model. Note: this is a worker artifact discipline, NOT a review mechanism —
-review remains the existing single Codex review trigger.)*
+*(Today the story's task breakdown lives only inside a single `IMPLEMENT` phase
+in the worker's head — nothing is persisted, so a resumed worker re-plans from
+scratch. Adapted, simplified, from agentic-consumer's `plan.md`/`ledger.md`
+convention. This is a worker-artifact discipline, not a review mechanism —
+review stays the existing single Codex review trigger.)*
 
 #### Acceptance Criteria (EARS)
 
-- WHEN a story enters implementation for the first time, THE SYSTEM SHALL run a
-  `PLANNING` phase that produces a committed `plan.md` (goal, constraints,
-  assumptions, and an ordered, checkbox task list keyed to the story's
-  acceptance criteria) and an initial `ledger.md` (one row per task with status
-  `pending`), under a deterministic per-story plan directory on the story branch.
-- WHILE a story has a valid committed plan, THE SYSTEM SHALL NOT re-run planning
-  on resume; it SHALL read the ledger to locate the next `pending`/`in-progress`
-  task and continue there.
-- WHEN a worker completes or advances a task, THE SYSTEM SHALL require the worker
-  to update that task's ledger row (status, commit SHA, note) and write a
-  `task-<n>-report.md`, delivered atomically with the task's code change.
-- WHEN a worker resumes an existing plan AND the story's acceptance criteria have
-  changed since the plan was written, THE SYSTEM SHALL reconcile the plan
-  (append/adjust tasks) rather than trust a stale `done` ledger — a resume SHALL
-  re-validate the plan against current story state, never blindly skip planning
-  on an already-complete ledger. *(Field evidence: agentic-consumer issue #47 —
-  resume failed to reconcile a new requirement into an already-`done` ledger.)*
-- WHERE the ledger records a task transition to `done`, THE SYSTEM MAY treat
-  "a task advanced to done" as an additional objective progress signal for the
-  Progress Guard (Requirement 4), complementing "head advanced".
-- THE SYSTEM SHALL keep the controller free of task semantics: the worker authors
-  and updates the plan/ledger/reports; the controller only observes a cheap,
-  ledger-derived progress signal and never parses or schedules individual tasks
-  (the controller-bounds/worker-does-the-work contract is preserved).
-- **[DECISION REQUIRED]** Plan location (`docs/plans/<story>/` committed on the
-  story branch, recommended — visible in the PR and travels with the code) vs a
-  controller-private path under `state/`. Confirm during review.
-- **[DECISION REQUIRED]** Plan shape: N files (`task-1.md … task-n.md`) vs a
-  single `plan.md` with an ordered checklist plus one `ledger.md`. Recommended:
-  single `plan.md` + `ledger.md` + per-task reports (fewer files, easier diff).
+- WHEN a story enters implementation for the first time AND planning is enabled,
+  THE SYSTEM SHALL run a `PLANNING` phase that produces `plan.md` (goal,
+  constraints, ordered checkbox task list keyed to acceptance criteria) and
+  `ledger.md` (one row per task, status `pending`), committed on the story
+  branch when delivery is enabled.
+- WHILE a story has a valid committed plan, THE SYSTEM SHALL skip planning on
+  resume and continue at the next `pending`/`in-progress` task; validity SHALL
+  be judged from committed state only, and any parse ambiguity SHALL route to
+  the existing reconcile phase (fail closed) rather than silently re-planning.
+- WHEN a worker advances a task, THE SYSTEM SHALL require it to update that
+  task's ledger row (status, commit SHA, note) atomically with the code change.
+- WHEN a worker resumes an existing plan AND the acceptance criteria changed,
+  THE SYSTEM SHALL reconcile the plan (append/adjust tasks) rather than trust a
+  stale `done` ledger. *(Field evidence: agentic-consumer issue #47.)*
+- THE SYSTEM SHALL keep the controller free of task semantics: it reads only the
+  ledger status counts as a cheap progress signal (Requirement 10) and never
+  parses or schedules individual tasks; the worker authors all plan content.
+- WHERE delivery is disabled (dry-run or `allow_push:false`), THE SYSTEM SHALL
+  still allow the worker to write the plan in the working tree and SHALL NOT
+  treat an uncommitted plan as a blocker.
+- **[DECISION REQUIRED]** Plan default: ships config-gated OFF (current
+  DISCOVER→IMPLEMENT path preserved) until proven on a real dry-run.
 
-### Requirement 10: Robust worker execution contract (result, deadline, salvage)
+### Requirement 10: One progress counter (consolidate anti-loop mechanisms)
 
-**User Story:** As a maintainer of a bounded, resumable worker, I want the
-worker↔controller handoff to be machine-readable, deadline-aware, and
-salvageable on interruption, so that a phase result is parsed reliably, a worker
-knows its own wall-clock budget, and work is not silently lost when a phase is
-terminated.
-
-*(Motivation adapted from agentic-consumer: a structured `result.json` with a
-markdown fallback, an injected absolute deadline clock, and a shutdown-time
-salvage sequence. These harden the existing stdout-scraped result path and the
-deliver-then-CI/resume guarantees.)*
+**User Story:** As a maintainer, I want a single source of truth for
+"attempts-without-progress", so that the scattered, independently-reset counters
+(`reconciliation_attempts`, `max_resume_attempts`, `max_feedback_attempts`, and
+any planning/stall counter) can never disagree — the exact fragility Requirement
+3 targets.
 
 #### Acceptance Criteria (EARS)
 
-- WHEN a worker phase completes, THE SYSTEM SHALL prefer a machine-readable
-  result artifact (e.g. `state/result-<epic>.json` with `status`, `next_phase`,
-  `evidence`, `blocker`, `artifacts`, `fixed_threads`) and SHALL fall back to
-  parsing the existing `RESULT_*` stdout lines when the artifact is absent, so
-  behavior is backward compatible.
-- WHEN the controller launches a worker phase, THE SYSTEM SHALL make the phase's
-  absolute deadline available to the worker (start + deadline epoch), so the
-  worker can wrap up and persist its plan/ledger/result before the budget
-  expires rather than being killed mid-write.
-- WHEN a worker is terminated by budget or watchdog, THE SYSTEM SHALL attempt a
-  bounded salvage — persist the ledger/result and commit controller-owned
-  changes when delivery is enabled — before the phase is abandoned, and SHALL
-  fail closed (leave the working tree for reconciliation) if salvage cannot
-  complete. Salvage SHALL never merge, force-push, or bypass the merge gate.
-- THE SYSTEM SHALL keep the manual-merge gate, dry-run safety, and fail-closed
-  mutation flags unchanged across all three mechanisms.
-
-### Requirement 11: Autonomous workflow supervision and self-remediation
-
-**User Story:** As the operator of a fully autonomous system, I want a
-supervisory layer that continuously watches the end-to-end job, detects when the
-workflow is genuinely stuck, diagnoses the root cause with a dedicated Codex
-agent, and applies a bounded, whitelisted remediation — so that a run can never
-stall forever, yet the supervisor can never bypass the controller's safety
-authority.
-
-*(This generalizes the existing `RECONCILE (SUPERVISOR)` phase — today invoked
-reactively on a detected deviation — into a proactive, always-evaluated health
-monitor with an explicit diagnostic step. Precedent: agentic-consumer's
-read-only `diagnostic-orchestrator` agent. The diagnosis is free-form Codex
-reasoning; the ACTIONS are a small typed, gated set the controller applies,
-preserving "controller owns authority, Codex is a bounded worker".)*
-
-#### Acceptance Criteria (EARS)
-
-- WHILE a run is active, THE SYSTEM SHALL evaluate end-to-end health each tick
-  against explicit stuck signals (e.g. same head past the no-progress cap, phase
-  attempts exceeding a bound, ledger not advancing, repeated identical
-  BLOCKED/ERROR, heartbeat/lock recovery loops) using the Progress Guard's
-  objective progress definition (Requirement 4).
-- WHEN a stuck signal fires, THE SYSTEM SHALL dispatch a bounded, read-only
-  diagnostic Codex phase (`SUPERVISING`) that produces a root-cause analysis and
-  a single proposed remediation drawn only from a whitelisted set (reconcile
-  branch, reset a specific stuck control-substate, re-plan/re-plan-reconcile,
-  deliver-to-CI, park-and-advance, or terminal block).
-- WHEN the diagnostic proposes a remediation, THE SYSTEM SHALL apply it only
-  through the existing fail-closed decision applier (typed, evidence-required,
-  attempt-bounded); an out-of-whitelist, unevidenced, or over-budget proposal
-  SHALL be rejected and escalated to a durable BLOCKED/parked state, never
-  applied.
-- THE SYSTEM SHALL bound supervision itself: a configurable maximum number of
-  self-remediation attempts per head/story, after which the run parks or blocks
-  durably (never busy-loops, never dead-ends), consistent with Requirements 4
-  and 5.
-- THE SYSTEM SHALL NOT allow the supervisor or its agent to merge, force-push,
-  bypass the manual-merge gate, edit controller control-logic, or select work
-  outside the whitelisted remediations. Its diagnosis is read-only; its actions
-  are gated.
-- THE SYSTEM SHALL log every supervision decision with its stuck signal,
-  root-cause summary, chosen remediation, and reason code (Requirement 6), and
-  SHALL surface an escalation to the operator (one notification, if comments are
-  enabled) when it parks or blocks.
+- THE SYSTEM SHALL maintain exactly one per-head no-progress counter, owned by
+  the Progress Guard (Requirement 4); the reconcile, resume, feedback, and
+  planning caps SHALL be policies (thresholds) over that one counter, not their
+  own independent counters.
+- WHEN a head advances (progress per FR-4), THE SYSTEM SHALL reset that single
+  counter, and all dependent caps SHALL observe the reset without separate
+  bookkeeping.
+- WHERE proactive stall handling is needed, THE SYSTEM SHALL reuse the existing
+  reactive `RECONCILE` phase and its fail-closed, capped decision applier — no
+  new supervising phase, agent, or counter is introduced.
 
 ## Non-Functional Requirements
 
@@ -417,16 +339,9 @@ preserving "controller owns authority, Codex is a bounded worker".)*
    but drive them off the new progress signal).
 3. **FR-3 migration:** typed-state now vs a phased introduction (typed control
    substate first, full typed state later).
-4. **FR-9 plan location:** `docs/plans/<story>/` committed on the story branch
-   (recommended) vs a controller-private path under `state/`.
-5. **FR-9 plan shape:** N task files vs single `plan.md` + `ledger.md` +
-   per-task reports (recommended).
-6. **FR-9 default:** ships config-gated OFF (current DISCOVER→IMPLEMENT path
-   preserved) until the `PLANNING` phase is proven on a real dry-run.
-7. **FR-10 result artifact:** adopt `result-<epic>.json` now (with stdout
-   fallback) vs keep stdout-only parsing. Recommended: adopt with fallback.
-8. **FR-11 supervision autonomy:** confirm the whitelisted remediation set and
-   the max self-remediation attempts per head/story before terminal park/block.
-   Recommended: reuse the existing reconcile decision vocabulary + park-and-
-   advance; default the supervisor to diagnose-and-apply-gated (never
-   diagnose-only-notify), gated OFF until proven.
+4. **FR-9 plan:** ships config-gated OFF (current DISCOVER→IMPLEMENT path
+   preserved) until proven on a real dry-run. Plan committed on the story branch
+   as a single `plan.md` + `ledger.md` (no per-task report files).
+5. **FR-10 counters:** confirm collapsing `reconciliation_attempts`,
+   `max_resume_attempts`, `max_feedback_attempts`, and any planning cap into one
+   Progress-Guard-owned counter with per-policy thresholds.

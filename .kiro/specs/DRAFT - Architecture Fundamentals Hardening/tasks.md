@@ -30,11 +30,6 @@ flowchart LR
   S7 --> S8
   S8 --> S9[S9 Cleanup, docs, thresholds]
   S6 --> S10[S10 PLANNING phase + PlanLedger (config-gated)]
-  S7 --> S10
-  S5 --> S11[S11 WorkerSupervisor + worker contract]
-  S3 --> S11
-  S8 --> S12[S12 WorkflowSupervisor end-to-end health (config-gated)]
-  S7 --> S12
 ```
 
 ## Stories
@@ -53,14 +48,19 @@ flowchart LR
 - **Depends:** none · **Estimate:** 2 days
 
 ### S2 — Extract ProgressGuard (pure decision engine)
-- **Validates:** R4, R2
+- **Validates:** R4, R2, R10
 - **Description:** Move all anti-loop / progress / stall / terminal logic out of
   `reconcileAndExecute` into a pure `ProgressGuard` with `observe`/`decide` and
-  a `ProgressState` record; wire the orchestrator to call it. No behavior change.
+  a `ProgressState` record; wire the orchestrator to call it. Consolidate the
+  scattered counters (`reconciliation_attempts`, `max_resume_attempts`,
+  `max_feedback_attempts`) so they become thresholds over the guard's single
+  per-head counter, not independent counters (R10). No behavior change.
 - **Acceptance:**
   - [ ] `ProgressGuard` + `ProgressState` created; the scattered `stuck_head*`,
         `resume_*`, `feedback_attempts` control logic is removed from the
         orchestrator and delegated to the guard.
+  - [ ] Exactly one per-head no-progress counter exists; reconcile/resume/
+        feedback caps read it as thresholds (TS-13). No independent counters.
   - [ ] `ProgressGuardTest` (pure, no mocks) covers TS-1..TS-3 and every
         transition in the design state diagram.
   - [ ] Characterization suite (S1) still green (parity).
@@ -140,67 +140,30 @@ flowchart LR
   - [ ] No control-path method > ~80 lines; static-analysis gate added.
   - [ ] Decision logs include reason codes (TS-9); no repeated flood lines.
   - [ ] README + this spec reflect the final **core refactor** architecture
-        (S1–S8). The gated capabilities (S10 PLANNING, S11 WorkerSupervisor,
-        S12 WorkflowSupervisor) document themselves as they land.
+        (S1–S9). The gated PLANNING capability (S10) documents itself when it
+        lands.
 - **Depends:** S8 · **Estimate:** 2 days
 
 ### S10 — PLANNING phase + PlanLedger (config-gated)
 - **Validates:** R9
 - **Description:** Add a `PLANNING` phase and `prompts/plan.md` that commit a
-  `docs/plans/<story>/{plan.md,ledger.md}` on the story branch; extend
-  IMPLEMENT/FEEDBACK prompts to update the ledger + write `task-<n>-report.md`
-  per task. Add a thin `PlanLedgerReader` (status column only) and wire the
-  resume-skip gate into `WorkflowMachine`, the resume-reconciliation rule, and
-  an optional `tasksDoneAdvanced` progress input to `ProgressGuard`. Controller
-  stays free of task semantics. Gated by config defaulting to current
-  DISCOVER→IMPLEMENT behavior.
+  single `plan.md` + `ledger.md` on the story branch; extend IMPLEMENT/FEEDBACK
+  prompts to update the ledger atomically per task. Add a thin `PlanLedgerReader`
+  (reads committed ledger status only) and wire the resume-skip gate into
+  `WorkflowMachine` plus the resume-reconciliation rule. Fail closed to
+  `RECONCILE` on parse ambiguity. Controller stays free of task semantics. Gated
+  by config defaulting to current DISCOVER→IMPLEMENT behavior.
 - **Acceptance:**
-  - [ ] TS-11, TS-12, TS-13 pass; `PlanLedgerReader` unit-tested (pure, no mocks)
-        including malformed/empty/partial ledgers.
-  - [ ] Resume with a valid plan skips PLANNING; changed-AC resume reconciles
-        (does not trust stale `done` ledger).
-  - [ ] Default config preserves current behavior until enabled; controller
-        writes no plan files and parses no task bodies.
+  - [ ] TS-11, TS-12 pass; `PlanLedgerReader` unit-tested (pure, no mocks)
+        including malformed/empty/partial ledgers → route to RECONCILE.
+  - [ ] Resume with a valid committed plan skips PLANNING; changed-AC resume
+        reconciles (does not trust stale `done` ledger).
+  - [ ] Delivery-disabled (dry-run/`allow_push:false`) never treats an
+        uncommitted plan as a blocker.
+  - [ ] Default config preserves current behavior; controller writes no plan
+        files and parses no task bodies.
   - [ ] Full suite + `installDist` green; README + this spec document the phase.
-- **Depends:** S6, S7 · **Estimate:** 3 days · **[DECISION REQUIRED before start]**
-
-### S11 — WorkerSupervisor + worker execution contract
-- **Validates:** R10, R2
-- **Description:** Extract the inlined worker-execution + heartbeat slice from
-  the dispatcher into a `WorkerSupervisor` returning a typed `WorkerResult`. Add
-  the structured `result-<epic>.json` artifact (with `RESULT_*` stdout fallback),
-  the deadline handoff file, and a bounded salvage on budget/watchdog
-  termination. `CodexRunner`/`WorkflowLock`/`Controller` monitoring roles
-  unchanged.
-- **Acceptance:**
-  - [ ] `WorkerSupervisor` unit-tested; `WorkerResult` parsing covers artifact
-        and stdout-fallback paths (TS-14).
-  - [ ] Salvage persists ledger/result + commits controller-owned changes when
-        delivery enabled, else fails closed; never merges/force-pushes (TS-15).
-  - [ ] `reconcileAndExecute` no longer contains worker-run/heartbeat plumbing.
-  - [ ] Characterization suite still green; manual-merge gate/dry-run unchanged.
-- **Depends:** S3, S5 · **Estimate:** 3 days
-
-### S12 — WorkflowSupervisor (end-to-end health + self-remediation, config-gated)
-- **Validates:** R11
-- **Description:** Add a `WorkflowSupervisor` that detects stuck signals (pure,
-  reusing ProgressGuard's progress definition), dispatches a read-only
-  `SUPERVISING` Codex phase (`prompts/supervise.md`) for root-cause + one
-  whitelisted remediation, and applies it ONLY via the existing fail-closed
-  `StateRecovery.applyReconciliationDecision`. Bounded by
-  `max_supervision_attempts` → park/block. Gated OFF by default (current reactive
-  reconcile behavior preserved).
-- **Acceptance:**
-  - [ ] `WorkflowSupervisor.detect` unit-tested (pure) for every StuckSignal;
-        remediation dispatch + application covered (TS-16).
-  - [ ] Out-of-whitelist/unevidenced/over-budget proposals are rejected and
-        escalate to durable BLOCKED/park; no busy-loop (TS-17).
-  - [ ] Cannot merge, force-push, bypass the gate, or edit control logic;
-        decisions logged with signal + root-cause + reason code (R6).
-  - [ ] Default config preserves current behavior; full suite + `installDist`
-        green.
-  - [ ] README + this spec document the SUPERVISING phase and its config flags.
-- **Depends:** S6, S7, S8 · **Estimate:** 4 days · **[DECISION REQUIRED before start]**
+- **Depends:** S6 · **Estimate:** 3 days · **[DECISION REQUIRED before start]**
 
 ## Summary
 
@@ -215,14 +178,12 @@ flowchart LR
 | S7 | Offline E2E harness | S2,S5 | 3d |
 | S8 | Park-and-advance (gated) | S6,S7 | 3d |
 | S9 | Cleanup/thresholds/docs | S8 | 2d |
-| S10 | PLANNING phase + PlanLedger (gated) | S6,S7 | 3d |
-| S11 | WorkerSupervisor + worker contract | S3,S5 | 3d |
-| S12 | WorkflowSupervisor end-to-end (gated) | S6,S7,S8 | 4d |
+| S10 | PLANNING phase + PlanLedger (gated) | S6 | 3d |
 
-**Total: ~35 days.** Highest-value, lowest-risk first: S1 (safety net) → S2
-(the component that broke repeatedly). S8 is the only behavior *change*, and
-S8, S10, and S12 are config-gated and decision-gated (default off, current
-behavior preserved). S11 (WorkerSupervisor) is behavior-preserving extraction.
+**Total: ~28 days.** Highest-value, lowest-risk first: S1 (safety net) → S2
+(the component that broke repeatedly; S2 also consolidates the counters, R10).
+S8 and S10 are the only behavior additions — both config-gated and
+decision-gated (default off, current behavior preserved).
 
 ## Notes
 

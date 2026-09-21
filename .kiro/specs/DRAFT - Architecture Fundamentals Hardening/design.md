@@ -15,10 +15,11 @@ anti-loop / progress / terminal decisions into a single pure component (the
 thin dispatcher plus per-phase handlers over a **typed workflow state**.
 
 The refactor is behavior-preserving and incremental (characterize → extract →
-verify parity per step). Three additive, config-gated capabilities are layered
-on the refactored seams and default off: a PLANNING phase with a durable
-plan/ledger (C6), a per-phase WorkerSupervisor with a hardened worker contract
-(C7), and an end-to-end WorkflowSupervisor with bounded self-remediation (C8).
+verify parity per step). One additive, config-gated capability is layered on the
+refactored seams and defaults off: a PLANNING phase with a durable plan/ledger
+(C6). A single Progress-Guard-owned counter consolidates all anti-loop caps
+(C7). No new supervisor components or agents are introduced — proactive stall
+handling reuses the existing reactive `RECONCILE` phase.
 
 ## Current architecture (as-is, from code)
 
@@ -58,12 +59,6 @@ flowchart TD
   PL --> PG
   H1 & H2 & H3 & H4 & H5 & H6 --> WS
   H2 & H3 --> PG
-  Disp --> WSup[WorkerSupervisor<br/>drive+monitor one phase — Req 10]
-  WSup --> Cx0[CodexRunner]
-  WSup --> WR[(result-epic.json<br/>+ deadline handoff)]
-  Disp --> WFSup[WorkflowSupervisor<br/>end-to-end health + SUPERVISING — Req 11]
-  WFSup --> PG
-  WFSup --> SR[StateRecovery<br/>fail-closed gated remediation]
   Disp --> GH[GitHub] & Git[GitOperations] & Cx[CodexRunner] & Rv[ReviewCoordinator]
   WS <--> St[(StateStore)]
 ```
@@ -71,10 +66,8 @@ flowchart TD
 Each handler is small, receives the typed `WorkflowState` + injected
 collaborators, returns a `PhaseOutcome` (next state + side-effect intents). The
 dispatcher applies transitions declared by the state machine. Anti-loop
-decisions live only in `ProgressGuard`. The `PLANNING` phase and `PlanLedger`
-(Requirement 9, C6), the `WorkerSupervisor` + worker contract (Requirement 10,
-C7), and the `WorkflowSupervisor` end-to-end health layer (Requirement 11, C8)
-are config-gated and default off.
+decisions live only in `ProgressGuard` (one counter, C7). The `PLANNING` phase
+and `PlanLedger` (Requirement 9, C6) are config-gated and default off.
 
 ## Components
 
@@ -172,145 +165,66 @@ skip-dedupe, GitHub read gating, merge gate remain as today.
 
 ### C6. PLANNING phase + PlanLedger — Requirement 9
 
-Adds a durable, resumable plan discipline adapted from agentic-consumer's
-`docs/plans/<id>/` convention (plan.md + ledger.md + per-task reports), scoped
-to the Codex/cron/SQLite model. **This is a worker-artifact discipline, not a
-review mechanism** — code review stays the existing single Codex review trigger.
+Adds a durable, resumable plan discipline, simplified from agentic-consumer's
+convention. **Worker-artifact discipline, not a review mechanism.**
 
-New phase in the state machine (config-gated, default off):
+New phase (config-gated, default off):
 
 ```
 SELECT_STORY → PLANNING → IMPLEMENTING → VERIFYING → ...
-                  ↑ skipped when a valid plan already exists (resume)
+                  ↑ skipped when a valid committed plan exists (resume)
 ```
 
-- `PLANNING` dispatches a new `prompts/plan.md`. The worker reads the story +
-  acceptance criteria, decomposes it into an ordered task list, and commits a
-  plan directory on the story branch:
+- `PLANNING` dispatches `prompts/plan.md`. The worker decomposes the story and
+  commits, on the story branch, a single `plan.md` (goal, constraints, ordered
+  `[ ]` tasks → AC) and `ledger.md` (per-task `status | commit | note`). No
+  per-task report files — the ledger note column carries that.
+- `IMPLEMENTING`/`FIXING_FEEDBACK` prompts are extended to: read the ledger,
+  work the next `pending`/`in-progress` task, update its ledger row atomically
+  with the code change.
 
-  ```
-  docs/plans/<story>/
-    ├── plan.md          # goal, constraints, assumptions, ordered [ ] tasks → AC
-    ├── ledger.md        # per-task: status | commit | note  (+ Resume instructions)
-    └── task-<n>-report.md   # written as each task completes
-  ```
-
-- `IMPLEMENTING`/`FIXING_FEEDBACK` prompts are extended to require: read the
-  ledger, work the next `pending`/`in-progress` task, update its ledger row and
-  write `task-<n>-report.md`, delivered atomically with the code change.
-
-Controller-side support is deliberately thin (preserves the
-controller-bounds/worker-does-the-work contract):
+Controller-side support is deliberately thin and reads committed state only:
 
 ```java
-// Pure, no task semantics — only a cheap durable progress signal.
-record PlanLedger(int totalTasks, int doneTasks, int inProgressTasks,
-                  String planDir, boolean present, boolean valid) {}
+record PlanLedger(int totalTasks, int doneTasks, boolean present, boolean valid) {}
 
 final class PlanLedgerReader {
-    // Parses ledger.md status column only; never schedules or parses task bodies.
-    PlanLedger read(Path storyPlanDir);
-    boolean hasValidPlan(Path storyPlanDir);   // gate: skip PLANNING on resume
+    // Reads ledger.md status column from the checked-out story branch only.
+    // Never schedules or parses task bodies.
+    PlanLedger read(Path storyBranchRoot);
+    boolean hasValidPlan(Path storyBranchRoot);   // committed state only
 }
 ```
 
 - **Resume gate:** `WorkflowMachine` (C4) routes `SELECT_STORY → PLANNING` only
   when `hasValidPlan` is false; otherwise straight to `IMPLEMENTING`.
-- **Resume reconciliation (Req 9, agentic-consumer #47):** the plan prompt must
-  re-validate the plan against current acceptance criteria and APPEND/adjust
-  tasks rather than trust a stale `done` ledger — never blindly skip planning on
-  a complete ledger when the story's criteria changed.
-- **Progress signal:** `ProgressGuard` (C2) gains an optional
-  `tasksDoneAdvanced` input (from `PlanLedger.doneTasks` delta) so "a task
-  advanced to done" counts as progress alongside "head advanced" — improving the
-  progress definition in Requirement 4 without changing its core logic.
-- **State:** `WorkflowState` (C1) gains `planDir` + last-observed `PlanLedger`
+- **Fail closed:** any ledger parse ambiguity → route to the existing `RECONCILE`
+  phase (never a silent re-plan, which could loop).
+- **Resume reconciliation (Req 9, agentic-consumer #47):** the plan prompt
+  re-validates against current AC and APPENDs/adjusts tasks rather than trusting
+  a stale `done` ledger.
+- **Delivery-disabled safety:** under dry-run / `allow_push:false` the worker may
+  write the plan in the working tree; an uncommitted plan is never a blocker.
+- **State:** `WorkflowState` (C1) gains only a boolean `hasPlan`/last `PlanLedger`
   snapshot (story-scoped; cleared by `clearStoryScoped()`).
 
-The controller never writes plan files and never parses task bodies; it reads
-only the ledger status column via `PlanLedgerReader`.
+The controller never writes plan files and never parses task bodies.
 
-### C7. WorkerSupervisor + worker execution contract — Requirement 10
+### C7. One progress counter — Requirement 10
 
-Extracts the inlined worker-execution + heartbeat slice from the god-method
-(orchestrator lines ~905-970 today) into a dedicated component, and hardens the
-worker↔controller handoff. Per-phase scope.
+Collapses the scattered anti-loop counters into a single Progress-Guard-owned
+counter (the direct robustness win; this *removes* code):
 
-```java
-record WorkerResult(
-    String status,        // SUCCESS | BLOCKED | FAILED
-    String nextPhase,
-    String evidence,      // COMPLETE | DEFERRED_TO_CI | ...
-    String blocker,
-    List<Artifact> artifacts,
-    List<String> fixedThreads,
-    int exitCode,
-    long elapsedMs
-) {}
-
-final class WorkerSupervisor {
-    // Render prompt → startJob → build heartbeat → codexRunner.run(deadline) →
-    // read result artifact (fallback: parse RESULT_* stdout) → finishJob.
-    WorkerResult runPhase(WorkflowState state, PhaseSpec phase);
-}
-```
-
-- **Structured result (FR-10):** the worker writes `state/result-<epic>.json`
-  (`status/next_phase/evidence/blocker/artifacts/fixed_threads`); the supervisor
-  prefers it and falls back to the existing `RESULT_*` stdout scrape when absent
-  (backward compatible).
-- **Deadline handoff (FR-10):** the supervisor writes the phase's start/deadline
-  epoch where the worker can read it (e.g. `state/deadline-<epic>`), so Codex can
-  wrap up and persist plan/ledger/result before the budget kill.
-- **Salvage (FR-10):** on budget/watchdog termination, a bounded salvage
-  persists the ledger/result and commits controller-owned changes when delivery
-  is enabled, then fails closed (leaves the tree for reconciliation). Never
-  merges, force-pushes, or bypasses the gate.
-- Relationship to monitoring engines: `CodexRunner` still owns the in-phase
-  process read/timeout loop and `WorkflowLock`/`Controller` still own cross-tick
-  liveness/watchdog — the supervisor wires them, it does not replace them.
-
-### C8. WorkflowSupervisor (end-to-end health + self-remediation) — Requirement 11
-
-The higher, cross-tick layer. Generalizes today's reactive
-`RECONCILE (SUPERVISOR)` phase into a proactive health monitor with an explicit
-diagnostic step, wired to the existing fail-closed decision applier.
-
-```java
-enum StuckSignal { NONE, SAME_HEAD_NO_PROGRESS, PHASE_ATTEMPTS_EXCEEDED,
-                   LEDGER_NOT_ADVANCING, REPEATED_TERMINAL, RECOVERY_LOOP }
-
-record SupervisionInput(ProgressState progress, PlanLedger ledger,
-                        int phaseAttempts, String currentHead,
-                        RecoveryState recovery, SupervisionCaps caps) {}
-
-final class WorkflowSupervisor {
-    StuckSignal detect(SupervisionInput in);      // pure; uses ProgressGuard's progress def
-    // When stuck: dispatch read-only SUPERVISING (diagnose) → whitelisted remediation.
-    // The remediation is applied ONLY via StateRecovery.applyReconciliationDecision
-    // (typed, evidence-required, attempt-bounded, fail-closed).
-}
-```
-
-- **Detection** is pure and reuses `ProgressGuard`'s objective progress
-  definition (Req 4) — no new anti-loop policy is invented here.
-- **Diagnosis** is a new read-only `SUPERVISING` phase (`prompts/supervise.md`),
-  building on `reconcile.md`'s existing decision vocabulary. Codex reasons
-  freely over evidence (phases, heads, ledger, worker reports, logs) and returns
-  exactly one whitelisted `DECISION_ACTION` + evidence.
-- **Remediation whitelist** = the existing reconcile actions
-  (`RESUME_*`, `PROCESS_FEEDBACK`, `BLOCK_*`) plus `DELIVER_TO_CI`,
-  `PARK_AND_ADVANCE`, `REPLAN`. Applied only through
-  `StateRecovery.applyReconciliationDecision` (already fail-closed and
-  attempt-bounded); anything else is rejected and escalated.
-- **Bounded supervision:** a `max_supervision_attempts` cap per head/story;
-  exceeding it parks (Req 5) or blocks durably — never busy-loops, never
-  dead-ends.
-- **Authority preserved:** the supervisor and its agent cannot merge,
-  force-push, bypass the manual-merge gate, edit control logic, or act outside
-  the whitelist. Diagnosis read-only; actions gated.
-- Config-gated, default off; when off, the current reactive reconcile behavior
-  is unchanged.
+- Today five mechanisms independently count "attempts without progress"
+  (`ProgressGuard`, `reconciliation_attempts`, `max_resume_attempts`,
+  `max_feedback_attempts`, and any planning cap). They can disagree — the
+  Requirement 3 fragility.
+- Target: `ProgressGuard.ProgressState` holds the one per-head counter. The
+  reconcile / resume / feedback / planning caps become *thresholds* read against
+  it, not separate counters with their own reset rules.
+- No new supervising phase, agent, or counter. Proactive stall handling = when
+  `ProgressGuard.decide` returns `TERMINAL_BLOCK`/`PARK`, route to the existing
+  fail-closed `RECONCILE` phase (already capped at 3 attempts).
 
 ## Data model / migration — Requirement 3
 
@@ -375,27 +289,11 @@ final class WorkflowSupervisor {
 - **TS-12 (Validates R9, agentic-consumer #47):** *Given* an already-`done`
   ledger AND the story's acceptance criteria changed, *When* a resume runs,
   *Then* the plan is reconciled (a task is appended/adjusted) rather than the
-  stale `done` ledger being trusted — planning is not blindly skipped.
-- **TS-13 (Validates R9/R4):** *Given* a ledger task transitions `pending → done`
-  on the same head, *When* `ProgressGuard.observe` runs with `tasksDoneAdvanced`,
-  *Then* it counts as progress and no-progress counters reset.
-- **TS-14 (Validates R10):** *Given* a worker writes `result-<epic>.json`, *When*
-  the phase completes, *Then* the supervisor parses it; *and Given* the artifact
-  is absent, *Then* it falls back to the `RESULT_*` stdout lines identically.
-- **TS-15 (Validates R10):** *Given* a phase is terminated at its deadline with a
-  dirty tree and delivery enabled, *When* salvage runs, *Then* the ledger/result
-  is persisted and controller-owned changes are committed; *and Given* delivery
-  disabled, *Then* the tree is left for reconciliation (fail closed) with no
-  merge/force-push.
-- **TS-16 (Validates R11):** *Given* a same-head no-progress stall past the cap,
-  *When* the supervisor runs, *Then* it emits a `StuckSignal`, dispatches a
-  read-only `SUPERVISING` phase, and applies exactly one whitelisted remediation
-  via the fail-closed applier.
-- **TS-17 (Validates R11):** *Given* the diagnostic returns an out-of-whitelist
-  or unevidenced action, *When* applied, *Then* it is rejected and the run
-  escalates to a durable BLOCKED/parked state (never applied, never busy-loops);
-  *and Given* supervision attempts exceed `max_supervision_attempts`, *Then* the
-  run parks/blocks durably.
+  stale `done` ledger being trusted; *and Given* a malformed ledger, *Then* the
+  run routes to `RECONCILE` (fail closed), never a silent re-plan loop.
+- **TS-13 (Validates R10):** *Given* a head advances, *When* the counter resets,
+  *Then* the reconcile/resume/feedback/planning caps all observe the reset from
+  the single Progress-Guard counter (no independent counter disagrees).
 
 ## Sequencing (high level)
 
@@ -405,13 +303,9 @@ final class WorkflowSupervisor {
 4. Extract phase handlers + WorkflowMachine →
 5. E2E harness →
 6. Optional FR-5 park-and-advance (config-gated).
-7. Optional FR-9 PLANNING phase + PlanLedger (config-gated) — layered last, on
-   top of the WorkflowMachine (C4) and ProgressGuard (C2) seams; default off.
-8. FR-10 WorkerSupervisor + worker contract — extract worker execution from the
-   dispatcher (pairs with step 4); result artifact + deadline + salvage.
-9. Optional FR-11 WorkflowSupervisor (config-gated) — built on ProgressGuard
-   (C2) detection + StateRecovery (existing fail-closed applier); default off,
-   diagnosis read-only, actions whitelisted.
+7. FR-10 counter consolidation (folded into the ProgressGuard extraction, S2) +
+   optional FR-9 PLANNING phase + PlanLedger (config-gated, default off), layered
+   last on the WorkflowMachine (C4) seam.
 
 ## Risks and mitigations
 
@@ -421,9 +315,12 @@ final class WorkflowSupervisor {
 - **Scope creep into features** → explicitly out of scope (requirements).
 - **Big-bang temptation** → enforced incremental steps, each independently
   green.
-- **Self-remediation agent overreach (R11)** → the WorkflowSupervisor's Codex
-  diagnosis is read-only and its actions are a small whitelist applied only via
-  the existing fail-closed, evidence-required, attempt-bounded
-  `StateRecovery.applyReconciliationDecision`; it can never merge, force-push,
-  bypass the merge gate, edit control logic, or busy-loop. Bounded by
-  `max_supervision_attempts` → park/block. Config-gated, default off.
+- **Counter fragility (R10)** → exactly one per-head no-progress counter owned by
+  ProgressGuard; all caps are thresholds over it. No component keeps its own
+  counter, so counters cannot disagree.
+- **Plan-parse loop (R9)** → `hasValidPlan` reads committed state only and any
+  ambiguity routes to the existing fail-closed `RECONCILE`; the plan is never
+  silently re-generated.
+- **Repo/state growth (scalability)** → the plan is a single `plan.md` +
+  `ledger.md` per story (not N files); the events journal and parked-story map
+  are bounded by log-housekeeping.
