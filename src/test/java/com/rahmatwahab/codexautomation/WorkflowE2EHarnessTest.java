@@ -30,7 +30,7 @@ class WorkflowE2EHarnessTest {
     }
 
     /** Mutable fake whose PR head advances and a thread resolves each tick. */
-    private static final class EvolvingGitHub extends GitHub {
+    private static class EvolvingGitHub extends GitHub {
         int round = 0;
         final List<String> resolved = new ArrayList<>();
 
@@ -173,5 +173,78 @@ class WorkflowE2EHarnessTest {
                     .as("tick %d must not dead-end in a hard block", tick)
                     .isNotIn("BLOCKED_EXTERNAL", "CONFLICT_DETECTED");
         }
+    }
+
+    @Test
+    void terminalStoryIsParkedAndControllerAdvances(@TempDir Path root) throws Exception {
+        // R7 stall/terminal/park scenario: a story already marked terminally
+        // UNRECOVERABLE on its head, with park-and-advance enabled, must be
+        // parked (recorded with head/reason) and the controller must advance to
+        // IDLE so the next tick selects a different story — never dead-end.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        Path prompts = root.resolve("prompts");
+        Files.createDirectories(prompts);
+        Files.writeString(prompts.resolve("common.md"), "COMMON");
+        Files.writeString(prompts.resolve("feedback.md"), "{{COMMON}}\nFix.");
+        Files.writeString(prompts.resolve("reconcile.md"), "{{COMMON}}\nReconcile.");
+        Files.createDirectories(root.resolve("state"));
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", false, "max_feedback_attempts", 3),
+                "budgets", map(),
+                "workflow", map("allow_push", true, "allow_comments", false,
+                        "terminal_policy", "park_and_advance"));
+
+        EvolvingGitHub github = new EvolvingGitHub() {
+            @Override public Object prs() {
+                return new ArrayList<>(); // no PRs: skip PR-scoped + wait-gate
+            }
+        };
+        github.round = 5;
+        CodexRunner codex = new CodexRunner(Map.of(), System::nanoTime) {
+            @Override
+            public CodexResult run(Map<String, Object> cfg, Path prompt, Path r, boolean dry,
+                                   Runnable hb, Integer timeout) {
+                return new CodexResult(0, "RESULT_STATUS: SUCCESS\nRESULT_NEXT_PHASE: FIXING_FEEDBACK\n"
+                        + "RESULT_BLOCKER: NONE\nRESULT_EVIDENCE: COMPLETE\n");
+            }
+        };
+        GitOperations.GitRunner gitRunner = (r, args) -> new GitOperations.GitResult(0, "", "");
+        Controller.GitOperationsFactory gitFactory = new Controller.GitOperationsFactory(repo) {
+            @Override public GitOperations create() {
+                return new GitOperations(repo, gitRunner);
+            }
+        };
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #52", "url", "http://x/27");
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        Map<String, Object> state = store.load();
+        state.put("current_story", 52);
+        state.put("branch", "story/52-x");
+        state.put("phase", "FIXING_FEEDBACK");
+        // Head already determined terminally unrecoverable.
+        state.put("stuck_head", "head5");
+        state.put("stuck_head_reason", "UNRECOVERABLE");
+
+        WorkflowLock lock = WorkflowLock.acquire(
+                root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+        WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                config, state, store, github, repo, root, epic, 27, false,
+                gitFactory, codex, new ReviewCoordinator(), lock);
+        orchestrator.reconcileAndExecute(new ArrayList<>(), null);
+        lock.release();
+
+        Map<String, Object> after = store.load();
+        // Story 52 is parked on head5, and the controller advanced to IDLE.
+        assertThat(ParkPolicy.parkedStoryNumbers(after)).contains(52);
+        assertThat(ParkPolicy.parkedHead(after, 52)).isEqualTo("head5");
+        assertThat(Engine.asString(after.get("phase"))).isEqualTo("IDLE");
+        assertThat(after.get("current_story")).isNull();
     }
 }
