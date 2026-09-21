@@ -143,6 +143,20 @@ public final class ProgressGuard {
     }
 
     /**
+     * The single reconcile-failure cap: after this many consecutive failed or
+     * blocking reconciliation decisions the run is escalated to a durable block.
+     * Kept here so every anti-loop threshold lives in one owner (Requirement 10),
+     * even though the reconcile counter measures a different axis (consecutive
+     * reconcile failures) than the per-head no-progress counter.
+     */
+    public static final int RECONCILE_CAP = 3;
+
+    /** Whether the consecutive-reconcile-failure count has reached the cap. */
+    public static boolean reconcileCapReached(int attempts) {
+        return attempts >= RECONCILE_CAP;
+    }
+
+    /**
      * Result of the per-finding feedback guard: the (possibly migrated) guard
      * key, the attempt count for it, and whether the cap is exceeded.
      */

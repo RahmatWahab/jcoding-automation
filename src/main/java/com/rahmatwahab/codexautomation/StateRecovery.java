@@ -164,7 +164,7 @@ public final class StateRecovery {
         int attempts = intValue(state.getOrDefault("reconciliation_attempts", 0));
         if (action.equals("BLOCK_REQUIREMENTS") || action.equals("BLOCK_EXTERNAL")) {
             attempts += 1;
-            if (attempts >= 3) {
+            if (ProgressGuard.reconcileCapReached(attempts)) {
                 state.put("phase", "BLOCKED_EXTERNAL");
                 state.put("reconciliation_attempts", attempts);
                 state.put("error", "reconciliation selected blocking action three consecutive times");

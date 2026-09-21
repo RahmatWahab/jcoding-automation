@@ -1487,7 +1487,7 @@ final class WorkflowOrchestrator {
             state.put("reconciliation_attempts", attempts);
             state.put("error", outcome.detail());
             state.put("decision_rejection", outcome.detail());
-            if (attempts >= 3) {
+            if (ProgressGuard.reconcileCapReached(attempts)) {
                 state.put("phase", "BLOCKED_EXTERNAL");
                 state.put("error", "reconciliation failed three consecutive times; manual intervention required");
             }

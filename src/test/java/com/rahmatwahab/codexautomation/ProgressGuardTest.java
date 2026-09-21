@@ -96,6 +96,17 @@ class ProgressGuardTest {
     }
 
     @Test
+    void reconcileCapPolicyIsCentralizedAtThree() {
+        // R10: the reconcile-failure threshold lives in one owner. Below the cap
+        // the run continues; at/after the cap it escalates.
+        assertThat(ProgressGuard.reconcileCapReached(0)).isFalse();
+        assertThat(ProgressGuard.reconcileCapReached(2)).isFalse();
+        assertThat(ProgressGuard.reconcileCapReached(3)).isTrue();
+        assertThat(ProgressGuard.reconcileCapReached(4)).isTrue();
+        assertThat(ProgressGuard.RECONCILE_CAP).isEqualTo(3);
+    }
+
+    @Test
     void feedbackGuardIncrementsOnSameFindingAndResetsOnChange() {
         // Same head:finding increments the feedback attempt count; a different
         // finding (or head) rebaselines to 1.
