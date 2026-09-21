@@ -1096,81 +1096,63 @@ final class WorkflowOrchestrator {
             String reconcileHead = currentPr == null
                     ? "" : Engine.asString(currentPr.get("headRefOid"));
             boolean forceDelivery = false;
+            // Single source of truth for the resume anti-loop counters
+            // (Requirements 4 & 10): ProgressGuard owns the same-head consecutive
+            // guard and the cumulative per-story guard, including the reset rules
+            // (progress = resolved-thread increase; head movement alone is not
+            // progress — the PR #187 field case). The outcome is mirrored back
+            // into the legacy state keys so persistence and the reset sites
+            // elsewhere remain behavior-identical.
+            int maxResume = (int) Engine.asLongOrDefault(
+                    automation.get("max_resume_attempts"), 3);
+            int loopMultiplier = Math.max(1, (int) Engine.asLongOrDefault(
+                    automation.get("resume_loop_multiplier"), 4));
+            String currentStoryKey = current == null ? "" : String.valueOf(current);
+            int resolvedNow = resolvedThreadCount();
+            int resolvedAtReset = (int) Engine.asLongOrDefault(
+                    state.get("resume_total_resolved_baseline"), 0);
+            ProgressGuard.ProgressState priorProgress = new ProgressGuard.ProgressState(
+                    Engine.asString(state.get("resume_guard_head")),
+                    (int) Engine.asLongOrDefault(state.get("resume_attempts"), 0),
+                    Engine.asString(state.get("resume_total_story")),
+                    (int) Engine.asLongOrDefault(state.get("resume_total_attempts"), 0),
+                    resolvedAtReset);
+            ProgressGuard.GuardOutcome guard = ProgressGuard.observe(priorProgress,
+                    new ProgressGuard.GuardInput(resumeAction, reconcileHead, currentStoryKey,
+                            resolvedNow, maxResume, loopMultiplier));
+            ProgressGuard.ProgressState progress = guard.state();
             if (resumeAction) {
-                String guardHead = Engine.asString(state.get("resume_guard_head"));
-                int resumeAttempts;
-                if (!reconcileHead.isEmpty() && reconcileHead.equals(guardHead)) {
-                    resumeAttempts = (int) Engine.asLongOrDefault(state.get("resume_attempts"), 0) + 1;
+                // Mirror same-head guard.
+                if (progress.sameHeadGuardHead().isEmpty()) {
+                    state.remove("resume_guard_head");
                 } else {
-                    resumeAttempts = 1;
-                    state.put("resume_guard_head", reconcileHead);
+                    state.put("resume_guard_head", progress.sameHeadGuardHead());
                 }
-                state.put("resume_attempts", resumeAttempts);
-                int maxResume = (int) Engine.asLongOrDefault(
-                        automation.get("max_resume_attempts"), 3);
-
-                // Cumulative, head-independent guard: count every resume for the
-                // active story. Reset only on a story change, not a head change.
-                // Cumulative, head-independent guard: count every resume for the
-                // active story. It resets on a story change AND on GENUINE
-                // PROGRESS — i.e. a review thread has been resolved since the
-                // counter last reset. A healthy PR advancing through review
-                // (fix -> resolve thread -> new finding -> fix) makes real
-                // progress every round and therefore never trips this cap; only
-                // a genuine no-progress spin (no threads resolved across the
-                // whole window) accrues to the cap. Field evidence: PR #187
-                // legitimately went through ~40 heads and ~200 thread
-                // resolutions, yet the old story-only reset falsely declared it
-                // UNRECOVERABLE. Progress is the correct reset signal, not merely
-                // head movement (a trivial head bump with no resolution is not
-                // progress) and not the local worktree state (committed work
-                // leaves a clean worktree).
-                String totalGuardStory = Engine.asString(state.get("resume_total_story"));
-                String currentStoryKey = current == null ? "" : String.valueOf(current);
-                int resolvedNow = resolvedThreadCount();
-                int resolvedAtReset = (int) Engine.asLongOrDefault(
-                        state.get("resume_total_resolved_baseline"), 0);
+                state.put("resume_attempts", progress.sameHeadAttempts());
+                // Mirror cumulative guard, logging a reset the same way as before.
                 boolean madeProgress = resolvedNow > resolvedAtReset;
-                int totalResumeAttempts;
-                if (!currentStoryKey.isEmpty() && currentStoryKey.equals(totalGuardStory)
-                        && !madeProgress) {
-                    totalResumeAttempts =
-                            (int) Engine.asLongOrDefault(state.get("resume_total_attempts"), 0) + 1;
-                } else {
-                    // New story, or the worker resolved at least one thread since
-                    // the counter last reset — treat as fresh, and rebaseline the
-                    // resolved-thread watermark so future progress keeps resetting.
-                    totalResumeAttempts = 1;
-                    state.put("resume_total_story", currentStoryKey);
-                    state.put("resume_total_resolved_baseline", resolvedNow);
-                    if (madeProgress) {
-                        log.info("PROGRESS: story #{} resolved {} review thread(s) (was {}); "
-                                + "resetting cumulative resume guard — the PR is advancing",
-                                current, resolvedNow, resolvedAtReset);
-                    }
+                boolean rebaselined = progress.cumulativeAttempts() == 1
+                        && !currentStoryKey.equals(Engine.asString(state.get("resume_total_story")))
+                        || (madeProgress && progress.cumulativeAttempts() == 1);
+                state.put("resume_total_story", progress.cumulativeStory());
+                state.put("resume_total_resolved_baseline", progress.resolvedBaseline());
+                state.put("resume_total_attempts", progress.cumulativeAttempts());
+                if (madeProgress && progress.cumulativeAttempts() == 1) {
+                    log.info("PROGRESS: story #{} resolved {} review thread(s) (was {}); "
+                            + "resetting cumulative resume guard — the PR is advancing",
+                            current, resolvedNow, resolvedAtReset);
                 }
-                state.put("resume_total_attempts", totalResumeAttempts);
-                int loopMultiplier = Math.max(1, (int) Engine.asLongOrDefault(
-                        automation.get("resume_loop_multiplier"), 4));
-                int maxTotalResume = maxResume * loopMultiplier;
-
-                if (resumeAttempts > maxResume) {
-                    // Autonomous delivery: stop resuming, commit what exists, and
-                    // let CI validate. Never block waiting for a human.
-                    forceDelivery = true;
+                forceDelivery = guard.forceDelivery();
+                if (forceDelivery && progress.sameHeadAttempts() > maxResume) {
                     log.info("AUTO-DELIVER: reconciliation resumed PR head {} {} times without "
                             + "advancing; delivering controller-owned changes and deferring "
-                            + "validation to CI", shortSha(reconcileHead), resumeAttempts);
-                } else if (totalResumeAttempts > maxTotalResume) {
-                    // Cumulative cap reached: the story keeps resuming (even with
-                    // an advancing head) without converging. Force the same
-                    // autonomous delivery/abort path so a story can never loop
-                    // unbounded.
-                    forceDelivery = true;
+                            + "validation to CI", shortSha(reconcileHead), progress.sameHeadAttempts());
+                } else if (forceDelivery) {
                     log.info("AUTO-DELIVER: story #{} accumulated {} resume decisions "
                             + "(cap {}); the head keeps advancing without converging, "
                             + "delivering controller-owned changes and deferring "
-                            + "validation to CI", current, totalResumeAttempts, maxTotalResume);
+                            + "validation to CI", current, progress.cumulativeAttempts(),
+                            guard.maxTotalResume());
                 }
             } else {
                 // A non-resume decision (e.g. WAIT_FOR_CI, BLOCK_*) clears the
