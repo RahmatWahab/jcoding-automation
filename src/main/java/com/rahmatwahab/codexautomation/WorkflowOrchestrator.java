@@ -271,88 +271,10 @@ final class WorkflowOrchestrator {
                 int feedbackAttempts = fb.attempts();
                 state.put("feedback_attempts", feedbackAttempts);
                 if (fb.capExceeded()) {
-                    // Fully autonomous: do not dead-end at "manual review". After
-                    // the feedback cap on an unchanging head, if the worker has
-                    // produced deliverable changes, commit them, auto-resolve
-                    // the open threads, and defer to CI. If there is NOTHING to
-                    // deliver (clean worktree, head unchanged — the worker could
-                    // not produce a fix), do not fake-resolve unfixed findings;
-                    // route once to the reasoning supervisor for a bounded
-                    // decision instead of soft-looping.
-                    if (!dryRun && Engine.asBool(workflow.get("allow_push"), false)) {
-                        GitOperations fbGit = gitFactory.create();
-                        try {
-                            fbGit.checkoutStoryBranch(Engine.asString(state.get("branch")));
-                        } catch (RuntimeException exc) {
-                            log.error("FEEDBACK AUTO-DELIVER: checkout failed: {}", exc.getMessage());
-                        }
-                        boolean hasDeliverableChanges;
-                        try {
-                            hasDeliverableChanges =
-                                    fbGit.classifyWorktree(state) != GitOperations.WorktreeState.CLEAN;
-                        } catch (RuntimeException exc) {
-                            hasDeliverableChanges = false;
-                        }
-                        if (hasDeliverableChanges) {
-                            log.info("FEEDBACK AUTO-DELIVER: PR #{} head {} reprocessed {} times; "
-                                    + "delivering worker changes and deferring to CI",
-                                    currentPr.get("number"), shortSha(head), feedbackAttempts);
-                            state.put("phase", "WAITING_FOR_CI");
-                            state.put("result_status", "SUCCESS");
-                            state.put("result_evidence", "DEFERRED_TO_CI");
-                            state.put("delivery_mode", "CI_DEFERRED");
-                            state.remove("feedback_guard_key");
-                            state.remove("feedback_attempts");
-                            state.remove("error");
-                            save();
-                            int deliveryResult = runDeliveryPipeline(
-                                    fbGit, current, currentPr, "", new ArrayList<>(activeFeedback), false);
-                            state.put("run_finished_at", Controller.now());
-                            save();
-                            log.info("FEEDBACK AUTO-DELIVER COMPLETE: PR #{} phase={}",
-                                    currentPr.get("number"), state.get("phase"));
-                            return PrScopedResult.exit(deliveryResult == Integer.MIN_VALUE ? 0 : deliveryResult);
-                        }
-                        // Nothing to deliver: the worker cannot fix the findings.
-                        // Route to the reasoning supervisor via the existing
-                        // pending-reconcile mechanism (kept below), rather than
-                        // resolving unfixed threads or spinning.
-                        state.put("phase", "BLOCKED_REQUIREMENTS");
-                        state.put("feedback_reconcile_pending", true);
-                        state.put("error", "Feedback for PR #" + currentPr.get("number")
-                                + " head " + shortSha(head) + " reprocessed " + feedbackAttempts
-                                + " times and the worker produced no deliverable fix; escalating "
-                                + "to the reasoning supervisor.");
-                        state.remove("feedback_guard_key");
-                        state.remove("feedback_attempts");
-                        save();
-                        log.info("FEEDBACK ESCALATION: PR #{} no deliverable fix after {} attempts; "
-                                + "routing to supervisor", currentPr.get("number"), feedbackAttempts);
-                        // fall through: feedback_reconcile_pending keeps
-                        // BLOCKED_REQUIREMENTS, and the deviation supervisor
-                        // routes it to reconcile.
-                    } else {
-                        // Simulation (dry-run) or push disabled: record and stop
-                        // without pretending to deliver. Mark this head as
-                        // terminally stuck and clear the guard counters so the
-                        // controller does NOT re-enter feedback and re-increment
-                        // the attempt count on every subsequent cron tick — that
-                        // produced an unbounded "reprocessed N times" BLOCKED loop
-                        // in dry-run. A genuinely new head clears stuck_head and
-                        // allows a fresh attempt; a human/CI change is required
-                        // to advance this one.
-                        state.put("phase", "BLOCKED_EXTERNAL");
-                        state.put("stuck_head", head);
-                        state.put("stuck_head_reason", "DELIVERY_DISABLED");
-                        state.remove("feedback_guard_key");
-                        state.remove("feedback_attempts");
-                        state.put("error", "Feedback for PR #" + currentPr.get("number")
-                                + " head " + shortSha(head) + " was reprocessed " + feedbackAttempts
-                                + " times without resolution and delivery is disabled (dry_run or "
-                                + "allow_push=false)");
-                        save();
-                        log.error("BLOCKED: " + state.get("error"));
-                        return PrScopedResult.exit(1);
+                    PrScopedResult cap = handleFeedbackCapExceeded(
+                            current, currentPr, head, feedbackAttempts, activeFeedback);
+                    if (cap != null) {
+                        return cap;
                     }
                 }
                 }
@@ -1398,6 +1320,83 @@ final class WorkflowOrchestrator {
      * {@code null} to continue the feedback path. Behavior-identical to the
      * former inline block.
      */
+    /**
+     * Handle the feedback attempt cap being exceeded on an unchanging head
+     * (Requirement 2): auto-deliver committed work to CI when deliverable,
+     * escalate to the reasoning supervisor when nothing is deliverable (returns
+     * {@code null} to continue into the pending-reconcile path), or mark the
+     * head terminally stuck when delivery is disabled. Behavior-identical to the
+     * former inline block.
+     */
+    private PrScopedResult handleFeedbackCapExceeded(Integer current, Map<String, Object> currentPr,
+                                                     String head, int feedbackAttempts,
+                                                     List<Map<String, Object>> activeFeedback) {
+        if (!dryRun && Engine.asBool(workflow.get("allow_push"), false)) {
+            GitOperations fbGit = gitFactory.create();
+            try {
+                fbGit.checkoutStoryBranch(Engine.asString(state.get("branch")));
+            } catch (RuntimeException exc) {
+                log.error("FEEDBACK AUTO-DELIVER: checkout failed: {}", exc.getMessage());
+            }
+            boolean hasDeliverableChanges;
+            try {
+                hasDeliverableChanges =
+                        fbGit.classifyWorktree(state) != GitOperations.WorktreeState.CLEAN;
+            } catch (RuntimeException exc) {
+                hasDeliverableChanges = false;
+            }
+            if (hasDeliverableChanges) {
+                log.info("FEEDBACK AUTO-DELIVER: PR #{} head {} reprocessed {} times; "
+                        + "delivering worker changes and deferring to CI",
+                        currentPr.get("number"), shortSha(head), feedbackAttempts);
+                state.put("phase", "WAITING_FOR_CI");
+                state.put("result_status", "SUCCESS");
+                state.put("result_evidence", "DEFERRED_TO_CI");
+                state.put("delivery_mode", "CI_DEFERRED");
+                state.remove("feedback_guard_key");
+                state.remove("feedback_attempts");
+                state.remove("error");
+                save();
+                int deliveryResult = runDeliveryPipeline(
+                        fbGit, current, currentPr, "", new ArrayList<>(activeFeedback), false);
+                state.put("run_finished_at", Controller.now());
+                save();
+                log.info("FEEDBACK AUTO-DELIVER COMPLETE: PR #{} phase={}",
+                        currentPr.get("number"), state.get("phase"));
+                return PrScopedResult.exit(deliveryResult == Integer.MIN_VALUE ? 0 : deliveryResult);
+            }
+            // Nothing to deliver: escalate via the pending-reconcile mechanism.
+            // Return null so the caller continues (feedback_reconcile_pending
+            // keeps BLOCKED_REQUIREMENTS and the deviation supervisor routes it).
+            state.put("phase", "BLOCKED_REQUIREMENTS");
+            state.put("feedback_reconcile_pending", true);
+            state.put("error", "Feedback for PR #" + currentPr.get("number")
+                    + " head " + shortSha(head) + " reprocessed " + feedbackAttempts
+                    + " times and the worker produced no deliverable fix; escalating "
+                    + "to the reasoning supervisor.");
+            state.remove("feedback_guard_key");
+            state.remove("feedback_attempts");
+            save();
+            log.info("FEEDBACK ESCALATION: PR #{} no deliverable fix after {} attempts; "
+                    + "routing to supervisor", currentPr.get("number"), feedbackAttempts);
+            return null;
+        }
+        // Simulation (dry-run) or push disabled: mark terminally stuck and stop
+        // so the controller does not re-enter feedback every tick.
+        state.put("phase", "BLOCKED_EXTERNAL");
+        state.put("stuck_head", head);
+        state.put("stuck_head_reason", "DELIVERY_DISABLED");
+        state.remove("feedback_guard_key");
+        state.remove("feedback_attempts");
+        state.put("error", "Feedback for PR #" + currentPr.get("number")
+                + " head " + shortSha(head) + " was reprocessed " + feedbackAttempts
+                + " times without resolution and delivery is disabled (dry_run or "
+                + "allow_push=false)");
+        save();
+        log.error("BLOCKED: " + state.get("error"));
+        return PrScopedResult.exit(1);
+    }
+
     private PrScopedResult handleStuckHeadForFeedback(Map<String, Object> currentPr, String head,
                                                       boolean legacyPrLevelFindingState,
                                                       Map<String, Object> activeFinding,
