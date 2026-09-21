@@ -143,16 +143,9 @@ public final class Controller {
      * workflow dispatch table (default: implement.md).
      */
     public static String phasePromptFor(String phase) {
-        return switch (phase == null ? "" : phase) {
-            case "CHANGES_REQUESTED", "FIXING_FEEDBACK" -> "prompts/feedback.md";
-            case "VERIFYING" -> "prompts/verify.md";
-            case "REVIEWING_CODE" -> "prompts/review.md";
-            case "BLOCKED_REQUIREMENTS", "BLOCKED_REPOSITORY",
-                 "FAILED_RECOVERABLE", "CODEX_FAILURE" -> "prompts/reconcile.md";
-            case "READY_TO_MERGE" -> "prompts/final-review.md";
-            case "IDLE" -> "prompts/discover.md";
-            default -> "prompts/implement.md";
-        };
+        // The authoritative phase → prompt mapping lives in WorkflowMachine
+        // (Requirement 1); this delegates so there is one source of truth.
+        return WorkflowMachine.promptFor(phase);
     }
 
     /** Command-line options for the controller entry point. */
