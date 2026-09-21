@@ -102,9 +102,10 @@ public final class WorkflowMachine {
         // Reconciliation and blocked/recoverable phases resume any active phase
         // or move to a waiting/terminal phase.
         for (String recover : Set.of("RECONCILING", "BLOCKED_REQUIREMENTS",
-                "BLOCKED_REPOSITORY", "FAILED_RECOVERABLE", "CODEX_FAILURE",
+                "BLOCKED_REPOSITORY", "BLOCKED_EXTERNAL", "BLOCKED_CONFIGURATION",
+                "FAILED_RECOVERABLE", "CODEX_FAILURE",
                 "CONFLICT_DETECTED")) {
-            m.put(recover, union(anyActive, waitingOrTerminal));
+            m.put(recover, union(anyActive, waitingOrTerminal, Set.of("IDLE", "EPIC_COMPLETE")));
         }
         // Idle selects a story and begins implementation (or planning), or completes the EPIC.
         m.put("IDLE", union(anyActive, Set.of("PLANNING", "EPIC_COMPLETE", "IDLE", "BLOCKED_REQUIREMENTS")));

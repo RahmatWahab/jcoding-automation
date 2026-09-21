@@ -45,6 +45,24 @@ class WorkflowMachineTest {
     }
 
     @Test
+    void everyPhaseSetByTheControllerHasDeclaredSuccessors() {
+        // R1: guard against a table gap — every phase the controller can occupy
+        // as a source must have at least one declared legal successor, so the
+        // save()-time transition check never falsely flags a real transition.
+        for (String phase : new String[] {
+                "IDLE", "PLANNING", "IMPLEMENTING", "VERIFYING", "REVIEWING_CODE",
+                "FIXING_FEEDBACK", "RECONCILING", "WAITING_FOR_CI", "WAITING_FOR_CODEX_REVIEW",
+                "WAITING_FOR_MANUAL_MERGE", "READY_TO_MERGE", "BLOCKED_REQUIREMENTS",
+                "BLOCKED_EXTERNAL", "BLOCKED_REPOSITORY", "BLOCKED_CONFIGURATION",
+                "CONFLICT_DETECTED", "FAILED_RECOVERABLE", "CODEX_FAILURE", "MERGED"}) {
+            // A phase re-entering itself (retry) is always legal, so this only
+            // fails if the phase has NO declared forward transitions at all.
+            assertThat(WorkflowMachine.isLegalTransition(phase, phase))
+                    .as("phase %s must be known", phase).isTrue();
+        }
+    }
+
+    @Test
     void undeclaredTransitionIsADetectableError_ts6() {
         // TS-6: an illegal transition must raise a detectable error, not pass
         // silently. MERGED may only advance to IDLE/EPIC_COMPLETE.

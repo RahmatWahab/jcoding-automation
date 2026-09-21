@@ -64,6 +64,18 @@ final class WorkflowOrchestrator {
     }
 
     private void save() {
+        // R1 transition enforcement: an undeclared phase transition is surfaced
+        // as a detectable event, not silent behavior. It is logged (not thrown)
+        // so a table gap can never destabilize the live control path; the
+        // WorkflowMachine table is the authority the WARN is checked against.
+        String newPhase = Engine.asString(state.get("phase"));
+        String lastPhase = Engine.asString(state.get("last_persisted_phase"));
+        if (!lastPhase.isEmpty() && !newPhase.isEmpty()
+                && !WorkflowMachine.isLegalTransition(lastPhase, newPhase)) {
+            log.warn("ILLEGAL_TRANSITION: undeclared phase transition {} -> {} "
+                    + "(not in the WorkflowMachine table)", lastPhase, newPhase);
+        }
+        state.put("last_persisted_phase", newPhase);
         store.save(state);
     }
 
