@@ -220,84 +220,10 @@ final class WorkflowOrchestrator {
                 // it and let the normal live feedback path run. Only a genuinely
                 // new deliverable fix clears it in the non-delivering case.
                 boolean deliveringMode = !dryRun && Engine.asBool(workflow.get("allow_push"), false);
-                if (head.equals(Engine.asString(state.get("stuck_head")))) {
-                    String stuckReason = Engine.asString(state.get("stuck_head_reason"));
-                    if ("UNRECOVERABLE".equals(stuckReason)) {
-                        boolean legacyMarker = legacyPrLevelFindingState
-                                || Engine.asString(state.get("stuck_finding_key")).isEmpty();
-                        if (legacyMarker) {
-                            // The old controller stored an unrecoverable marker
-                            // for the entire PR head. The finding queue makes
-                            // that marker obsolete: migrate it once and let
-                            // each unresolved finding receive its own bounded
-                            // execution/checkpoint.
-                            state.remove("stuck_head");
-                            state.remove("stuck_head_reason");
-                            state.remove("feedback_guard_head");
-                            state.remove("feedback_guard_key");
-                            state.remove("feedback_attempts");
-                            // The legacy PR-level block may have left the
-                            // global phase watchdog exhausted. Once the
-                            // marker is migrated, the finding queue owns
-                            // progress and the next feedback attempt must get
-                            // a fresh phase budget.
-                            state.put("phase_attempt", 0);
-                            state.remove("deviation_code");
-                            state.remove("deviation_detail");
-                            log.info("STUCK-HEAD MIGRATED: replacing legacy PR-level marker "
-                                    + "with per-finding feedback checkpoints");
-                        } else if (activeFinding != null
-                                && !Engine.asString(state.get("stuck_finding_key")).isEmpty()
-                                && !ReviewFindingQueue.key(activeFinding).equals(
-                                        Engine.asString(state.get("stuck_finding_key")))) {
-                            // A different finding is now active. The old
-                            // finding remains blocked, but it must not suppress
-                            // independent review work on the same PR head.
-                            state.remove("stuck_head");
-                            state.remove("stuck_head_reason");
-                            state.remove("stuck_finding_key");
-                            log.info("STUCK-FINDING BYPASSED: continuing with independent "
-                                    + "review finding on head {}", shortSha(head));
-                        } else {
-                            // This specific finding is terminal, but it must
-                            // not be retried on every cron tick.
-                            state.put("phase", "BLOCKED_EXTERNAL");
-                            save();
-                            log.info("BLOCKED (terminal): PR #{} finding {} on head {} is unrecoverable; "
-                                            + "holding until the finding or head changes",
-                                    currentPr.get("number"),
-                                    activeFinding == null ? "all-findings"
-                                            : ReviewFindingQueue.key(activeFinding), shortSha(head));
-                            return PrScopedResult.exit(1);
-                        }
-                    }
-                    if (deliveringMode) {
-                        log.info("STUCK-HEAD CLEARED: delivery is enabled for head {}; "
-                                + "resuming the normal feedback path", shortSha(head));
-                        state.remove("stuck_head");
-                        state.remove("stuck_head_reason");
-                    } else {
-                        boolean newFix = false;
-                        try {
-                            newFix = gitFactory.create().classifyWorktree(state)
-                                    != GitOperations.WorktreeState.CLEAN;
-                        } catch (RuntimeException ignored) {
-                            newFix = false;
-                        }
-                        if (newFix) {
-                            log.info("STUCK-HEAD CLEARED: deliverable changes present for head {}; "
-                                    + "allowing a fresh feedback attempt", shortSha(head));
-                            state.remove("stuck_head");
-                            state.remove("stuck_head_reason");
-                        } else {
-                            state.put("phase", "BLOCKED_EXTERNAL");
-                            save();
-                            log.info("BLOCKED (terminal): PR #{} head {} feedback remains unresolved "
-                                    + "and delivery is disabled; awaiting a new head or operator action",
-                                    currentPr.get("number"), shortSha(head));
-                            return PrScopedResult.exit(1);
-                        }
-                    }
+                PrScopedResult stuck = handleStuckHeadForFeedback(
+                        currentPr, head, legacyPrLevelFindingState, activeFinding, deliveringMode);
+                if (stuck != null) {
+                    return stuck;
                 }
 
                 // Respect the worker's verdict: if the previous FIXING_FEEDBACK
@@ -1464,6 +1390,86 @@ final class WorkflowOrchestrator {
      * a non-null exit code when the run must end here, or {@code null} to
      * proceed. Behavior-identical to the former inline preamble.
      */
+    /**
+     * Handle a feedback head that carries a stuck-head marker (Requirement 2):
+     * migrate a legacy PR-level marker, bypass a blocked finding for independent
+     * work, clear the marker when delivery is enabled or a new fix exists, or
+     * hold terminally. Returns a non-null PrScopedResult to end the run, or
+     * {@code null} to continue the feedback path. Behavior-identical to the
+     * former inline block.
+     */
+    private PrScopedResult handleStuckHeadForFeedback(Map<String, Object> currentPr, String head,
+                                                      boolean legacyPrLevelFindingState,
+                                                      Map<String, Object> activeFinding,
+                                                      boolean deliveringMode) {
+        if (!head.equals(Engine.asString(state.get("stuck_head")))) {
+            return null;
+        }
+        String stuckReason = Engine.asString(state.get("stuck_head_reason"));
+        if ("UNRECOVERABLE".equals(stuckReason)) {
+            boolean legacyMarker = legacyPrLevelFindingState
+                    || Engine.asString(state.get("stuck_finding_key")).isEmpty();
+            if (legacyMarker) {
+                state.remove("stuck_head");
+                state.remove("stuck_head_reason");
+                state.remove("feedback_guard_head");
+                state.remove("feedback_guard_key");
+                state.remove("feedback_attempts");
+                state.put("phase_attempt", 0);
+                state.remove("deviation_code");
+                state.remove("deviation_detail");
+                log.info("STUCK-HEAD MIGRATED: replacing legacy PR-level marker "
+                        + "with per-finding feedback checkpoints");
+            } else if (activeFinding != null
+                    && !Engine.asString(state.get("stuck_finding_key")).isEmpty()
+                    && !ReviewFindingQueue.key(activeFinding).equals(
+                            Engine.asString(state.get("stuck_finding_key")))) {
+                state.remove("stuck_head");
+                state.remove("stuck_head_reason");
+                state.remove("stuck_finding_key");
+                log.info("STUCK-FINDING BYPASSED: continuing with independent "
+                        + "review finding on head {}", shortSha(head));
+            } else {
+                state.put("phase", "BLOCKED_EXTERNAL");
+                save();
+                log.info("BLOCKED (terminal): PR #{} finding {} on head {} is unrecoverable; "
+                                + "holding until the finding or head changes",
+                        currentPr.get("number"),
+                        activeFinding == null ? "all-findings"
+                                : ReviewFindingQueue.key(activeFinding), shortSha(head));
+                return PrScopedResult.exit(1);
+            }
+        }
+        if (deliveringMode) {
+            log.info("STUCK-HEAD CLEARED: delivery is enabled for head {}; "
+                    + "resuming the normal feedback path", shortSha(head));
+            state.remove("stuck_head");
+            state.remove("stuck_head_reason");
+        } else {
+            boolean newFix = false;
+            try {
+                newFix = gitFactory.create().classifyWorktree(state)
+                        != GitOperations.WorktreeState.CLEAN;
+            } catch (RuntimeException ignored) {
+                newFix = false;
+            }
+            if (newFix) {
+                log.info("STUCK-HEAD CLEARED: deliverable changes present for head {}; "
+                        + "allowing a fresh feedback attempt", shortSha(head));
+                state.remove("stuck_head");
+                state.remove("stuck_head_reason");
+            } else {
+                state.put("phase", "BLOCKED_EXTERNAL");
+                save();
+                log.info("BLOCKED (terminal): PR #{} head {} feedback remains unresolved "
+                        + "and delivery is disabled; awaiting a new head or operator action",
+                        currentPr.get("number"), shortSha(head));
+                return PrScopedResult.exit(1);
+            }
+        }
+        return null;
+    }
+
     /**
      * Apply the reconcile-worker decision (Requirement 2): accept/reject the
      * bounded decision, run the ProgressGuard resume anti-loop, and perform the
