@@ -420,7 +420,8 @@ final class WorkflowOrchestrator {
                 state.put("review_gate_head", currentPr.get("headRefOid"));
                 state.put("next_action", "WAIT_FOR_CODEX_REVIEW");
                 save();
-                log.info("WAITING: story #" + current + ", phase=WAITING_FOR_CODEX_REVIEW");
+                logStableState("WAIT_CODEX|" + current + "|" + shortSha(currentPr.get("headRefOid")),
+                        "WAITING: story #{}, phase=WAITING_FOR_CODEX_REVIEW", current);
                 return 0;
             }
             // The gate has closed for this head; record the connector review.
@@ -454,7 +455,8 @@ final class WorkflowOrchestrator {
                 Engine.Deviation stopDeviation = Engine.detectDeviation(state, currentPr, maxAttempts);
                 if (stopDeviation == null || !stopDeviation.recoverable()) {
                     save();
-                    log.info("STOPPED: story #" + current + ", phase=" + state.get("phase"));
+                    logStableState("STOPPED|" + current + "|" + state.get("phase"),
+                            "STOPPED: story #{}, phase={}", current, state.get("phase"));
                     return 1;
                 }
                 log.info("STOP DEFERRED: story #{} phase={} — escalating to supervisor",
@@ -493,7 +495,8 @@ final class WorkflowOrchestrator {
                 // Leave the terminal marker in place. detectDeviation returns no
                 // deviation for this head, so the controller holds it blocked
                 // quietly until the head changes or an operator intervenes.
-                log.info("STUCK-HEAD TERMINAL: PR head {} is unrecoverable by the automated worker; "
+                logStableState("STUCK_TERMINAL|" + shortSha(state.get("stuck_head")),
+                        "STUCK-HEAD TERMINAL: PR head {} is unrecoverable by the automated worker; "
                         + "holding blocked until the head advances or an operator acts",
                         shortSha(state.get("stuck_head")));
             } else if (!dryRun && Engine.asBool(workflow.get("allow_push"), false)) {
@@ -1648,7 +1651,11 @@ final class WorkflowOrchestrator {
             }
         }
         save();
-        log.info("WAITING: story #{} phase={} reason={} reviewDecision={} ciChecks={} head={}",
+        String waitSignature = "WAIT|" + state.get("phase") + "|"
+                + shortSha(currentPr.get("headRefOid")) + "|"
+                + Engine.asString(currentPr.get("reviewDecision"));
+        logStableState(waitSignature,
+                "WAITING: story #{} phase={} reason={} reviewDecision={} ciChecks={} head={}",
                 current, state.get("phase"), waitReason(state.get("phase"), currentPr),
                 Engine.asString(currentPr.get("reviewDecision")),
                 Engine.asList(currentPr.get("statusCheckRollup")).size(),
@@ -1704,6 +1711,35 @@ final class WorkflowOrchestrator {
             }
         }
         return completed;
+    }
+
+    /**
+     * Log a stable waiting/terminal state without flooding (Requirement 6).
+     * A given {@code signature} logs at INFO the first time it is seen and at
+     * DEBUG on every subsequent identical tick, so a run that sits in the same
+     * waiting/terminal state does not emit an identical INFO line each cron
+     * tick. The last-logged signature is stored durably (per-EPIC, reset with
+     * story-scoped state) so dedupe survives restarts. Any change to the phase,
+     * head, or counters produces a new signature and logs at INFO again.
+     */
+    private void logStableState(String signature, String message, Object... args) {
+        String previous = Engine.asString(state.get("last_stable_log_signature"));
+        if (isRepeatStableLog(previous, signature)) {
+            log.debug(message, args);
+        } else {
+            log.info(message, args);
+            state.put("last_stable_log_signature", signature);
+        }
+    }
+
+    /**
+     * Pure dedupe decision (Requirement 6): a non-empty signature identical to
+     * the previously-logged one is a repeat (suppress to DEBUG); anything else
+     * (first sight, changed phase/head/counters, or empty) logs at INFO.
+     */
+    static boolean isRepeatStableLog(String previousSignature, String currentSignature) {
+        return currentSignature != null && !currentSignature.isEmpty()
+                && currentSignature.equals(previousSignature);
     }
 
     private Map<String, Object> findRecordedPr(List<Map<String, Object>> prs, Map<String, Object> fallback) {

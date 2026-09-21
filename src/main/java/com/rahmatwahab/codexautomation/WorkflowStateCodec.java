@@ -48,7 +48,8 @@ public final class WorkflowStateCodec {
             "blockers", "error", "raw_error", "message",
             "decision_action", "decision_reason", "decision_rejection",
             "blocker_class", "recovery_action", "reconciliation_attempts",
-            "phase_attempt", "phase_started_at", "thread_updates");
+            "phase_attempt", "phase_started_at", "thread_updates",
+            "last_stable_log_signature");
 
     /**
      * Typed view of the control-relevant substate. Immutable value carrier read
