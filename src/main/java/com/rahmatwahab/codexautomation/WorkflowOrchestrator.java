@@ -1122,21 +1122,11 @@ final class WorkflowOrchestrator {
                             resolvedNow, maxResume, loopMultiplier));
             ProgressGuard.ProgressState progress = guard.state();
             if (resumeAction) {
-                // Mirror same-head guard.
-                if (progress.sameHeadGuardHead().isEmpty()) {
-                    state.remove("resume_guard_head");
-                } else {
-                    state.put("resume_guard_head", progress.sameHeadGuardHead());
-                }
-                state.put("resume_attempts", progress.sameHeadAttempts());
-                // Mirror cumulative guard, logging a reset the same way as before.
+                // Mirror the guard's counters back into the durable keys via the
+                // single codec authority (Requirement 3), logging a reset the
+                // same way as before.
                 boolean madeProgress = resolvedNow > resolvedAtReset;
-                boolean rebaselined = progress.cumulativeAttempts() == 1
-                        && !currentStoryKey.equals(Engine.asString(state.get("resume_total_story")))
-                        || (madeProgress && progress.cumulativeAttempts() == 1);
-                state.put("resume_total_story", progress.cumulativeStory());
-                state.put("resume_total_resolved_baseline", progress.resolvedBaseline());
-                state.put("resume_total_attempts", progress.cumulativeAttempts());
+                WorkflowStateCodec.writeProgress(state, progress);
                 if (madeProgress && progress.cumulativeAttempts() == 1) {
                     log.info("PROGRESS: story #{} resolved {} review thread(s) (was {}); "
                             + "resetting cumulative resume guard — the PR is advancing",
@@ -1656,27 +1646,10 @@ final class WorkflowOrchestrator {
         // reasoning about (and having to dismiss) stale story-47 recovery
         // metadata while story-180 was active; that cross-story contamination
         // is eliminated here. Loop guards especially must reset so a fresh
-        // story never inherits another story's resume/feedback counters.
-        for (String key : List.of(
-                "worktree_recovery", "worktree_baseline", "base_branch",
-                "resume_guard_head", "resume_attempts",
-                "resume_total_story", "resume_total_attempts",
-                "resume_total_resolved_baseline",
-                "feedback_guard_head", "feedback_guard_key", "feedback_attempts",
-                "last_feedback_result", "last_feedback_result_head",
-                "stuck_head", "stuck_head_reason",
-                "stuck_finding_key",
-                "feedback_reconcile_pending",
-                "last_processed_commit", "last_connector_review_commit",
-                "last_review_trigger_commit", "review_trigger_pending",
-                "delivery_mode", "result_status", "result_evidence",
-                "worker_result_status", "worker_result_evidence",
-                "blockers", "error", "raw_error", "message",
-                "decision_action", "decision_reason", "decision_rejection",
-                "blocker_class", "recovery_action", "reconciliation_attempts",
-                "phase_attempt", "phase_started_at", "thread_updates")) {
-            state.remove(key);
-        }
+        // story never inherits another story's resume/feedback counters. The
+        // authoritative key set and this single reset live in WorkflowStateCodec
+        // (Requirement 3): one mutation point, no duplicated reset lists.
+        WorkflowStateCodec.clearStoryScoped(state);
     }
 
     private Integer phaseBudget(String executionPhase) {
