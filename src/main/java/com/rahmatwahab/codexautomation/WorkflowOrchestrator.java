@@ -482,6 +482,40 @@ final class WorkflowOrchestrator {
         // and proposes a bounded recovery; the controller validates and applies
         // it. This is the single, general mechanism that replaces per-case
         // patches — "if the controller sees anything incorrect, think and fix".
+        // Generic deviation supervisor (Requirement 2): detect any deviation/
+        // stall and either recover deterministically (returning an exit code) or
+        // route to the reasoning reconcile prompt.
+        DeviationResult deviationResult = runDeviationSupervisor(current, currentPr, forcedPrompt);
+        if (deviationResult.exitCode() != null) {
+            return deviationResult.exitCode();
+        }
+        forcedPrompt = deviationResult.forcedPrompt();
+
+        // Phase dispatch: render the prompt and run the bounded worker, then
+        // apply the result / reconcile decision / delivery (Requirement 2:
+        // worker-phase handler). reconcileAndExecute is now a thin dispatcher.
+        return runWorkerPhase(current, currentPr, feedbackToResolve, forcedPrompt);
+    }
+
+    /** Result of the deviation supervisor: non-null exitCode ends the run. */
+    private record DeviationResult(Integer exitCode, String forcedPrompt) {
+        static DeviationResult exit(int code) {
+            return new DeviationResult(code, null);
+        }
+        static DeviationResult proceed(String forcedPrompt) {
+            return new DeviationResult(null, forcedPrompt);
+        }
+    }
+
+    /**
+     * Generic deviation supervisor (Requirement 2): stale stuck-head handling
+     * (incl. park-and-advance), deterministic COMMITTED_NO_PR recovery, and
+     * escalation to the reconcile prompt. Behavior-identical to the former
+     * inline block. Returns a carrier: a non-null exit code ends the run,
+     * otherwise the (possibly forced) prompt flows onward.
+     */
+    private DeviationResult runDeviationSupervisor(Integer current, Map<String, Object> currentPr,
+                                                   String forcedPrompt) {
         int maxPhaseAttempts = (int) Engine.asLongOrDefault(
                 automation.get("max_phase_attempts"), 5);
         // A prior terminal stuck_head marker must not suppress a genuinely new
@@ -530,7 +564,7 @@ final class WorkflowOrchestrator {
                 state.put("current_pr", null);
                 state.put("phase", "IDLE");
                 save();
-                return 0;
+                return DeviationResult.exit(0);
             }
             if (unrecoverable) {
                 // Leave the terminal marker in place. detectDeviation returns no
@@ -600,7 +634,7 @@ final class WorkflowOrchestrator {
                     log.error("SUPERVISOR RECOVERY DID NOT CREATE A PR: story #{} phase={} error={}",
                             current, state.get("phase"), state.get("error"));
                 }
-                return deliveryResult == Integer.MIN_VALUE ? 0 : deliveryResult;
+                return DeviationResult.exit(deliveryResult == Integer.MIN_VALUE ? 0 : deliveryResult);
             }
 
             // Otherwise escalate to the reasoning supervisor (reconcile.md),
@@ -611,11 +645,7 @@ final class WorkflowOrchestrator {
             log.info("SUPERVISOR ESCALATION: routing deviation {} to reasoning reconcile",
                     deviation.code());
         }
-
-        // Phase dispatch: render the prompt and run the bounded worker, then
-        // apply the result / reconcile decision / delivery (Requirement 2:
-        // worker-phase handler). reconcileAndExecute is now a thin dispatcher.
-        return runWorkerPhase(current, currentPr, feedbackToResolve, forcedPrompt);
+        return DeviationResult.proceed(forcedPrompt);
     }
 
     /**
