@@ -1484,14 +1484,29 @@ class WorkflowOrchestratorIntegrationTest {
         WorkflowLock lock = WorkflowLock.acquire(
                 root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
         DeliveryGitHub github = new DeliveryGitHub(prSnapshot);
+        // Stub the worker: after the legacy stuck_head marker is migrated, the
+        // controller dispatches the unresolved finding. The worker returns a
+        // structured SUCCESS (exit 0) so the run reports actionable work (code
+        // 1) — this test verifies the MIGRATION, not a real binary's exit code.
+        CodexRunner codex = new CodexRunner(Map.of(), System::nanoTime) {
+            @Override
+            public CodexResult run(Map<String, Object> cfg, Path prompt, Path r, boolean dry,
+                                   Runnable hb, Integer timeout) {
+                return new CodexResult(0,
+                        "RESULT_STATUS: SUCCESS\nRESULT_NEXT_PHASE: FIXING_FEEDBACK\n"
+                        + "RESULT_BLOCKER: NONE\nRESULT_EVIDENCE: COMPLETE\n");
+            }
+        };
         WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
                 config, state, store, github, repo, root, epic, 27, false,
-                gitFactory, new CodexRunner(), new ReviewCoordinator(), lock);
+                gitFactory, codex, new ReviewCoordinator(), lock);
         int code = orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
         lock.release();
 
-        // The old PR-level marker is cleared before dispatching the finding.
-        assertThat(code).isEqualTo(1);
+        // Migration succeeds and the unresolved finding is resumed: the worker
+        // is dispatched and returns SUCCESS (exit 0). The substantive assertions
+        // are the migrated state below (legacy marker cleared, finding active).
+        assertThat(code).isEqualTo(0);
         Map<String, Object> after = store.load();
         assertThat(after.get("stuck_head")).isNull();
         assertThat(after.get("stuck_head_reason")).isNull();
