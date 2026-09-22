@@ -1485,6 +1485,37 @@ final class WorkflowOrchestrator {
     }
 
     /**
+     * Terminally stick the current PR head after the consecutive
+     * reconcile-failure/rejection cap is reached. Setting {@code stuck_head} to
+     * the current head makes {@link Engine#detectDeviation} return {@code null}
+     * for this head on the next cron cycle, so the loop halts deterministically
+     * WITHOUT a human — and it survives the PR-scoped {@code FIXING_FEEDBACK}
+     * re-entry, which was the flag-flip that previously prevented the cap from
+     * accumulating. A genuinely new head (a fresh commit) does not equal
+     * {@code stuck_head}, so normal processing resumes automatically.
+     */
+    private void markReconcileHeadStuck(Map<String, Object> currentPr, int attempts, String reason) {
+        state.put("phase", "BLOCKED_EXTERNAL");
+        String head = currentPr == null ? "" : Engine.asString(currentPr.get("headRefOid"));
+        if (!head.isEmpty()) {
+            state.put("stuck_head", head);
+            // UNRECOVERABLE is the existing terminal reason honored by BOTH the
+            // deviation supervisor (holds blocked, never re-clears in delivering
+            // mode) and Engine.detectDeviation (returns null for this head). Any
+            // other reason would be treated as a stale delivery-disabled marker
+            // and cleared, re-enabling the loop.
+            state.put("stuck_head_reason", "UNRECOVERABLE");
+            Map<String, Object> blockedFinding = ReviewFindingQueue.active(state);
+            if (blockedFinding != null) {
+                state.put("stuck_finding_key", ReviewFindingQueue.key(blockedFinding));
+            }
+        }
+        state.put("error", reason);
+        log.error("BLOCKED (terminal): PR #{} head {} — {}",
+                currentPr == null ? "none" : currentPr.get("number"), shortSha(head), reason);
+    }
+
+    /**
      * Apply the reconcile-worker decision (Requirement 2): accept/reject the
      * bounded decision, run the ProgressGuard resume anti-loop, and perform the
      * autonomous auto-deliver / terminal-block / PROCESS_FEEDBACK routing.
@@ -1494,6 +1525,53 @@ final class WorkflowOrchestrator {
     private int handleReconcileDecision(GitOperations git, Integer current, Map<String, Object> currentPr,
                                         CodexRunner.CodexResult result, Path renderedPrompt,
                                         List<Map<String, Object>> feedbackToResolve) {
+        // A fresh PR head (a new commit) is a recovery signal: clear any stale
+        // terminal-stuck marker and the consecutive reconcile-failure counter so
+        // normal processing resumes automatically without operator action.
+        String currentHead = currentPr == null
+                ? "" : Engine.asString(currentPr.get("headRefOid"));
+        String stuckHead = Engine.asString(state.get("stuck_head"));
+        if (!currentHead.isEmpty() && !stuckHead.isEmpty() && !currentHead.equals(stuckHead)) {
+            state.remove("stuck_head");
+            state.remove("stuck_head_reason");
+            state.put("reconciliation_attempts", 0);
+            log.info("RECONCILE HEAD ADVANCED: cleared terminal stuck marker; "
+                    + "resuming normal processing on head {}", shortSha(currentHead));
+        }
+        // FIX (root cause of the infinite reconcile loop): a NON-ZERO reconcile
+        // worker exit is a WORKER/TOOLING FAILURE, not an AI decision. It must
+        // NOT be parsed by applyReconciliationDecision and mislabeled as an
+        // "invalid decision". Engine.applyCodexResult already ran in
+        // runWorkerPhase and classified the exit into PAUSED_QUOTA /
+        // FAILED_RECOVERABLE / CODEX_FAILURE — keep that phase.
+        if (result.exitCode() != 0) {
+            String failurePhase = Engine.asString(state.get("phase"));
+            // A quota pause is transient: honor it via the retry_at backoff and
+            // do NOT count it toward the terminal reconcile-failure cap.
+            if ("PAUSED_QUOTA".equals(failurePhase)) {
+                state.put("exit_code", result.exitCode());
+                state.put("run_finished_at", Controller.now());
+                save();
+                log.info("RECONCILE WORKER PAUSED (quota): exit={} phase={} retry_at={}",
+                        result.exitCode(), failurePhase, state.get("retry_at"));
+                return result.exitCode();
+            }
+            int attempts = (int) Engine.asLongOrDefault(
+                    state.get("reconciliation_attempts"), 0) + 1;
+            state.put("reconciliation_attempts", attempts);
+            log.info("RECONCILE WORKER FAILED: exit={} phase={} attempt={}",
+                    result.exitCode(), failurePhase, attempts);
+            if (ProgressGuard.reconcileCapReached(attempts)) {
+                markReconcileHeadStuck(currentPr, attempts,
+                        "reconcile worker failed " + attempts
+                        + " consecutive times on this head; awaiting a new head or "
+                        + "operator action");
+            }
+            state.put("exit_code", result.exitCode());
+            state.put("run_finished_at", Controller.now());
+            save();
+            return result.exitCode();
+        }
         StateRecovery.ReconciliationOutcome outcome =
                 StateRecovery.applyReconciliationDecision(state, result.output());
         if (!outcome.accepted()) {
@@ -1505,6 +1583,13 @@ final class WorkflowOrchestrator {
             if (ProgressGuard.reconcileCapReached(attempts)) {
                 state.put("phase", "BLOCKED_EXTERNAL");
                 state.put("error", "reconciliation failed three consecutive times; manual intervention required");
+                // Durably stick the head so the terminal stop survives the
+                // PR-scoped FIXING_FEEDBACK re-entry (Engine.detectDeviation
+                // checks stuck_head first and returns null for this head).
+                markReconcileHeadStuck(currentPr, attempts,
+                        "reconcile returned an invalid/unusable decision " + attempts
+                        + " consecutive times on this head; awaiting a new head or "
+                        + "operator action");
             }
             state.put("exit_code", result.exitCode());
             state.put("run_finished_at", Controller.now());

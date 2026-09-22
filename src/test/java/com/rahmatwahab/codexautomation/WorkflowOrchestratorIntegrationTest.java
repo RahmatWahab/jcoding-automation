@@ -891,6 +891,265 @@ class WorkflowOrchestratorIntegrationTest {
     }
 
     @Test
+    void failingReconcileWorkerStopsLoopAndBlocksTerminally(@TempDir Path root) throws Exception {
+        // Regression for the production infinite reconcile loop (story #53 /
+        // PR #190): the reconcile Codex worker keeps FAILING (exit 1, no usable
+        // decision) after a quota pause. Each cron cycle the PR-scoped feedback
+        // re-entry flips the phase back to FIXING_FEEDBACK, so the 3-strike
+        // reconcile cap never accumulated and the controller looped 71 times
+        // with ZERO terminal blocks. A fully autonomous system must degrade
+        // deterministically: bounded retry, then a terminal safe stop keyed to
+        // the unrecoverable head — without a human.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q");
+        Path prompts = root.resolve("prompts");
+        Files.createDirectories(prompts);
+        Files.writeString(prompts.resolve("common.md"), "COMMON");
+        Files.writeString(prompts.resolve("reconcile.md"), "{{COMMON}}\nReconcile.");
+        Files.createDirectories(root.resolve("state"));
+
+        String head = "deadbeefcafef00d";
+        Map<String, Object> prSnapshot = map(
+                "number", 190, "state", "OPEN", "mergedAt", null,
+                "headRefOid", head, "headRefName", "story/53-x", "url", "http://x/pr/190",
+                "reviewDecision", "CHANGES_REQUESTED", "statusCheckRollup", new ArrayList<>(),
+                "reviewThreadsAvailable", true, "comments", new ArrayList<>(),
+                "reviews", List.of(map("author", map("login", "chatgpt-codex-connector"),
+                        "submittedAt", "2026-02-01", "commit", map("oid", head))),
+                "reviewThreads", List.of(map("id", "PRRT_1", "isResolved", false,
+                        "comments", map("nodes", List.of(map("id", "PRRC_1",
+                                "body", "please fix this bug", "createdAt", "2026-01-01",
+                                "author", map("login", "reviewer")))))));
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", false, "max_resume_attempts", 2,
+                        "max_feedback_attempts", 99, "delivery_verification_attempts", 1,
+                        "delivery_verification_delay_seconds", 0),
+                "budgets", map(),
+                "workflow", map("allow_push", true,
+                        "allow_comments", true, "allow_thread_resolution", true));
+
+        // Reconcile worker always FAILS: exit 1, empty output (no decision).
+        int[] reconcileDispatches = {0};
+        CodexRunner codex = new CodexRunner(Map.of(), System::nanoTime) {
+            @Override
+            public CodexResult run(Map<String, Object> cfg, Path prompt, Path r, boolean dry,
+                                   Runnable hb, Integer timeout) {
+                reconcileDispatches[0]++;
+                return new CodexResult(1, "");
+            }
+        };
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #53", "url", "http://x/27");
+
+        List<String> gitCalls = new ArrayList<>();
+        GitOperations.GitRunner gitRunner = (r, args) -> {
+            String key = String.join(" ", args);
+            gitCalls.add(key);
+            if (key.startsWith("status --porcelain")) {
+                // Clean worktree: nothing deliverable, so a failing worker
+                // cannot auto-deliver — it must terminally block instead.
+                return new GitOperations.GitResult(0, "", "");
+            }
+            if (key.startsWith("branch --show-current")) {
+                return new GitOperations.GitResult(0, "story/53-x\n", "");
+            }
+            if (key.startsWith("branch --list")) {
+                return new GitOperations.GitResult(0, "story/53-x\n", "");
+            }
+            if (key.startsWith("rev-parse HEAD")) {
+                return new GitOperations.GitResult(0, head + "\n", "");
+            }
+            if (key.startsWith("ls-remote origin")) {
+                return new GitOperations.GitResult(0, head + "\trefs/heads/story/53-x\n", "");
+            }
+            return new GitOperations.GitResult(0, "", "");
+        };
+        Controller.GitOperationsFactory gitFactory = new Controller.GitOperationsFactory(repo) {
+            @Override
+            public GitOperations create() {
+                return new GitOperations(repo, gitRunner);
+            }
+        };
+
+        int stuckAtRun = -1;
+        int dispatchesWhenStuck = -1;
+        for (int run = 1; run <= 6; run++) {
+            Map<String, Object> state = store.load();
+            // Simulate the production cron cycle: the feedback re-entry flips
+            // the phase back to FIXING_FEEDBACK every tick because the PR still
+            // has an unresolved review thread; BLOCKED_REQUIREMENTS routes to
+            // reconcile.md and the prior feedback verdict was BLOCKED on head.
+            state.put("phase", "BLOCKED_REQUIREMENTS");
+            state.put("current_story", 53);
+            state.put("current_pr", 190);
+            state.put("branch", "story/53-x");
+            state.put("last_feedback_result", "BLOCKED");
+            state.put("last_feedback_result_head", head);
+            WorkflowLock lock = WorkflowLock.acquire(
+                    root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+            DeliveryGitHub github = new DeliveryGitHub(prSnapshot);
+            WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                    config, state, store, github, repo, root, epic, 27, false,
+                    gitFactory, codex, new ReviewCoordinator(), lock);
+            orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
+            lock.release();
+            Map<String, Object> after = store.load();
+            if (head.equals(Engine.asString(after.get("stuck_head"))) && stuckAtRun < 0) {
+                stuckAtRun = run;
+                dispatchesWhenStuck = reconcileDispatches[0];
+            }
+        }
+
+        // Bounded: the terminal stop is reached within RECONCILE_CAP + 2 runs.
+        assertThat(stuckAtRun)
+                .as("must reach a terminal stuck_head stop, not loop indefinitely")
+                .isGreaterThan(0)
+                .isLessThanOrEqualTo(ProgressGuard.RECONCILE_CAP + 2);
+
+        // The head is durably marked unrecoverable so the loop halts.
+        Map<String, Object> finalState = store.load();
+        assertThat(Engine.asString(finalState.get("stuck_head"))).isEqualTo(head);
+        assertThat(Engine.asString(finalState.get("stuck_head_reason"))).isNotEmpty();
+
+        // Terminal: a subsequent run on this SAME head produces NO further
+        // reconcile dispatch — detectDeviation returns null for a stuck head.
+        int dispatchesBefore = reconcileDispatches[0];
+        Map<String, Object> state = store.load();
+        state.put("current_story", 53);
+        state.put("current_pr", 190);
+        state.put("branch", "story/53-x");
+        WorkflowLock lock = WorkflowLock.acquire(
+                root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+        DeliveryGitHub github = new DeliveryGitHub(prSnapshot);
+        WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                config, state, store, github, repo, root, epic, 27, false,
+                gitFactory, codex, new ReviewCoordinator(), lock);
+        orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
+        lock.release();
+        assertThat(reconcileDispatches[0])
+                .as("no further reconcile dispatch once the head is terminally stuck")
+                .isEqualTo(dispatchesBefore);
+
+        // detectDeviation returns null (no deviation) for the stuck head.
+        assertThat(Engine.detectDeviation(store.load(), prSnapshot, 5)).isNull();
+    }
+
+    @Test
+    void reconcileWorkerQuotaFailureIsHonoredNotCountedAsHardFailure(@TempDir Path root)
+            throws Exception {
+        // A reconcile worker that fails with a provider quota message must be
+        // honored as a quota PAUSE (retry_at backoff drives recovery), NOT
+        // counted toward the terminal reconcile-failure cap.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q");
+        Path prompts = root.resolve("prompts");
+        Files.createDirectories(prompts);
+        Files.writeString(prompts.resolve("common.md"), "COMMON");
+        Files.writeString(prompts.resolve("reconcile.md"), "{{COMMON}}\nReconcile.");
+        Files.createDirectories(root.resolve("state"));
+
+        String head = "0ff1cef00dcafe99";
+        Map<String, Object> prSnapshot = map(
+                "number", 190, "state", "OPEN", "mergedAt", null,
+                "headRefOid", head, "headRefName", "story/53-x", "url", "http://x/pr/190",
+                "reviewDecision", "CHANGES_REQUESTED", "statusCheckRollup", new ArrayList<>(),
+                "reviewThreadsAvailable", true, "comments", new ArrayList<>(),
+                "reviews", List.of(map("author", map("login", "chatgpt-codex-connector"),
+                        "submittedAt", "2026-02-01", "commit", map("oid", head))),
+                "reviewThreads", List.of(map("id", "PRRT_1", "isResolved", false,
+                        "comments", map("nodes", List.of(map("id", "PRRC_1",
+                                "body", "please fix this bug", "createdAt", "2026-01-01",
+                                "author", map("login", "reviewer")))))));
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", false, "max_resume_attempts", 2,
+                        "quota_retry_seconds", 1800,
+                        "max_feedback_attempts", 99, "delivery_verification_attempts", 1,
+                        "delivery_verification_delay_seconds", 0),
+                "budgets", map(),
+                "workflow", map("allow_push", true,
+                        "allow_comments", true, "allow_thread_resolution", true));
+
+        // Reconcile worker fails with a provider quota message.
+        CodexRunner codex = new CodexRunner(Map.of(), System::nanoTime) {
+            @Override
+            public CodexResult run(Map<String, Object> cfg, Path prompt, Path r, boolean dry,
+                                   Runnable hb, Integer timeout) {
+                return new CodexResult(1, "You've hit your usage limit.");
+            }
+        };
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #53", "url", "http://x/27");
+
+        GitOperations.GitRunner gitRunner = (r, args) -> {
+            String key = String.join(" ", args);
+            if (key.startsWith("status --porcelain")) {
+                return new GitOperations.GitResult(0, "", "");
+            }
+            if (key.startsWith("branch --show-current")) {
+                return new GitOperations.GitResult(0, "story/53-x\n", "");
+            }
+            if (key.startsWith("branch --list")) {
+                return new GitOperations.GitResult(0, "story/53-x\n", "");
+            }
+            if (key.startsWith("rev-parse HEAD")) {
+                return new GitOperations.GitResult(0, head + "\n", "");
+            }
+            if (key.startsWith("ls-remote origin")) {
+                return new GitOperations.GitResult(0, head + "\trefs/heads/story/53-x\n", "");
+            }
+            return new GitOperations.GitResult(0, "", "");
+        };
+        Controller.GitOperationsFactory gitFactory = new Controller.GitOperationsFactory(repo) {
+            @Override
+            public GitOperations create() {
+                return new GitOperations(repo, gitRunner);
+            }
+        };
+
+        Map<String, Object> state = store.load();
+        state.put("phase", "BLOCKED_REQUIREMENTS");
+        state.put("current_story", 53);
+        state.put("current_pr", 190);
+        state.put("branch", "story/53-x");
+        state.put("last_feedback_result", "BLOCKED");
+        state.put("last_feedback_result_head", head);
+        WorkflowLock lock = WorkflowLock.acquire(
+                root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+        DeliveryGitHub github = new DeliveryGitHub(prSnapshot);
+        WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                config, state, store, github, repo, root, epic, 27, false,
+                gitFactory, codex, new ReviewCoordinator(), lock);
+        orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
+        lock.release();
+
+        Map<String, Object> finalState = store.load();
+        // A quota failure must PAUSE, not count as a hard reconcile failure.
+        assertThat(finalState.get("phase")).isEqualTo("PAUSED_QUOTA");
+        assertThat(Engine.asString(finalState.get("retry_at"))).isNotEmpty();
+        assertThat((int) Engine.asLongOrDefault(finalState.get("reconciliation_attempts"), 0))
+                .as("a quota pause must not accumulate toward the terminal cap")
+                .isEqualTo(0);
+        // And it must not terminally stick the head on a transient quota pause.
+        assertThat(Engine.asString(finalState.get("stuck_head"))).isEmpty();
+    }
+
+    @Test
     void advancingHeadResumeLoopTerminatesViaCumulativeCap(@TempDir Path root) throws Exception {
         // Regression for the production runaway observed in the cron logs: a
         // single story reached 300+ reconcile attempts over ~14h because EACH
