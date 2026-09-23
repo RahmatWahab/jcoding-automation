@@ -2246,6 +2246,122 @@ class WorkflowOrchestratorIntegrationTest {
     }
 
     @Test
+    void unknownDeclaredThreadIdIsSkippedNotBlocked(@TempDir Path root) throws Exception {
+        // Regression for the production BLOCK at 22:23 (PR #190): the worker
+        // returned SUCCESS but declared a truncated/hallucinated thread id
+        // (PRRT_kwDOTJ2qt86lW6) alongside a valid one. The old guard failed
+        // CLOSED — it BLOCKED the whole run on the unknown id, so the valid
+        // thread was never resolved and the PR dead-ended. After the fix the
+        // unknown id is skipped (logged/recorded) and the valid thread is still
+        // replied to and resolved; the run does not enter BLOCKED_EXTERNAL.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q");
+        Path prompts = root.resolve("prompts");
+        Files.createDirectories(prompts);
+        Files.writeString(prompts.resolve("common.md"), "COMMON");
+        Files.writeString(prompts.resolve("feedback.md"), "{{COMMON}}\nFix.");
+        Files.createDirectories(root.resolve("state"));
+
+        String head = "abcdef1234567890abcdef1234567890abcdef12";
+        Map<String, Object> prSnapshot = map(
+                "number", 190, "state", "OPEN", "mergedAt", null,
+                "headRefOid", head, "url", "http://x/pr/190",
+                "headRefName", "story/45-x", "reviewDecision", "CHANGES_REQUESTED",
+                "statusCheckRollup", new ArrayList<>(), "reviewThreadsAvailable", true,
+                "comments", new ArrayList<>(),
+                "reviews", List.of(map("author", map("login", "chatgpt-codex-connector"),
+                        "submittedAt", "2026-02-01", "commit", map("oid", head))),
+                "reviewThreads", List.of(map("id", "PRRT_valid", "isResolved", false,
+                        "comments", map("nodes", List.of(map("id", "PRRC_valid",
+                                "body", "please fix this real bug", "createdAt", "2026-01-01",
+                                "author", map("login", "reviewer")))))));
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", false, "delivery_verification_attempts", 1,
+                        "delivery_verification_delay_seconds", 0),
+                "budgets", map(),
+                "workflow", map("allow_push", true,
+                        "allow_comments", true, "allow_thread_resolution", true));
+
+        Map<String, Object> state = new LinkedHashMap<>();
+        state.put("phase", "FIXING_FEEDBACK");
+        state.put("current_story", 45);
+        state.put("current_pr", 190);
+        state.put("branch", "story/45-x");
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        WorkflowLock lock = WorkflowLock.acquire(root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+        DeliveryGitHub github = new DeliveryGitHub(prSnapshot);
+
+        // Worker declares one VALID thread id and one UNKNOWN (truncated) id.
+        CodexRunner codex = new CodexRunner(Map.of(), System::nanoTime) {
+            @Override
+            public CodexResult run(Map<String, Object> cfg, Path prompt, Path r, boolean dry,
+                                   Runnable hb, Integer timeout) {
+                return new CodexResult(0,
+                        "RESULT_STATUS: SUCCESS\nRESULT_NEXT_PHASE: REVIEWING_CODE\n"
+                        + "RESULT_BLOCKER: NONE\nRESULT_EVIDENCE: COMPLETE\n"
+                        + "FIXED_THREAD: PRRT_valid\n"
+                        + "SUPERSEDED_THREAD: PRRT_kwDOTJ2qt86lW6\n");
+            }
+        };
+
+        GitOperations.GitRunner gitRunner = (r, args) -> {
+            String key = String.join(" ", args);
+            if (key.startsWith("status --porcelain")) {
+                return new GitOperations.GitResult(0, " M src/impl.txt\n", "");
+            }
+            if (key.startsWith("branch --show-current") || key.startsWith("branch --list")) {
+                return new GitOperations.GitResult(0, "story/45-x\n", "");
+            }
+            if (key.startsWith("rev-parse HEAD")) {
+                return new GitOperations.GitResult(0, head + "\n", "");
+            }
+            if (key.startsWith("ls-remote origin")) {
+                return new GitOperations.GitResult(0, head + "\trefs/heads/story/45-x\n", "");
+            }
+            return new GitOperations.GitResult(0, "", "");
+        };
+        Controller.GitOperationsFactory gitFactory = new Controller.GitOperationsFactory(repo) {
+            @Override
+            public GitOperations create() {
+                return new GitOperations(repo, gitRunner);
+            }
+        };
+
+        Map<String, Object> epic = (Map<String, Object>) github.issue(27);
+        WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                config, state, store, github, repo, root, epic, 27, false,
+                gitFactory, codex, new ReviewCoordinator(), lock);
+
+        orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
+        lock.release();
+
+        Map<String, Object> after = store.load();
+        // The run must NOT be blocked by the unknown id...
+        assertThat(Engine.asString(after.get("phase"))).isNotEqualTo("BLOCKED_EXTERNAL");
+        assertThat(Engine.asString(after.get("error")))
+                .doesNotContain("not present in the authoritative");
+        // ...the VALID declared thread is still replied to and resolved...
+        assertThat(github.repliedThreads).extracting(a -> a[0]).contains("PRRT_valid");
+        assertThat(github.resolvedThreads).contains("PRRT_valid");
+        // ...the UNKNOWN id is never acted on on GitHub...
+        assertThat(github.resolvedThreads).doesNotContain("PRRT_kwDOTJ2qt86lW6");
+        // ...but it IS recorded in the durable journal for observability.
+        Object updates = after.get("thread_updates");
+        assertThat(updates).isInstanceOf(List.class);
+        boolean recorded = ((List<?>) updates).stream().anyMatch(u -> u instanceof Map<?, ?> m
+                && "PRRT_kwDOTJ2qt86lW6".equals(String.valueOf(m.get("thread_id")))
+                && "DECLARED_ID_NOT_IN_SNAPSHOT".equals(String.valueOf(m.get("action"))));
+        assertThat(recorded).isTrue();
+    }
+
+    @Test
     void mergedPrAdvancesStoryAndClearsState(@TempDir Path root) throws Exception {
         Path repo = root.resolve("repo");
         Files.createDirectories(repo);

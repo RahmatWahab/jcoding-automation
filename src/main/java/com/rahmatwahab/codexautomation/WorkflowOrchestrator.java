@@ -832,18 +832,29 @@ final class WorkflowOrchestrator {
             }
         }
 
-        // Map declared fix ids to canonical thread ids; unknown ids fail closed.
+        // Map declared fix ids to canonical thread ids. A worker may declare an
+        // id that is not in the authoritative PR thread snapshot — e.g. a
+        // truncated/hallucinated id, or a real thread that was already resolved
+        // and dropped from the snapshot. Previously this failed CLOSED and
+        // BLOCKED the entire run (a single bad id dead-ended the PR forever;
+        // observed in production as a permanent BLOCKED on PR #190). Instead,
+        // SKIP the unmappable ids (log + record for audit) and proceed to
+        // resolve the mappable ones. Anything left genuinely unresolved stays a
+        // pending finding and is bounded by the feedback attempt cap (Rule 2),
+        // which force-closes it rather than looping.
         ReviewCoordinator.ThreadIdMapping mapping = ReviewCoordinator.canonicalFixedThreadIds(
                 currentPr != null ? currentPr : new LinkedHashMap<>(), declaredFixedIds);
         if (!mapping.unknown().isEmpty()) {
             List<String> sorted = new ArrayList<>(mapping.unknown());
             sorted.sort(String::compareTo);
-            state.put("phase", "BLOCKED_EXTERNAL");
-            state.put("error", "Codex declared review IDs that are not present in the "
-                    + "authoritative PR thread snapshot: " + String.join(", ", sorted));
+            for (String unknownId : sorted) {
+                recordThreadUpdate(unknownId, deliveredCommit == null ? "" : deliveredCommit,
+                        "DECLARED_ID_NOT_IN_SNAPSHOT");
+            }
             save();
-            log.error("BLOCKED: " + state.get("error"));
-            return 1;
+            log.warn("DECLARED IDS SKIPPED: Codex declared review IDs not present in the "
+                    + "authoritative PR thread snapshot (skipping, not blocking): {}",
+                    String.join(", ", sorted));
         }
 
         // Reply to and resolve only verified, delivered, explicitly-fixed threads.
