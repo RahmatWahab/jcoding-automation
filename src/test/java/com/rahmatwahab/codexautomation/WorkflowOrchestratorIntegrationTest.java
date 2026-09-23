@@ -2102,7 +2102,7 @@ class WorkflowOrchestratorIntegrationTest {
     }
 
     /** Fake GitHub serving an existing PR and recording thread mutations. */
-    private static final class DeliveryGitHub extends GitHub {
+    private static class DeliveryGitHub extends GitHub {
         final List<String> resolvedThreads = new ArrayList<>();
         final List<String[]> repliedThreads = new ArrayList<>();
         final List<int[]> mergedPrs = new ArrayList<>();
@@ -2672,5 +2672,504 @@ class WorkflowOrchestratorIntegrationTest {
         assertThat((String) state.get("error")).contains("default branch");
         assertThat(code).isEqualTo(1);
         lock.release();
+    }
+
+    /**
+     * Build the exact terminal state production reached on PR #190: a delivering
+     * (live) run whose feedback worker exhausted its attempts, AUTO-DELIVER
+     * aborted with nothing to deliver, and the head was marked terminally
+     * UNRECOVERABLE for the active review finding.
+     */
+    private static Map<String, Object> terminalStuckState(String head, String threadId) {
+        Map<String, Object> finding = map(
+                "thread_id", threadId, "id", "PRRC_1", "status", "BLOCKED",
+                "attempts", 4, "url", "http://x/pr/190#t");
+        String findingKey = ReviewFindingQueue.key(finding);
+        Map<String, Object> state = new LinkedHashMap<>();
+        state.put("phase", "BLOCKED_EXTERNAL");
+        state.put("current_story", 53);
+        state.put("current_pr", 190);
+        state.put("branch", "story/53-x");
+        state.put("stuck_head", head);
+        state.put("stuck_head_reason", "UNRECOVERABLE");
+        state.put("stuck_finding_key", findingKey);
+        state.put("review_findings", new ArrayList<>(List.of(finding)));
+        state.put("active_review_finding", new LinkedHashMap<>(finding));
+        state.put("active_review_findings", new ArrayList<>(List.of(new LinkedHashMap<>(finding))));
+        // A prior FIXING_FEEDBACK worker on this exact head returned BLOCKED,
+        // which is what routes the live path into handleStuckHeadForFeedback.
+        state.put("last_feedback_result", "BLOCKED");
+        state.put("last_feedback_result_head", head);
+        return state;
+    }
+
+    private static Map<String, Object> prSnapshotWithUnresolvedThread(String head, String threadId) {
+        return map(
+                "number", 190, "state", "OPEN", "mergedAt", null,
+                "headRefOid", head, "headRefName", "story/53-x", "url", "http://x/pr/190",
+                "reviewDecision", "CHANGES_REQUESTED", "statusCheckRollup", new ArrayList<>(),
+                "reviewThreadsAvailable", true, "comments", new ArrayList<>(),
+                "reviews", List.of(map("author", map("login", "chatgpt-codex-connector"),
+                        "submittedAt", "2026-02-01", "commit", map("oid", head))),
+                "reviewThreads", List.of(map("id", threadId, "isResolved", false,
+                        "comments", map("nodes", List.of(map("id", "PRRC_1",
+                                "body", "missing /v1/containers/health endpoint",
+                                "createdAt", "2026-01-01",
+                                "author", map("login", "reviewer")))))));
+    }
+
+    private Map<String, Object> liveConfig(Path repo, String terminalPolicy) {
+        Map<String, Object> workflow = map("allow_push", true, "allow_comments", true,
+                "allow_thread_resolution", true, "auto_merge", true);
+        if (terminalPolicy != null) {
+            workflow.put("terminal_policy", terminalPolicy);
+        }
+        return map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", false, "max_feedback_attempts", 3,
+                        "delivery_verification_attempts", 1, "delivery_verification_delay_seconds", 0),
+                "budgets", map(),
+                "workflow", workflow);
+    }
+
+    @Test
+    void terminalFeedbackHoldDoesNotFloodTheLogEveryTick(@TempDir Path root) throws Exception {
+        // Regression for the production PR #190 loop: after AUTO-DELIVER aborted
+        // ("nothing to deliver") the head was marked UNRECOVERABLE, and every
+        // subsequent cron tick logged an identical
+        //   "BLOCKED (terminal): PR #190 finding ... is unrecoverable; holding"
+        // line at INFO — 800+ identical lines over hours. Under the default
+        // "hold" policy the head must stay blocked, but the terminal hold must
+        // be logged idempotently (INFO once, then deduped), NOT every tick.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q", "-b", "main");
+        Path prompts = root.resolve("prompts");
+        Files.createDirectories(prompts);
+        Files.writeString(prompts.resolve("common.md"), "COMMON");
+        Files.writeString(prompts.resolve("feedback.md"), "{{COMMON}}\nFix.");
+        Files.writeString(prompts.resolve("reconcile.md"), "{{COMMON}}\nReconcile.");
+        Files.createDirectories(root.resolve("state"));
+
+        String head = "a8ed8f248ca0";
+        String threadId = "PRRT_190";
+        Map<String, Object> prSnapshot = prSnapshotWithUnresolvedThread(head, threadId);
+        Map<String, Object> config = liveConfig(repo, "hold"); // default policy
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #53", "url", "http://x/27");
+
+        // Seed the terminal stuck state once, persist it, then drive many ticks.
+        store.save(terminalStuckState(head, threadId));
+
+        int blockedExits = 0;
+        String firstSignature = null;
+        String lastSignature = null;
+        int distinctInfoLogSignatures = 0;
+        String prevSignature = "";
+        for (int tick = 1; tick <= 10; tick++) {
+            Map<String, Object> state = store.load();
+            WorkflowLock lock = WorkflowLock.acquire(
+                    root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+            DeliveryGitHub github = new DeliveryGitHub(prSnapshot);
+            WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                    config, state, store, github, repo, root, epic, 27, false,
+                    new Controller.GitOperationsFactory(repo), new CodexRunner(),
+                    new ReviewCoordinator(), lock);
+            int code = orchestrator.reconcileAndExecute(
+                    new ArrayList<>(List.of(prSnapshot)), null);
+            Map<String, Object> after = store.load();
+            if (code == 1 && "BLOCKED_EXTERNAL".equals(Engine.asString(after.get("phase")))) {
+                blockedExits++;
+            }
+            String sig = Engine.asString(after.get("last_stable_log_signature"));
+            if (tick == 1) {
+                firstSignature = sig;
+            }
+            lastSignature = sig;
+            // Count how many ticks would have logged at INFO (signature changed).
+            if (!sig.equals(prevSignature)) {
+                distinctInfoLogSignatures++;
+            }
+            prevSignature = sig;
+            lock.release();
+        }
+
+        // The head stays terminally blocked on every tick (never falsely
+        // progresses, never dead-ends into a crash).
+        assertThat(blockedExits).isEqualTo(10);
+        // The stable-log signature is set on the first hold and remains constant
+        // thereafter — proving the terminal hold logs at INFO exactly once and
+        // is deduped to DEBUG on every subsequent identical tick (no flood).
+        assertThat(firstSignature).startsWith("FEEDBACK_STUCK_TERMINAL|");
+        assertThat(lastSignature).isEqualTo(firstSignature);
+        assertThat(distinctInfoLogSignatures).isEqualTo(1);
+    }
+
+    @Test
+    void parkAndAdvancePolicyParksStuckFeedbackStoryInsteadOfHoldingForever(@TempDir Path root)
+            throws Exception {
+        // With terminal_policy=park_and_advance the same terminal feedback state
+        // must NOT hold forever: the controller parks story #53 on its head,
+        // posts a single operator notification, resets story-scoped state, and
+        // goes IDLE so the next tick can select a different eligible story —
+        // fulfilling the "no human in the delivery loop / never dead-ends"
+        // guarantee. This path was previously unreachable because the feedback
+        // terminal branch ignored ParkPolicy entirely.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q", "-b", "main");
+        Path prompts = root.resolve("prompts");
+        Files.createDirectories(prompts);
+        Files.writeString(prompts.resolve("common.md"), "COMMON");
+        Files.writeString(prompts.resolve("feedback.md"), "{{COMMON}}\nFix.");
+        Files.writeString(prompts.resolve("reconcile.md"), "{{COMMON}}\nReconcile.");
+        Files.createDirectories(root.resolve("state"));
+
+        String head = "a8ed8f248ca0";
+        String threadId = "PRRT_190";
+        Map<String, Object> prSnapshot = prSnapshotWithUnresolvedThread(head, threadId);
+        Map<String, Object> config = liveConfig(repo, "park_and_advance");
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #53", "url", "http://x/27");
+
+        store.save(terminalStuckState(head, threadId));
+
+        List<String> parkComments = new ArrayList<>();
+        Map<String, Object> state = store.load();
+        WorkflowLock lock = WorkflowLock.acquire(
+                root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+        DeliveryGitHub github = new DeliveryGitHub(prSnapshot) {
+            @Override
+            public void comment(int number, String body) {
+                parkComments.add(body);
+            }
+        };
+        WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                config, state, store, github, repo, root, epic, 27, false,
+                new Controller.GitOperationsFactory(repo), new CodexRunner(),
+                new ReviewCoordinator(), lock);
+        int code = orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
+        lock.release();
+
+        Map<String, Object> after = store.load();
+        // The run advances cleanly (exit 0) instead of dead-ending on exit 1.
+        assertThat(code).isEqualTo(0);
+        // Story #53 is parked on the stuck head so selection can move on.
+        assertThat(ParkPolicy.parkedStoryNumbers(after)).contains(53);
+        assertThat(ParkPolicy.parkedHead(after, 53)).isEqualTo(head);
+        // The controller resets to IDLE and drops the story scope.
+        assertThat(Engine.asString(after.get("phase"))).isEqualTo("IDLE");
+        assertThat(after.get("current_story")).isNull();
+        // Exactly one operator notification is posted.
+        assertThat(parkComments).hasSize(1);
+        assertThat(parkComments.get(0)).contains("PARKED", "#53");
+    }
+
+    @Test
+    void rule1ForceClosesReviewThreadRaisedOnAnOlderCommit(@TempDir Path root) throws Exception {
+        // Rule 1: a review thread anchored to a commit older than the current
+        // PR head is force-closed (replied + resolved) rather than reprocessed.
+        // If the issue is genuinely still present, the next Codex review raises
+        // a fresh thread against the advanced head.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q", "-b", "main");
+        Path prompts = root.resolve("prompts");
+        Files.createDirectories(prompts);
+        Files.writeString(prompts.resolve("common.md"), "COMMON");
+        Files.writeString(prompts.resolve("feedback.md"), "{{COMMON}}\nFix.");
+        Files.writeString(prompts.resolve("reconcile.md"), "{{COMMON}}\nReconcile.");
+        Files.createDirectories(root.resolve("state"));
+
+        String head = "newhead000000";
+        String oldCommit = "oldcommit0001";
+        String threadId = "PRRT_OLD";
+        // The unresolved inline thread was raised on an OLDER commit than head.
+        Map<String, Object> prSnapshot = map(
+                "number", 190, "state", "OPEN", "mergedAt", null,
+                "headRefOid", head, "headRefName", "story/53-x", "url", "http://x/pr/190",
+                "reviewDecision", "CHANGES_REQUESTED", "statusCheckRollup", new ArrayList<>(),
+                "reviewThreadsAvailable", true, "comments", new ArrayList<>(),
+                "reviews", List.of(map("author", map("login", "chatgpt-codex-connector"),
+                        "submittedAt", "2026-02-01", "commit", map("oid", head))),
+                "reviewThreads", List.of(map("id", threadId, "isResolved", false,
+                        "comments", map("nodes", List.of(map("id", "PRRC_OLD",
+                                "body", "please fix this stale issue",
+                                "createdAt", "2026-01-01",
+                                "commit", map("oid", oldCommit),
+                                "author", map("login", "reviewer")))))));
+
+        Map<String, Object> config = liveConfig(repo, "hold");
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #53", "url", "http://x/27");
+
+        Map<String, Object> state = new LinkedHashMap<>();
+        state.put("phase", "FIXING_FEEDBACK");
+        state.put("current_story", 53);
+        state.put("current_pr", 190);
+        state.put("branch", "story/53-x");
+        store.save(state);
+
+        WorkflowLock lock = WorkflowLock.acquire(
+                root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+        DeliveryGitHub github = new DeliveryGitHub(prSnapshot);
+        WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                config, state, store, github, repo, root, epic, 27, false,
+                new Controller.GitOperationsFactory(repo), new CodexRunner(),
+                new ReviewCoordinator(), lock);
+        orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
+        lock.release();
+
+        // The stale thread was resolved on GitHub...
+        assertThat(github.resolvedThreads).contains(threadId);
+        // ...and marked terminally FORCE_CLOSED in the durable queue so it is
+        // never dispatched to the worker again.
+        Map<String, Object> after = store.load();
+        boolean forceClosed = ReviewFindingQueue.findings(after).stream()
+                .anyMatch(f -> threadId.equals(Engine.asString(f.get("thread_id")))
+                        && "FORCE_CLOSED".equals(Engine.asString(f.get("status"))));
+        assertThat(forceClosed).isTrue();
+    }
+
+    @Test
+    void rule1LeavesThreadOnCurrentHeadUntouched(@TempDir Path root) throws Exception {
+        // Guard: a finding raised on the CURRENT head is live feedback and must
+        // NOT be force-closed by Rule 1.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q", "-b", "main");
+        Path prompts = root.resolve("prompts");
+        Files.createDirectories(prompts);
+        Files.writeString(prompts.resolve("common.md"), "COMMON");
+        Files.writeString(prompts.resolve("feedback.md"), "{{COMMON}}\nFix.");
+        Files.writeString(prompts.resolve("reconcile.md"), "{{COMMON}}\nReconcile.");
+        Files.createDirectories(root.resolve("state"));
+
+        String head = "curhead0000001";
+        String threadId = "PRRT_CUR";
+        Map<String, Object> prSnapshot = map(
+                "number", 190, "state", "OPEN", "mergedAt", null,
+                "headRefOid", head, "headRefName", "story/53-x", "url", "http://x/pr/190",
+                "reviewDecision", "CHANGES_REQUESTED", "statusCheckRollup", new ArrayList<>(),
+                "reviewThreadsAvailable", true, "comments", new ArrayList<>(),
+                "reviews", List.of(map("author", map("login", "chatgpt-codex-connector"),
+                        "submittedAt", "2026-02-01", "commit", map("oid", head))),
+                "reviewThreads", List.of(map("id", threadId, "isResolved", false,
+                        "comments", map("nodes", List.of(map("id", "PRRC_CUR",
+                                "body", "please fix this current issue",
+                                "createdAt", "2026-01-01",
+                                "commit", map("oid", head),
+                                "author", map("login", "reviewer")))))));
+
+        Map<String, Object> config = liveConfig(repo, "hold");
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #53", "url", "http://x/27");
+
+        Map<String, Object> state = new LinkedHashMap<>();
+        state.put("phase", "FIXING_FEEDBACK");
+        state.put("current_story", 53);
+        state.put("current_pr", 190);
+        state.put("branch", "story/53-x");
+        store.save(state);
+
+        WorkflowLock lock = WorkflowLock.acquire(
+                root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+        DeliveryGitHub github = new DeliveryGitHub(prSnapshot);
+        WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                config, state, store, github, repo, root, epic, 27, false,
+                new Controller.GitOperationsFactory(repo), new CodexRunner(),
+                new ReviewCoordinator(), lock);
+        orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
+        lock.release();
+
+        // The current-head thread must NOT be force-closed.
+        assertThat(github.resolvedThreads).doesNotContain(threadId);
+        Map<String, Object> after = store.load();
+        boolean forceClosed = ReviewFindingQueue.findings(after).stream()
+                .anyMatch(f -> threadId.equals(Engine.asString(f.get("thread_id")))
+                        && "FORCE_CLOSED".equals(Engine.asString(f.get("status"))));
+        assertThat(forceClosed).isFalse();
+    }
+
+    @Test
+    void rule2ForceClosesUnfixableFindingAfterAttemptCapAndAdvances(@TempDir Path root)
+            throws Exception {
+        // Rule 2: when the same finding on the same head exceeds
+        // max_feedback_attempts with nothing deliverable, the controller
+        // force-closes the thread as invalid and ADVANCES instead of holding
+        // terminally or looping. This is the direct fix for the PR #190 loop.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q", "-b", "main");
+        Path prompts = root.resolve("prompts");
+        Files.createDirectories(prompts);
+        Files.writeString(prompts.resolve("common.md"), "COMMON");
+        Files.writeString(prompts.resolve("feedback.md"), "{{COMMON}}\nFix.");
+        Files.writeString(prompts.resolve("reconcile.md"), "{{COMMON}}\nReconcile.");
+        Files.createDirectories(root.resolve("state"));
+
+        String head = "stuckhead00001";
+        String threadId = "PRRT_STUCK";
+        // Finding is raised on the CURRENT head (so Rule 1 does not fire) and is
+        // never fixable — the fake worker returns BLOCKED-equivalent (empty).
+        Map<String, Object> prSnapshot = map(
+                "number", 190, "state", "OPEN", "mergedAt", null,
+                "headRefOid", head, "headRefName", "story/53-x", "url", "http://x/pr/190",
+                "reviewDecision", "CHANGES_REQUESTED", "statusCheckRollup", new ArrayList<>(),
+                "reviewThreadsAvailable", true, "comments", new ArrayList<>(),
+                "reviews", List.of(map("author", map("login", "chatgpt-codex-connector"),
+                        "submittedAt", "2026-02-01", "commit", map("oid", head))),
+                "reviewThreads", List.of(map("id", threadId, "isResolved", false,
+                        "comments", map("nodes", List.of(map("id", "PRRC_STUCK",
+                                "body", "please fix this unfixable issue",
+                                "createdAt", "2026-01-01",
+                                "commit", map("oid", head),
+                                "author", map("login", "reviewer")))))));
+
+        Map<String, Object> config = liveConfig(repo, "hold"); // max_feedback_attempts=3
+
+        // Clean worktree: the worker never produces a deliverable change, so the
+        // cap-exceeded path takes the "nothing to deliver" -> force-close branch.
+        GitOperations.GitRunner gitRunner = (r, args) -> {
+            String key = String.join(" ", args);
+            if (key.startsWith("status --porcelain")) {
+                return new GitOperations.GitResult(0, "", "");
+            }
+            if (key.startsWith("branch --show-current") || key.startsWith("branch --list")) {
+                return new GitOperations.GitResult(0, "story/53-x\n", "");
+            }
+            if (key.startsWith("rev-parse HEAD")) {
+                return new GitOperations.GitResult(0, head + "\n", "");
+            }
+            if (key.startsWith("ls-remote origin")) {
+                return new GitOperations.GitResult(0, head + "\trefs/heads/story/53-x\n", "");
+            }
+            return new GitOperations.GitResult(0, "", "");
+        };
+        Controller.GitOperationsFactory gitFactory = new Controller.GitOperationsFactory(repo) {
+            @Override
+            public GitOperations create() {
+                return new GitOperations(repo, gitRunner);
+            }
+        };
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #53", "url", "http://x/27");
+
+        // A worker that always fails to fix (empty output -> no FIXED_THREAD),
+        // but returns a VALID reconcile decision (PROCESS_FEEDBACK) so the
+        // reconcile-garbage guard never fires — mirroring production where
+        // reconcile keeps routing back to feedback. Rule 2 (the feedback attempt
+        // cap) must be the terminal handler that force-closes and advances.
+        CodexRunner failingCodex = new CodexRunner(Map.of(), System::nanoTime) {
+            @Override
+            public CodexResult run(Map<String, Object> cfg, Path prompt, Path r, boolean dry,
+                                   Runnable hb, Integer timeout) {
+                String content = "";
+                try {
+                    content = prompt == null ? "" : Files.readString(prompt);
+                } catch (java.io.IOException ignored) {
+                    content = "";
+                }
+                if (content.contains("Reconcile.")) {
+                    return new CodexResult(0,
+                            "DECISION_ACTION: PROCESS_FEEDBACK\nDECISION_REASON: retry the finding\n");
+                }
+                return new CodexResult(0, "RESULT_STATUS: BLOCKED\nRESULT_BLOCKER: UNFIXABLE\n");
+            }
+        };
+
+        // A GitHub fake that REFLECTS resolution: once a thread is resolved it
+        // is marked isResolved=true on subsequent reads and the PR review
+        // decision clears — this proves the workflow converges after force-close
+        // rather than merely stopping on the first tick.
+        Map<String, Object> mutablePr = new LinkedHashMap<>(prSnapshot);
+        class ReflectingGitHub extends DeliveryGitHub {
+            ReflectingGitHub() {
+                super(mutablePr);
+            }
+
+            @Override
+            public Map<String, Object> pr(int number) {
+                return mutablePr;
+            }
+
+            @Override
+            @SuppressWarnings("unchecked")
+            public void resolveThread(String tid) {
+                super.resolveThread(tid);
+                List<Object> threads = (List<Object>) mutablePr.get("reviewThreads");
+                for (Object t : threads) {
+                    Map<String, Object> tm = (Map<String, Object>) t;
+                    if (tid.equals(tm.get("id"))) {
+                        tm.put("isResolved", true);
+                    }
+                }
+                boolean anyUnresolved = threads.stream()
+                        .anyMatch(t -> !Boolean.TRUE.equals(((Map<String, Object>) t).get("isResolved")));
+                if (!anyUnresolved) {
+                    mutablePr.put("reviewDecision", "APPROVED");
+                }
+            }
+        }
+
+        boolean everBlockedExternal = false;
+        boolean forceClosed = false;
+        int forceCloseCount = 0;
+        int lastCode = 0;
+        String finalPhase = "";
+        for (int tick = 1; tick <= 12; tick++) {
+            Map<String, Object> state = store.load();
+            if (tick == 1) {
+                state.put("phase", "FIXING_FEEDBACK");
+                state.put("current_story", 53);
+                state.put("current_pr", 190);
+                state.put("branch", "story/53-x");
+            }
+            WorkflowLock lock = WorkflowLock.acquire(
+                    root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+            ReflectingGitHub github = new ReflectingGitHub();
+            WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                    config, state, store, github, repo, root, epic, 27, false,
+                    gitFactory, failingCodex, new ReviewCoordinator(), lock);
+            lastCode = orchestrator.reconcileAndExecute(new ArrayList<>(List.of(mutablePr)), null);
+            Map<String, Object> after = store.load();
+            finalPhase = Engine.asString(after.get("phase"));
+            if ("BLOCKED_EXTERNAL".equals(finalPhase)) {
+                everBlockedExternal = true;
+            }
+            if (github.resolvedThreads.contains(threadId)) {
+                forceClosed = true;
+            }
+            forceCloseCount = github.resolvedThreads.size();
+            lock.release();
+        }
+
+        // The finding is force-closed as unfixable and the workflow advances —
+        // it never dead-ends in a terminal BLOCKED loop...
+        assertThat(forceClosed).isTrue();
+        assertThat(everBlockedExternal).isFalse();
+        assertThat(lastCode).isNotEqualTo(1);
+        // ...the finding is terminally FORCE_CLOSED in the durable queue...
+        Map<String, Object> end = store.load();
+        assertThat(ReviewFindingQueue.findings(end)).anySatisfy(f -> {
+            if (threadId.equals(Engine.asString(f.get("thread_id")))) {
+                assertThat(f.get("status")).isEqualTo("FORCE_CLOSED");
+            }
+        });
+        // ...and it converges: after the thread is resolved the PR is no longer
+        // in a feedback/blocked phase, and the thread is not force-closed over
+        // and over (idempotent — resolved at most a small bounded number of
+        // times, not once per tick across 12 ticks).
+        assertThat(finalPhase).isNotIn("BLOCKED_EXTERNAL", "BLOCKED_REQUIREMENTS", "FIXING_FEEDBACK");
+        assertThat(forceCloseCount).isLessThanOrEqualTo(2);
     }
 }

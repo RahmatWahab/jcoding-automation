@@ -60,3 +60,12 @@ report `FIXED_THREAD: <thread-id>`. Report one of these declarations for every
 completed item in the supplied batch; a BLOCKED item must have no declaration
 and remains pending for a later attempt. The controller resolves only those
 declared after delivery verification.
+
+Controller auto-close rules (do not fight them): (1) A review thread raised on
+a commit older than the current PR head is auto-closed by the controller before
+you are dispatched — the anchored code has already changed, so do not spend
+effort re-deriving stale findings; if the issue truly persists, the next
+automated review re-raises it against the current head. (2) A finding you cannot
+resolve after the bounded attempt cap is auto-closed as unresolvable and the
+workflow advances; report it `BLOCKED` honestly rather than fabricating a fix —
+the controller handles the terminal decision.

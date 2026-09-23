@@ -115,6 +115,48 @@ class ReviewFindingQueueTest {
                         && "VERIFIED".equals(map.get("status")));
     }
 
+    @Test
+    void forceCloseMarksFindingTerminalAndExcludesItFromWork() {
+        Map<String, Object> state = new LinkedHashMap<>();
+        ReviewFindingQueue.synchronize(state, List.of(
+                finding("PRRT_1", "unfixable"), finding("PRRT_2", "still pending")), 3);
+
+        ReviewFindingQueue.forceClose(state, "PRRT_1", "UNFIXABLE_AFTER_CAP");
+
+        // The closed finding is terminal (never selected as work again)...
+        assertThat(ReviewFindingQueue.findings(state)).anySatisfy(item -> {
+            if ("PRRT_1".equals(item.get("thread_id"))) {
+                assertThat(item.get("status")).isEqualTo("FORCE_CLOSED");
+                assertThat(item.get("force_close_reason")).isEqualTo("UNFIXABLE_AFTER_CAP");
+            }
+        });
+        assertThat(ReviewFindingQueue.next(ReviewFindingQueue.findings(state)))
+                .extracting(f -> f.get("thread_id")).isEqualTo("PRRT_2");
+        // ...and the active batch now surfaces the remaining pending finding.
+        assertThat(ReviewFindingQueue.activeBatch(state))
+                .extracting(item -> item.get("thread_id"))
+                .containsExactly("PRRT_2");
+    }
+
+    @Test
+    void forceClosedFindingIsNotResurrectedWhenStillUnresolvedOnGitHub() {
+        Map<String, Object> state = new LinkedHashMap<>();
+        ReviewFindingQueue.synchronize(state, List.of(finding("PRRT_1", "unfixable")), 3);
+        ReviewFindingQueue.forceClose(state, "PRRT_1", "OUTDATED_PASSED_COMMIT");
+
+        // GitHub still reports the thread unresolved on the next sync (before it
+        // reflects the resolution). The finding must stay FORCE_CLOSED, not flip
+        // back to PENDING and re-enter the work queue.
+        ReviewFindingQueue.synchronize(state, List.of(finding("PRRT_1", "unfixable")), 3);
+
+        assertThat(ReviewFindingQueue.findings(state)).anySatisfy(item -> {
+            if ("PRRT_1".equals(item.get("thread_id"))) {
+                assertThat(item.get("status")).isEqualTo("FORCE_CLOSED");
+            }
+        });
+        assertThat(ReviewFindingQueue.next(ReviewFindingQueue.findings(state))).isNull();
+    }
+
     private static Map<String, Object> finding(String threadId, String body) {
         return new LinkedHashMap<>(Map.of(
                 "id", "comment-" + threadId,

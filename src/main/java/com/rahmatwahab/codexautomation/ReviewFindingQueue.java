@@ -70,10 +70,14 @@ final class ReviewFindingQueue {
 
         // A finding disappears from the authoritative unresolved snapshot only
         // after GitHub reports it resolved. Preserve the record for auditability.
+        // BLOCKED and FORCE_CLOSED are terminal controller decisions and must
+        // not be relabeled VERIFIED.
         for (Map.Entry<String, Map<String, Object>> entry : existing.entrySet()) {
             Map<String, Object> finding = entry.getValue();
+            Object status = finding.get("status");
             if (!currentKeys.contains(entry.getKey())
-                    && !"BLOCKED".equals(finding.get("status"))) {
+                    && !"BLOCKED".equals(status)
+                    && !"FORCE_CLOSED".equals(status)) {
                 finding.put("status", "VERIFIED");
                 finding.put("verified_at", now());
             }
@@ -292,6 +296,38 @@ final class ReviewFindingQueue {
                 }
             }
         }
+    }
+
+    /**
+     * Force-close a finding by thread id: mark it terminally FORCE_CLOSED so it
+     * is excluded from every future work batch (it is neither PENDING nor
+     * IN_PROGRESS) and refresh the active batch. Used when the controller
+     * resolves a review thread without a code fix (Rule 1: the thread was
+     * raised on an older commit and the head has advanced; Rule 2: the finding
+     * could not be fixed after the attempt cap). The record is retained for
+     * auditability rather than deleted.
+     */
+    static void forceClose(Map<String, Object> state, String threadId, String reason) {
+        if (threadId == null || threadId.isEmpty()) {
+            return;
+        }
+        Object stored = state.get(STATE_KEY);
+        if (!(stored instanceof List<?> list)) {
+            refreshActiveBatch(state);
+            return;
+        }
+        for (Object item : list) {
+            if (item instanceof Map<?, ?> raw) {
+                @SuppressWarnings("unchecked") Map<String, Object> finding =
+                        (Map<String, Object>) raw;
+                if (threadId.equals(value(finding.get("thread_id")))) {
+                    finding.put("status", "FORCE_CLOSED");
+                    finding.put("force_close_reason", reason == null ? "" : reason);
+                    finding.put("last_finished_at", now());
+                }
+            }
+        }
+        refreshActiveBatch(state);
     }
 
     private static Map<String, Object> newFinding(Map<String, Object> item) {

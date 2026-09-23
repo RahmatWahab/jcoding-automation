@@ -208,6 +208,11 @@ final class WorkflowOrchestrator {
                     ReviewFindingQueue.DEFAULT_BATCH_SIZE);
             state.put("feedback_batch_size", Math.max(1, feedbackBatchSize));
             ReviewFindingQueue.synchronize(state, feedback, feedbackBatchSize);
+            // Rule 1: force-close any unresolved thread raised on a commit older
+            // than the current head before selecting work. The finding queue is
+            // re-read afterwards so a closed thread is not dispatched to the
+            // worker this run.
+            closeOutdatedThreads(currentPr, Engine.asString(currentPr.get("headRefOid")));
             Map<String, Object> activeFinding = ReviewFindingQueue.active(state);
             List<Map<String, Object>> activeFeedback = ReviewFindingQueue.activeBatch(state);
             List<Map<String, Object>> events = Engine.reviewEvents(
@@ -224,16 +229,19 @@ final class WorkflowOrchestrator {
 
                 String head = Engine.asString(currentPr.get("headRefOid"));
 
-                // Terminal stuck head: only meaningful in a NON-delivering mode
-                // (dry-run or allow_push disabled), which is the only place
-                // stuck_head is set for feedback. In that mode a head that could
-                // not be fixed must not re-enter feedback every tick (the
-                // unbounded "reprocessed N times" loop). In a DELIVERING mode
-                // (allow_push=true) the workflow can commit fixes and advance the
-                // PR, so a stale stuck_head — e.g. left over from an earlier
-                // dry-run before the flags were enabled — must NOT block: clear
-                // it and let the normal live feedback path run. Only a genuinely
-                // new deliverable fix clears it in the non-delivering case.
+                // Terminal stuck head. A stuck_head marker is set in two
+                // situations: (a) NON-delivering mode (dry-run or allow_push
+                // disabled) after repeated unrecoverable feedback, and (b)
+                // DELIVERING mode when AUTO-DELIVER aborts because the worker
+                // produced no deliverable fix and no independent findings
+                // remain (reason=UNRECOVERABLE). In a delivering mode a *stale*
+                // marker (e.g. left over from an earlier dry-run) must be
+                // cleared and the normal live path resumed, but a genuine
+                // UNRECOVERABLE marker on the current head must be honoured —
+                // either parked-and-advanced (park_and_advance policy) or held
+                // idempotently (hold policy) — so it never re-enters feedback
+                // every tick (the unbounded "reprocessed N times" loop) nor
+                // floods the log.
                 boolean deliveringMode = !dryRun && Engine.asBool(workflow.get("allow_push"), false);
                 PrScopedResult stuck = handleStuckHeadForFeedback(
                         currentPr, head, legacyPrLevelFindingState, activeFinding, deliveringMode);
@@ -954,6 +962,145 @@ final class WorkflowOrchestrator {
         return Integer.MIN_VALUE;
     }
 
+    /**
+     * Force-close a review thread without a code fix: post an explanatory reply
+     * (when comments are enabled) and resolve the thread on GitHub (when thread
+     * resolution is enabled), record the update in the durable journal, and mark
+     * the finding FORCE_CLOSED so it is never reprocessed. Shared by Rule 1
+     * (outdated thread) and Rule 2 (unfixable after the attempt cap). No-op in
+     * dry-run. Returns true if the thread was resolved on GitHub.
+     *
+     * <p>The reply intentionally records that a genuinely-still-present issue
+     * will be re-raised by the next Codex review on the advanced head, so
+     * closing here does not permanently hide a real defect.</p>
+     */
+    private boolean forceCloseThread(Map<String, Object> currentPr, String threadId,
+                                     String head, String replyBody, String reason) {
+        if (threadId == null || threadId.isEmpty()) {
+            return false;
+        }
+        boolean resolved = false;
+        if (!dryRun) {
+            try {
+                if (Engine.asBool(workflow.get("allow_comments"), false)
+                        && replyBody != null && !replyBody.isEmpty()) {
+                    github.replyThread(threadId, replyBody);
+                    recordThreadUpdate(threadId, head, "FORCE_CLOSE_REPLIED");
+                }
+                if (Engine.asBool(workflow.get("allow_thread_resolution"), false)) {
+                    github.resolveThread(threadId);
+                    recordThreadUpdate(threadId, head, "RESOLVED");
+                    resolved = true;
+                }
+            } catch (GitHubError exc) {
+                // Best-effort: if GitHub rejects the close, leave the finding as
+                // is so a later run can retry; do not crash the workflow.
+                log.warn("FORCE-CLOSE: unable to resolve thread {} on PR #{}: {}",
+                        threadId, currentPr == null ? "?" : currentPr.get("number"),
+                        exc.getMessage());
+                return false;
+            }
+        }
+        ReviewFindingQueue.forceClose(state, threadId, reason);
+        return resolved;
+    }
+
+    /**
+     * Rule 1: force-close any unresolved review thread that was raised on a
+     * commit strictly older than the current PR head. The rationale: the code
+     * the finding anchored to has since changed, so the old thread is not a
+     * reliable signal; if the underlying issue is genuinely still present, the
+     * next Codex review on the advanced head raises a fresh thread. This keeps
+     * the PR clean and prevents the worker from grinding on stale findings.
+     *
+     * <p>Only threads whose finding carries a non-empty anchoring commit that
+     * differs from the current head are closed; a finding raised on the current
+     * head (no advance yet) is left untouched so live feedback is honoured.
+     * Returns the number of threads closed.</p>
+     */
+    private int closeOutdatedThreads(Map<String, Object> currentPr, String head) {
+        if (currentPr == null || head == null || head.isEmpty()) {
+            return 0;
+        }
+        int closed = 0;
+        for (Map<String, Object> finding : ReviewFindingQueue.findings(state)) {
+            String status = Engine.asString(finding.get("status"));
+            if (!"PENDING".equals(status) && !"IN_PROGRESS".equals(status)) {
+                continue;
+            }
+            String threadId = Engine.asString(finding.get("thread_id"));
+            if (threadId.isEmpty()) {
+                continue;
+            }
+            String findingCommit = Engine.asString(finding.get("commit"));
+            // Only close a thread that was anchored to an EARLIER commit. A
+            // finding with no recorded commit, or one raised on the current
+            // head, is treated as live and left for the normal feedback path.
+            if (findingCommit.isEmpty() || findingCommit.equals(head)) {
+                continue;
+            }
+            String reply = "Auto-closing this review thread: it was raised on commit `"
+                    + shortSha(findingCommit) + "`, and the pull request head has since advanced to `"
+                    + shortSha(head) + "`. The affected code has changed, so this thread no longer "
+                    + "reflects the current head. If the issue is still present, the next automated "
+                    + "review will re-raise it against the current commit.\n\n"
+                    + "<!-- codex-automation-force-close:thread=" + threadId + ":reason=OUTDATED:head="
+                    + head + " -->";
+            forceCloseThread(currentPr, threadId, head, reply, "OUTDATED_PASSED_COMMIT");
+            log.info("THREAD FORCE-CLOSED (outdated): PR #{} thread {} raised on {} < head {}",
+                    currentPr.get("number"), threadId, shortSha(findingCommit), shortSha(head));
+            closed++;
+        }
+        if (closed > 0) {
+            save();
+        }
+        return closed;
+    }
+
+    /**
+     * Rule 2: force-close the active review finding as unresolvable and set the
+     * next phase so the workflow advances instead of dead-ending. Posts an
+     * explanatory reply/resolve (best-effort, honoring the config gates), marks
+     * the finding FORCE_CLOSED, clears the per-finding/terminal/reconcile guards,
+     * and selects {@code FIXING_FEEDBACK} when independent findings remain or
+     * {@code REVIEWING_CODE} otherwise. Does not persist or return — the caller
+     * owns save() and the run's exit code. Shared by the feedback attempt-cap
+     * path and the reconcile no-deliverable path so both behave identically.
+     */
+    private void forceCloseUnfixableAndAdvance(Map<String, Object> currentPr, String head,
+                                               String reasonPhrase) {
+        Map<String, Object> active = ReviewFindingQueue.active(state);
+        String threadId = active == null ? "" : Engine.asString(active.get("thread_id"));
+        if (!threadId.isEmpty()) {
+            String reply = "Auto-closing this review thread as unresolvable by automation: "
+                    + reasonPhrase + ". Marking the finding invalid and continuing. If the issue is "
+                    + "still present, the next automated review will re-raise it against the current "
+                    + "commit.\n\n<!-- codex-automation-force-close:thread=" + threadId
+                    + ":reason=UNFIXABLE_AFTER_CAP:head=" + head + " -->";
+            forceCloseThread(currentPr, threadId, head, reply, "UNFIXABLE_AFTER_CAP");
+            log.info("THREAD FORCE-CLOSED (unfixable): PR #{} thread {} on head {}",
+                    currentPr == null ? "?" : currentPr.get("number"), threadId, shortSha(head));
+        }
+        state.remove("feedback_guard_key");
+        state.remove("feedback_attempts");
+        state.remove("stuck_head");
+        state.remove("stuck_head_reason");
+        state.remove("stuck_finding_key");
+        state.remove("resume_guard_head");
+        state.remove("resume_attempts");
+        state.remove("resume_total_story");
+        state.remove("resume_total_attempts");
+        state.remove("resume_total_resolved_baseline");
+        state.remove("last_feedback_result");
+        state.remove("last_feedback_result_head");
+        state.remove("error");
+        state.put("reconciliation_attempts", 0);
+        Map<String, Object> nextFinding = ReviewFindingQueue.next(
+                ReviewFindingQueue.findings(state));
+        state.put("phase", nextFinding != null ? "FIXING_FEEDBACK" : "REVIEWING_CODE");
+        state.put("phase_attempt", 0);
+    }
+
     private void recordThreadUpdate(String threadId, String head, String action) {
         Object existing = state.get("thread_updates");
         List<Object> updates = existing instanceof List<?> list
@@ -1380,21 +1527,24 @@ final class WorkflowOrchestrator {
                         currentPr.get("number"), state.get("phase"));
                 return PrScopedResult.exit(deliveryResult == Integer.MIN_VALUE ? 0 : deliveryResult);
             }
-            // Nothing to deliver: escalate via the pending-reconcile mechanism.
-            // Return null so the caller continues (feedback_reconcile_pending
-            // keeps BLOCKED_REQUIREMENTS and the deviation supervisor routes it).
-            state.put("phase", "BLOCKED_REQUIREMENTS");
-            state.put("feedback_reconcile_pending", true);
-            state.put("error", "Feedback for PR #" + currentPr.get("number")
-                    + " head " + shortSha(head) + " reprocessed " + feedbackAttempts
-                    + " times and the worker produced no deliverable fix; escalating "
-                    + "to the reasoning supervisor.");
-            state.remove("feedback_guard_key");
-            state.remove("feedback_attempts");
+            // Nothing to deliver: Rule 2 — the worker has tried up to the
+            // attempt cap and cannot produce a fix. Rather than looping or
+            // dead-ending, force-close the active finding thread as invalid and
+            // advance. Any committed work stays on the PR; if the issue is
+            // genuinely still present, the next Codex review re-raises it.
+            forceCloseUnfixableAndAdvance(currentPr, head,
+                    "the worker attempted a fix " + feedbackAttempts + " times on head `"
+                    + shortSha(head) + "` without a verifiable resolution");
+            state.put("run_finished_at", Controller.now());
             save();
-            log.info("FEEDBACK ESCALATION: PR #{} no deliverable fix after {} attempts; "
-                    + "routing to supervisor", currentPr.get("number"), feedbackAttempts);
-            return null;
+            log.info("FEEDBACK CAP RESOLVED BY FORCE-CLOSE: PR #{} advancing (next phase={})",
+                    currentPr.get("number"), state.get("phase"));
+            // End this tick so the next run re-reads the PR from GitHub with the
+            // thread now resolved and re-evaluates from clean state. Continuing
+            // within this tick would re-run reconcile on the stale PR snapshot
+            // (which still reports CHANGES_REQUESTED until GitHub reflects the
+            // resolution) and re-route into the loop we just broke.
+            return PrScopedResult.exit(0);
         }
         // Simulation (dry-run) or push disabled: mark terminally stuck and stop
         // so the controller does not re-enter feedback every tick.
@@ -1444,13 +1594,56 @@ final class WorkflowOrchestrator {
                 log.info("STUCK-FINDING BYPASSED: continuing with independent "
                         + "review finding on head {}", shortSha(head));
             } else {
+                String findingLabel = activeFinding == null ? "all-findings"
+                        : ReviewFindingQueue.key(activeFinding);
+                Integer parkStory = state.get("current_story") == null
+                        ? null : Engine.asInt(state.get("current_story"));
+                // Park-and-advance (Requirement 5) also applies on the feedback
+                // path: when the policy is enabled, do not hold this story
+                // forever. Record it as parked on the current head, notify once,
+                // reset its story-scoped state, and go IDLE so the next tick
+                // selects a different eligible story. It auto-unparks when the
+                // head advances. This mirrors runDeviationSupervisor and honours
+                // the "no dead-end, no human in the delivery loop" guarantee.
+                if (ParkPolicy.enabled(workflow) && parkStory != null) {
+                    boolean newlyParked = ParkPolicy.park(state, parkStory, head,
+                            "UNRECOVERABLE", Controller.now());
+                    if (newlyParked && !dryRun
+                            && Engine.asBool(workflow.get("allow_comments"), false)) {
+                        try {
+                            github.comment(Engine.asInt(currentPr.get("number")),
+                                    "⏸️ PARKED — story #" + parkStory + " could not be advanced on "
+                                    + "head " + shortSha(head) + " after repeated automated attempts "
+                                    + "on review finding " + findingLabel + ". The controller has "
+                                    + "parked it and will continue with the next eligible story; it "
+                                    + "auto-resumes if this head advances. Operator action may be "
+                                    + "needed.");
+                        } catch (GitHubError ignored) {
+                            // notification is best-effort; parking still proceeds
+                        }
+                    }
+                    log.info("PARKED: story #{} on head {} finding {} (reason UNRECOVERABLE); "
+                            + "advancing to the next eligible story",
+                            parkStory, shortSha(head), findingLabel);
+                    WorkflowStateCodec.clearStoryScoped(state);
+                    state.put("current_story", null);
+                    state.put("current_pr", null);
+                    state.put("phase", "IDLE");
+                    save();
+                    return PrScopedResult.exit(0);
+                }
+                // Default "hold" policy: keep the head blocked, but log the hold
+                // idempotently. A raw per-tick log.info here produced an
+                // unbounded flood (observed as 800+ identical lines/hours in
+                // production); logStableState suppresses the repeat to DEBUG.
+                // Log BEFORE save() so the updated last_stable_log_signature is
+                // persisted and the next tick recognises the repeat.
                 state.put("phase", "BLOCKED_EXTERNAL");
-                save();
-                log.info("BLOCKED (terminal): PR #{} finding {} on head {} is unrecoverable; "
+                logStableState("FEEDBACK_STUCK_TERMINAL|" + shortSha(head) + "|" + findingLabel,
+                        "BLOCKED (terminal): PR #{} finding {} on head {} is unrecoverable; "
                                 + "holding until the finding or head changes",
-                        currentPr.get("number"),
-                        activeFinding == null ? "all-findings"
-                                : ReviewFindingQueue.key(activeFinding), shortSha(head));
+                        currentPr.get("number"), findingLabel, shortSha(head));
+                save();
                 return PrScopedResult.exit(1);
             }
         }
@@ -1668,55 +1861,21 @@ final class WorkflowOrchestrator {
                 hasDeliverable = false;
             }
             if (!hasDeliverable) {
-                String noProgressError = "Story #" + current + " PR #" + currentPr.get("number")
-                        + " head " + shortSha(reconcileHead) + " could not be advanced after "
-                        + "repeated resume attempts and the worker produced no deliverable "
-                        + "change for the active review finding.";
-                ReviewFindingQueue.markActiveBlocked(state, noProgressError);
-                Map<String, Object> nextFinding = ReviewFindingQueue.next(
-                        ReviewFindingQueue.findings(state));
-                if (nextFinding != null) {
-                    state.put("phase", "FIXING_FEEDBACK");
-                    state.put("next_action", "FIXING_FEEDBACK");
-                    state.remove("stuck_head");
-                    state.remove("stuck_head_reason");
-                    state.remove("stuck_finding_key");
-                    state.remove("resume_guard_head");
-                    state.remove("resume_attempts");
-                    state.remove("resume_total_story");
-                    state.remove("resume_total_attempts");
-                    state.remove("resume_total_resolved_baseline");
-                    state.remove("last_feedback_result");
-                    state.remove("last_feedback_result_head");
-                    state.put("error", noProgressError + " Continuing with the next finding.");
-                    state.put("exit_code", result.exitCode());
-                    state.put("run_finished_at", Controller.now());
-                    save();
-                    cleanup(renderedPrompt);
-                    log.warn("REVIEW FINDING BLOCKED: {}; continuing with next finding",
-                            noProgressError);
-                    return 0;
-                }
-                state.put("phase", "BLOCKED_EXTERNAL");
-                state.put("error", noProgressError
-                        + " No independent findings remain; operator intervention is required.");
-                state.put("stuck_head", reconcileHead);
-                state.put("stuck_head_reason", "UNRECOVERABLE");
-                Map<String, Object> blockedFinding = ReviewFindingQueue.active(state);
-                if (blockedFinding != null) {
-                    state.put("stuck_finding_key", ReviewFindingQueue.key(blockedFinding));
-                }
-                state.remove("resume_guard_head");
-                state.remove("resume_attempts");
-                state.remove("resume_total_story");
-                state.remove("resume_total_attempts");
-                state.remove("resume_total_resolved_baseline");
+                // Rule 2: the active finding could not be advanced after the
+                // resume cap and nothing is deliverable. Force-close it as
+                // unresolvable instead of dead-ending on operator intervention.
+                // Any committed work remains on the PR; a genuinely-present
+                // issue is re-raised by the next Codex review on the head.
+                forceCloseUnfixableAndAdvance(currentPr, reconcileHead,
+                        "the fix could not be advanced on head `" + shortSha(reconcileHead)
+                        + "` after repeated attempts, and no deliverable change was produced");
                 state.put("exit_code", result.exitCode());
                 state.put("run_finished_at", Controller.now());
                 save();
                 cleanup(renderedPrompt);
-                log.error("AUTO-DELIVER ABORTED (nothing to deliver): {}", state.get("error"));
-                return 1;
+                log.info("AUTO-DELIVER RESOLVED BY FORCE-CLOSE: PR #{} advancing (next phase={})",
+                        currentPr.get("number"), state.get("phase"));
+                return 0;
             }
             state.put("result_status", "SUCCESS");
             state.put("result_evidence", "DEFERRED_TO_CI");
