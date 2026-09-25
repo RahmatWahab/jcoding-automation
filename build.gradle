@@ -4,7 +4,7 @@ plugins {
     id "checkstyle"
 }
 
-group = "com.rahmatwahab"
+group = "com.jcoding"
 version = "0.1.0-SNAPSHOT"
 
 java {
@@ -14,7 +14,7 @@ java {
 }
 
 application {
-    mainClass = "com.rahmatwahab.codexautomation.Main"
+    mainClass = "com.jcoding.workflow.Main"
 }
 
 dependencies {

@@ -85,7 +85,7 @@ fi
 # 2) Stop any active controller and codex worker (graceful TERM, then KILL).
 if [[ $NO_STOP -ne 1 ]]; then
   stopped=0
-  for pat in 'com.rahmatwahab.codexautomation.Main' "codex --cd $REPO_PATH" 'codex-code-mode-host'; do
+  for pat in 'com.jcoding.workflow.Main' "codex --cd $REPO_PATH" 'codex-code-mode-host'; do
     if pgrep -f "$pat" >/dev/null 2>&1; then
       pkill -TERM -f "$pat" && stopped=1 || true
     fi
@@ -93,11 +93,11 @@ if [[ $NO_STOP -ne 1 ]]; then
   if [[ $stopped -eq 1 ]]; then
     echo "STOP: sent TERM to active processes; waiting up to 10s..."
     for _ in $(seq 1 10); do
-      pgrep -f 'com.rahmatwahab.codexautomation.Main' >/dev/null 2>&1 || break
+      pgrep -f 'com.jcoding.workflow.Main' >/dev/null 2>&1 || break
       sleep 1
     done
     # Force-kill anything still alive.
-    for pat in 'com.rahmatwahab.codexautomation.Main' "codex --cd $REPO_PATH" 'codex-code-mode-host'; do
+    for pat in 'com.jcoding.workflow.Main' "codex --cd $REPO_PATH" 'codex-code-mode-host'; do
       pkill -KILL -f "$pat" 2>/dev/null || true
     done
   fi
