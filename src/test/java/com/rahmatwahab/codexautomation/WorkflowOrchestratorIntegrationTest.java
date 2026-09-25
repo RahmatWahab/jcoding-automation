@@ -3288,4 +3288,256 @@ class WorkflowOrchestratorIntegrationTest {
         assertThat(finalPhase).isNotIn("BLOCKED_EXTERNAL", "BLOCKED_REQUIREMENTS", "FIXING_FEEDBACK");
         assertThat(forceCloseCount).isLessThanOrEqualTo(2);
     }
+
+    /** GitHub fake for a story that has NO PR yet; createPr opens PR #200. */
+    private static final class NoPrGitHub extends GitHub {
+        boolean prCreated = false;
+
+        NoPrGitHub() {
+            super("owner", "repo", "GH_TOKEN", "gh", 30,
+                    (command, timeout) -> new GitHub.CommandResult(0, "{}", ""), name -> "t");
+        }
+
+        @Override
+        public Object issue(int number) {
+            if (number == 27) {
+                return map("number", 27, "title", "EPIC", "state", "OPEN",
+                        "body", "Stories: #66", "url", "http://x/27");
+            }
+            return map("number", number, "title", "Story " + number, "state", "OPEN",
+                    "body", "Acceptance criteria", "url", "http://x/" + number);
+        }
+
+        @Override
+        public Object prs() {
+            return new ArrayList<>();
+        }
+
+        @Override
+        public Object createPr(String title, String body, String base, String head) {
+            prCreated = true;
+            return map("number", 200, "url", "http://x/pr/200", "state", "OPEN",
+                    "isDraft", false, "headRefName", head, "headRefOid", "newhead1");
+        }
+
+        @Override
+        public Map<String, Object> pr(int number) {
+            return map("number", 200, "state", "OPEN", "mergedAt", null,
+                    "headRefOid", "newhead1", "headRefName", "story/66-x",
+                    "url", "http://x/pr/200", "reviewDecision", "",
+                    "statusCheckRollup", List.of(map("status", "IN_PROGRESS")),
+                    "reviewThreadsAvailable", true, "reviewThreads", new ArrayList<>(),
+                    "reviews", new ArrayList<>(), "comments", new ArrayList<>());
+        }
+
+        @Override
+        public void comment(int number, String bodyText) {
+            // no-op
+        }
+    }
+
+    @Test
+    void prePrResumeReviewWithUncommittedWorkDeliversPrInsteadOfLooping(@TempDir Path root)
+            throws Exception {
+        // Regression for the production loop (story #66): the IMPLEMENTING worker
+        // blocked on a repo-owned validation harness, so the fix stayed
+        // UNCOMMITTED on the story branch with current_pr=null. The supervisor
+        // (reconcile) correctly decided RESUME_REVIEW ("commit, push, create the
+        // PR, then review"), but the controller only flipped the phase to
+        // REVIEWING_CODE — which is a no-op without a PR — and re-looped forever
+        // (attempt=56 with pr=none in the field). After the fix the controller
+        // executes the decision: it commits, pushes, and creates the PR, then
+        // defers to CI. No human, no loop.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q");
+        Path prompts = root.resolve("prompts");
+        Files.createDirectories(prompts);
+        Files.writeString(prompts.resolve("common.md"), "COMMON");
+        Files.writeString(prompts.resolve("reconcile.md"), "{{COMMON}}\nReconcile.");
+        Files.createDirectories(root.resolve("state"));
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", false, "max_resume_attempts", 2,
+                        "delivery_verification_attempts", 1,
+                        "delivery_verification_delay_seconds", 0),
+                "budgets", map(),
+                "workflow", map("allow_push", true, "allow_pr_creation", true,
+                        "allow_comments", true));
+
+        Map<String, Object> state = new LinkedHashMap<>();
+        state.put("phase", "BLOCKED_REQUIREMENTS"); // routes to reconcile.md
+        state.put("current_story", 66);
+        state.put("current_pr", null);
+        state.put("branch", "story/66-x");
+        // No last_processed_commit: work is UNCOMMITTED (the #66 state).
+
+        // Supervisor decides RESUME_REVIEW: implementation exists, only the PR is
+        // missing — commit/push/create-PR then review.
+        CodexRunner codex = new CodexRunner(Map.of(), System::nanoTime) {
+            @Override
+            public CodexResult run(Map<String, Object> cfg, Path prompt, Path r, boolean dry,
+                                   Runnable hb, Integer timeout) {
+                return new CodexResult(0,
+                        "DECISION_ACTION: RESUME_REVIEW\n"
+                        + "DECISION_REASON: implementation exists, only PR association is missing\n"
+                        + "BLOCKER_CLASS: NONE\n"
+                        + "RECOVERY_ACTION: commit, push, create the PR, then review\n"
+                        + "RESULT_STATUS: SUCCESS\nRESULT_NEXT_PHASE: REVIEWING_CODE\n"
+                        + "RESULT_BLOCKER: NONE\nRESULT_EVIDENCE: COMPLETE\n");
+            }
+        };
+
+        // Fake git: story branch checked out, DIRTY worktree (uncommitted fix),
+        // commit produces a new head, local/origin heads converge.
+        List<String> gitCalls = new ArrayList<>();
+        GitOperations.GitRunner gitRunner = (r, args) -> {
+            String key = String.join(" ", args);
+            gitCalls.add(key);
+            if (key.startsWith("status --porcelain")) {
+                return new GitOperations.GitResult(0, " M src/contract.txt\n", "");
+            }
+            if (key.startsWith("branch --show-current") || key.startsWith("branch --list")) {
+                return new GitOperations.GitResult(0, "story/66-x\n", "");
+            }
+            if (key.startsWith("rev-parse HEAD")) {
+                return new GitOperations.GitResult(0, "newhead1\n", "");
+            }
+            if (key.startsWith("ls-remote origin")) {
+                return new GitOperations.GitResult(0, "newhead1\trefs/heads/story/66-x\n", "");
+            }
+            return new GitOperations.GitResult(0, "", "");
+        };
+        Controller.GitOperationsFactory gitFactory = new Controller.GitOperationsFactory(repo) {
+            @Override
+            public GitOperations create() {
+                return new GitOperations(repo, gitRunner);
+            }
+        };
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        WorkflowLock lock = WorkflowLock.acquire(root.resolve("state").resolve("epic-27.lock"),
+                900, 3, 10);
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #66", "url", "http://x/27");
+        NoPrGitHub github = new NoPrGitHub();
+
+        WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                config, state, store, github, repo, root, epic, 27, false,
+                gitFactory, codex, new ReviewCoordinator(), lock);
+
+        int code = orchestrator.reconcileAndExecute(new ArrayList<>(), null);
+        lock.release();
+
+        // Executed the decision: committed, pushed, created the PR; deferred to
+        // CI. Not stuck in a blocked/review-without-PR loop.
+        assertThat(code).isEqualTo(0);
+        assertThat(github.prCreated).isTrue();
+        assertThat(state.get("current_pr")).isEqualTo(200);
+        assertThat(state.get("phase")).isEqualTo("WAITING_FOR_CI");
+        assertThat(state.get("phase")).isNotIn("BLOCKED_REQUIREMENTS", "REVIEWING_CODE");
+        assertThat(gitCalls).anyMatch(c -> c.startsWith("commit -m"));
+        assertThat(gitCalls).anyMatch(c -> c.startsWith("push --set-upstream origin story/66-x"));
+    }
+
+    @Test
+    void prePrResumeWithCleanWorktreeAndExhaustedCapsAdvancesStoryInsteadOfLooping(
+            @TempDir Path root) throws Exception {
+        // The other pre-PR dead-end: a RESUME decision on a PR-dependent phase
+        // with NO PR and NOTHING to deliver (clean worktree). Once the resume
+        // caps are exhausted the controller must autonomously advance to the
+        // next story rather than loop on an empty pre-PR state. No human.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q");
+        Path prompts = root.resolve("prompts");
+        Files.createDirectories(prompts);
+        Files.writeString(prompts.resolve("common.md"), "COMMON");
+        Files.writeString(prompts.resolve("reconcile.md"), "{{COMMON}}\nReconcile.");
+        Files.createDirectories(root.resolve("state"));
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                // max_resume_attempts=1, loop multiplier=1 so the cumulative cap
+                // trips quickly in-test.
+                "automation", map("dry_run", false, "max_resume_attempts", 1,
+                        "resume_loop_multiplier", 1),
+                "budgets", map(),
+                "workflow", map("allow_push", true, "allow_pr_creation", true));
+
+        CodexRunner codex = new CodexRunner(Map.of(), System::nanoTime) {
+            @Override
+            public CodexResult run(Map<String, Object> cfg, Path prompt, Path r, boolean dry,
+                                   Runnable hb, Integer timeout) {
+                return new CodexResult(0,
+                        "DECISION_ACTION: RESUME_REVIEW\n"
+                        + "DECISION_REASON: no PR associated yet\n"
+                        + "BLOCKER_CLASS: NONE\n"
+                        + "RECOVERY_ACTION: create the PR then review\n"
+                        + "RESULT_STATUS: SUCCESS\nRESULT_NEXT_PHASE: REVIEWING_CODE\n"
+                        + "RESULT_BLOCKER: NONE\nRESULT_EVIDENCE: COMPLETE\n");
+            }
+        };
+
+        // Clean worktree: nothing to deliver.
+        GitOperations.GitRunner gitRunner = (r, args) -> {
+            String key = String.join(" ", args);
+            if (key.startsWith("status --porcelain")) {
+                return new GitOperations.GitResult(0, "", ""); // CLEAN
+            }
+            if (key.startsWith("branch --show-current") || key.startsWith("branch --list")) {
+                return new GitOperations.GitResult(0, "story/66-x\n", "");
+            }
+            if (key.startsWith("rev-parse HEAD")) {
+                return new GitOperations.GitResult(0, "base000\n", "");
+            }
+            return new GitOperations.GitResult(0, "", "");
+        };
+        Controller.GitOperationsFactory gitFactory = new Controller.GitOperationsFactory(repo) {
+            @Override
+            public GitOperations create() {
+                return new GitOperations(repo, gitRunner);
+            }
+        };
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #66", "url", "http://x/27");
+
+        boolean[] advanced = {false};
+        String lastPhase = "";
+        for (int run = 1; run <= 5; run++) {
+            Map<String, Object> state = store.load();
+            state.put("phase", "BLOCKED_REQUIREMENTS");
+            state.put("current_story", 66);
+            state.put("current_pr", null);
+            state.put("branch", "story/66-x");
+            WorkflowLock lock = WorkflowLock.acquire(
+                    root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+            NoPrGitHub github = new NoPrGitHub();
+            WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                    config, state, store, github, repo, root, epic, 27, false,
+                    gitFactory, codex, new ReviewCoordinator(), lock);
+            orchestrator.reconcileAndExecute(new ArrayList<>(), null);
+            lastPhase = Engine.asString(state.get("phase"));
+            lock.release();
+            Map<String, Object> persisted = store.load();
+            Object completed = persisted.get("completed_stories");
+            if (completed instanceof List<?> list && list.contains(66)) {
+                advanced[0] = true;
+                break;
+            }
+        }
+
+        // Autonomously advanced past the un-deliverable pre-PR story; never
+        // dead-ended or looped indefinitely.
+        assertThat(advanced[0]).isTrue();
+    }
 }

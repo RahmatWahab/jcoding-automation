@@ -1911,6 +1911,30 @@ final class WorkflowOrchestrator {
             return 0;
         }
 
+        // Autonomous execution of a RESUME/PROCESS decision when the story has
+        // NO PR yet. The supervisor (reconcile via Codex) is the on-behalf-of-
+        // human actor: when it decides to resume a PR-dependent phase
+        // (REVIEWING_CODE / FIXING_FEEDBACK) but no PR exists, the controller
+        // must MAKE that decision productive instead of merely flipping the
+        // phase — otherwise the target phase is a no-op and the workflow loops
+        // forever (observed: story blocked pre-PR, RESUME_REVIEW re-entered 50+
+        // times with pr=none). The fully autonomous rule is deliver-or-advance,
+        // never wait:
+        //   • deliverable work on the story branch -> commit + push + create the
+        //     PR (the existing delivery pipeline), so review/CI can actually run;
+        //   • nothing deliverable and the resume caps are exhausted -> advance to
+        //     the next story so the EPIC keeps moving.
+        // States that already work (a PR exists) are untouched: this block is
+        // gated on currentPr == null and a PR-dependent resume target.
+        if (currentPr == null && resumeAction
+                && isPrDependentPhase(Engine.asString(state.get("phase")))) {
+            int prLessResult = executePrLessResume(git, current, result,
+                    renderedPrompt, feedbackToResolve, forceDelivery);
+            if (prLessResult != Integer.MIN_VALUE) {
+                return prLessResult;
+            }
+        }
+
         save();
         log.info("RECONCILIATION ACCEPTED: reason={} action={} detail={}",
                 state.get("blocker_class"), state.get("decision_action"), outcome.detail());
@@ -1936,6 +1960,107 @@ final class WorkflowOrchestrator {
             save();
         }
         return 0;
+    }
+
+    /**
+     * Phases that cannot make progress without an associated pull request.
+     * A RESUME/PROCESS decision targeting one of these while {@code current_pr}
+     * is null is a no-op that re-loops unless the controller first delivers a PR
+     * (see {@link #executePrLessResume}).
+     */
+    private static boolean isPrDependentPhase(String phase) {
+        return "REVIEWING_CODE".equals(phase) || "FIXING_FEEDBACK".equals(phase);
+    }
+
+    /**
+     * Autonomously carry out a supervisor RESUME/PROCESS decision for a story
+     * that has NO PR yet. Fully autonomous, never waits for a human:
+     * <ul>
+     *   <li>deliverable story work present ({@code RECOVERABLE_STORY_BRANCH}) ->
+     *       commit + push + create the PR via the existing delivery pipeline,
+     *       then let CI/review run against the new head;</li>
+     *   <li>nothing deliverable ({@code CLEAN}) AND the resume caps are exhausted
+     *       ({@code forceDelivery}) -> advance to the next story so the EPIC keeps
+     *       moving instead of looping on an empty pre-PR state.</li>
+     * </ul>
+     * Returns an exit code to propagate, or {@link Integer#MIN_VALUE} to let the
+     * caller fall through to the normal {@code RECONCILIATION ACCEPTED} path
+     * (used when work exists but push/PR creation is disabled, or when the
+     * worktree is clean but the caps are not yet exhausted — a bounded retry).
+     */
+    private int executePrLessResume(GitOperations git, Integer current,
+                                    CodexRunner.CodexResult result, Path renderedPrompt,
+                                    List<Map<String, Object>> feedbackToResolve,
+                                    boolean forceDelivery) {
+        GitOperations.WorktreeState worktreeState;
+        try {
+            worktreeState = git.classifyWorktree(state);
+        } catch (RuntimeException exc) {
+            // Cannot classify the tree — do not guess. Fall through to the
+            // normal accepted path (a subsequent tick re-evaluates).
+            log.warn("PRE-PR RESUME: unable to classify worktree for story #{}: {}",
+                    current, exc.getMessage());
+            return Integer.MIN_VALUE;
+        }
+
+        boolean hasDeliverable =
+                worktreeState == GitOperations.WorktreeState.RECOVERABLE_STORY_BRANCH;
+
+        // Case 1: deliver the existing story work as the first PR. Only when the
+        // workflow permits real mutations; otherwise fall through so the plain
+        // accepted path records the decision (dry-run / push disabled).
+        if (hasDeliverable && !dryRun
+                && Engine.asBool(workflow.get("allow_push"), false)
+                && Engine.asBool(workflow.get("allow_pr_creation"), false)) {
+            log.info("PRE-PR DELIVER: story #{} has implementation but no PR; committing, "
+                    + "pushing, and creating the PR so review/CI can proceed (phase={})",
+                    current, state.get("phase"));
+            // runDeliveryPipeline creates the PR for a currentPr==null story when
+            // the phase is a PR-ready phase (REVIEWING_CODE / FIXING_FEEDBACK
+            // qualify) and then returns MIN_VALUE. Clear the resume guards: a real
+            // head is about to exist, mirroring the post-commit reset in the
+            // delivery pipeline so a fresh PR does not inherit pre-commit counters.
+            state.remove("resume_guard_head");
+            state.remove("resume_attempts");
+            state.remove("resume_total_story");
+            state.remove("resume_total_attempts");
+            state.remove("resume_total_resolved_baseline");
+            save();
+            int deliveryResult = runDeliveryPipeline(git, current, null,
+                    result.output(), feedbackToResolve);
+            cleanup(renderedPrompt);
+            if (deliveryResult != Integer.MIN_VALUE) {
+                return deliveryResult;
+            }
+            state.put("exit_code", result.exitCode());
+            state.put("run_finished_at", Controller.now());
+            save();
+            log.info("PRE-PR DELIVER COMPLETE: story #{} phase={}", current, state.get("phase"));
+            return 0;
+        }
+
+        // Case 2: nothing to deliver AND the resume caps are exhausted. The
+        // supervisor cannot advance a PR-dependent phase without a PR and there
+        // is no work to turn into one. Autonomously advance to the next story
+        // rather than looping on an empty pre-PR state (never waits for a human).
+        if (!hasDeliverable && forceDelivery && current != null) {
+            log.info("PRE-PR ADVANCE: story #{} has no deliverable work and the resume caps "
+                    + "are exhausted with no PR; advancing to the next story to keep the EPIC "
+                    + "moving", current);
+            advanceStory(current);
+            state.put("exit_code", result.exitCode());
+            state.put("run_finished_at", Controller.now());
+            save();
+            cleanup(renderedPrompt);
+            log.info("PRE-PR ADVANCE COMPLETE: story #{} completed-and-advanced; phase={}",
+                    current, state.get("phase"));
+            return 0;
+        }
+
+        // Otherwise (work exists but mutations disabled, or clean tree but caps
+        // not yet reached) let the normal accepted path handle it — a bounded
+        // retry, not a permanent stall.
+        return Integer.MIN_VALUE;
     }
 
     private Integer prepareWorktreeForPhase(GitOperations git, Integer current,
