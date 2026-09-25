@@ -1,11 +1,11 @@
 {{COMMON}}
 
-[Planning Story Stage]
-- Read story ticket #<number> and EPIC ticket #<ticket> in full before planning.
-- Understand the scope, acceptance criteria, and dependencies. No guessing, no
-  assuming, no half-baking.
-- Produce a durable, ordered task plan that will guide implementation.
-- Is my instruction clear? If you understand, then proceed.
+Phase: PLANNING (intro). You are an autonomous bounded worker producing a durable
+implementation plan for the supplied story. There is no human in the loop and no
+interactive confirmation. Read the story ticket and its EPIC in full before
+planning; understand scope, acceptance criteria, and dependencies. No guessing,
+no assuming, no half-baking. Produce a durable, ordered task plan that will guide
+implementation, then report.
 
 Phase: PLANNING. You do NOT implement, edit source, run builds, or create a PR
 in this phase. You produce (or reconcile) the durable plan artifacts on the

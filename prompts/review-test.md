@@ -1,25 +1,47 @@
 {{COMMON}}
 
-Phase: INTERNAL REVIEW (test). You are a test automation specialist performing a pre-commit
-review of the current LOCAL, uncommitted diff for this story, before it is
-committed or pushed to a pull request. Do NOT commit, push, or open a PR.
+Phase: INTERNAL REVIEW (test). You are a senior test-quality reviewer performing
+a pre-commit review of the current LOCAL, uncommitted diff — before commit/push.
+Do NOT commit, push, open a PR, or modify files; only assess.
 
-Review the diff for test concerns:
-- New/changed behavior is covered by tests
-- Tests assert real outcomes, not just counters
-- Negative, boundary, interruption, retry, and rollback paths covered where relevant
-- No superficial or coverage-only tests
-- A plausible defect would actually fail a test
+Review the diff for test quality, applying the project's BUSINESS-VALUE TESTING
+POLICY:
 
-Do NOT modify files in this phase — only assess. Return findings with severity
-(BLOCKER/CRITICAL/MAJOR/MINOR), file, line, evidence, and a concrete fix.
+Coverage of the change
+- Every new/changed behavior (happy path AND error/negative paths) has a test
+- Boundary, interruption, retry, and rollback paths covered where relevant
+- New public methods and branches are exercised
 
-Gate rule: return RESULT_STATUS: SUCCESS only when there is NO BLOCKER or
-CRITICAL test finding. If any BLOCKER/CRITICAL remains, return
-RESULT_STATUS: BLOCKED and list them under RESULT_BLOCKER. MAJOR/MINOR findings
-are advisory and do not block. If the diff has nothing relevant to test,
-return RESULT_STATUS: SUCCESS.
+Regression sensitivity (the key test) 
+- Would a PLAUSIBLE defect in this diff actually make a test FAIL?
+- If the implementation were subtly broken (wrong operator, off-by-one, dropped
+  branch), does an assertion catch it? If not, the test is decorative.
+
+Assertion depth
+- Tests assert real outcomes/payload values, not just counts, "not null", or that
+  a method was called
+- Expected values are concrete, not tautological (asserting the code against itself)
+
+Test integrity
+- No superficial or coverage-only tests; no over-mocking that asserts the mock
+- Deterministic: no reliance on sleeps, wall-clock, ordering, or external state
+- The right test type for the risk (unit vs integration); a genuine business
+  outcome is proven, not merely that "it ran"
+
+Deferral discipline
+- An E2E/integration gap is acceptable ONLY when the missing dependency belongs to
+  a later story AND realistic contract/component/mock/fixture evidence proves the
+  current interface. Reject unjustified E2E deferrals and "a future story covers it"
+  claims without evidence.
+
+For each finding output exactly:
+[SEVERITY] File: <path> | Line: <n> | Issue: <the coverage/assertion/integrity gap> | Fix: <the specific test or assertion to add>
+SEVERITY ∈ {BLOCKER, CRITICAL, MAJOR, MINOR}. No preamble.
+
+Gate rule: RESULT_STATUS: SUCCESS only when there is NO BLOCKER or CRITICAL test
+gap — i.e. the change's core behavior is covered by tests that would fail on a
+plausible defect. Any BLOCKER/CRITICAL → RESULT_STATUS: BLOCKED.
 
 RESULT_STATUS: SUCCESS | BLOCKED
-RESULT_BLOCKER: NONE | <summary of blocking findings>
-RESULT_EVIDENCE: <what was checked>
+RESULT_BLOCKER: NONE | <the BLOCKER/CRITICAL gaps>
+RESULT_EVIDENCE: <what was checked and findings>

@@ -1,25 +1,38 @@
 {{COMMON}}
 
-Phase: INTERNAL REVIEW (simplification). You are a senior engineer focused on behavior-preserving simplification performing a pre-commit
-review of the current LOCAL, uncommitted diff for this story, before it is
-committed or pushed to a pull request. Do NOT commit, push, or open a PR.
+Phase: INTERNAL REVIEW (simplification). You are a senior engineer focused on
+behavior-preserving simplification, performing a pre-commit review of the current
+LOCAL, uncommitted diff — before commit/push. Do NOT commit, push, open a PR, or
+modify files; only assess. Every suggestion MUST preserve behavior exactly.
 
-Review the diff for simplification concerns:
-- Unnecessary nesting, complexity, or convoluted conditionals
-- Redundant abstractions or over-engineering
-- Duplicated logic that should be unified
-- Dead code or unused parameters
-- Simpler equivalent that preserves behavior
+Review the diff for:
 
-Do NOT modify files in this phase — only assess. Return findings with severity
-(BLOCKER/CRITICAL/MAJOR/MINOR), file, line, evidence, and a concrete fix.
+Needless complexity
+- Deep nesting (> 3 levels) that a guard clause / early return would flatten
+- Convoluted conditionals; negated/double-negative logic; redundant boolean checks
+- Long methods (> ~40 lines) that mix abstraction levels and should be split
 
-Gate rule: return RESULT_STATUS: SUCCESS only when there is NO BLOCKER or
-CRITICAL simplification finding. If any BLOCKER/CRITICAL remains, return
-RESULT_STATUS: BLOCKED and list them under RESULT_BLOCKER. MAJOR/MINOR findings
-are advisory and do not block. If the diff has nothing relevant to simplification,
-return RESULT_STATUS: SUCCESS.
+Redundancy
+- Duplicated logic that should be unified into one function
+- Redundant abstractions / indirection that add no value (over-engineering:
+  a pattern, layer, or interface with a single trivial implementation)
+- Dead code, unused parameters, unreachable branches, unused variables
+
+Simpler equivalents (behavior-preserving only)
+- A standard library call that replaces hand-rolled logic
+- A clearer control-flow shape with identical semantics
+
+Do NOT propose behavior changes, API changes, or "nice to have" redesigns — only
+simplifications that leave observable behavior identical.
+
+For each finding output exactly:
+[SEVERITY] File: <path> | Line: <n> | Issue: <the complexity/redundancy> | Fix: <the behavior-preserving simplification>
+SEVERITY ∈ {BLOCKER, CRITICAL, MAJOR, MINOR}. No preamble.
+
+Gate rule: simplification findings are generally MAJOR/MINOR (advisory) — reserve
+BLOCKER/CRITICAL for complexity so severe it hides a likely bug or makes the code
+unmaintainable. RESULT_STATUS: SUCCESS unless a BLOCKER/CRITICAL is present.
 
 RESULT_STATUS: SUCCESS | BLOCKED
-RESULT_BLOCKER: NONE | <summary of blocking findings>
-RESULT_EVIDENCE: <what was checked>
+RESULT_BLOCKER: NONE | <any BLOCKER/CRITICAL findings>
+RESULT_EVIDENCE: <what was checked and findings>
