@@ -158,6 +158,7 @@ What each flag unlocks (all default to `false`):
 | `allow_thread_resolution` | resolving review threads after a verified fix |
 | `automation.max_feedback_batch_size` | maximum number of compatible unresolved findings revalidated and fixed in one worker execution (default `3`) |
 | `auto_merge` | merge policy (single flag). `false` (default): the controller never merges — it posts `READY TO MERGE` and waits for a maintainer. `true`: fully autonomous — the controller merges a ready PR itself (clean Codex review + green CI + no unresolved threads) and advances to the next story. It never force-merges: a conflicting PR is routed to reconciliation to rebase/resolve, pending mergeability waits and retries, and branch-protection blocks are surfaced (never bypassed). Optional `merge_method` selects `squash` (default), `merge`, or `rebase` — the method must be enabled in the repo's merge settings. |
+| `internal_review` | pre-commit specialist review gate (default `false`). When `true`, after a worker `SUCCESS` on an implement/feedback phase the controller runs a sequential panel of specialist reviews (general, test, and — diff-gated — simplification, architecture, security, performance, database, deployment, resilience) against the **local, uncommitted diff** before committing/pushing. Each specialist runs review → bounded fix → re-review; issues are caught privately instead of surfacing as post-PR Codex review threads. Fully autonomous and bounded: a specialist that cannot be satisfied within `automation.internal_review_max_fix_attempts` (default `2`) is carried forward as advisory and delivery still proceeds — the post-PR Codex review remains the final authority. Requires `allow_push`/`allow_pr_creation` for the eventual delivery; under `dry_run` it makes no mutations. |
 
 and in `config/job-control.json`:
 
@@ -170,6 +171,70 @@ and in `config/job-control.json`:
 > the controller never commits or pushes them — the working tree changes are
 > intentionally left uncommitted. If you observe a fix that never lands on the
 > PR, verify these two flags first.
+
+### Internal review gate (pre-commit specialist review)
+
+When `workflow.internal_review = true`, the controller runs a **sequential panel
+of specialist reviewers against the local, uncommitted diff** after a worker
+`SUCCESS` on an implement/feedback phase, before anything is committed or pushed.
+The intent is to catch issues privately so they do not surface as a flood of
+post-PR Codex review threads.
+
+- **Sequential, one specialist at a time** (the controller is single-threaded per
+  run): general → simplification → architecture → test → security → performance
+  → database → deployment → resilience. Each specialist runs
+  review → bounded fix → re-review → pass, then the next begins.
+- **Diff-gated**: `general` and `test` always run; the rest run only when the
+  changed files match their trigger patterns (e.g. `security` on auth/input/crypto
+  paths, `database` on migrations/entities/SQL, `deployment` on Docker/Helm/CI).
+- **Bounded and fully autonomous**: each specialist's fix loop is capped by
+  `automation.internal_review_max_fix_attempts` (default `2`). A specialist that
+  cannot be satisfied within the cap is **carried forward as advisory** and
+  delivery still proceeds — the gate never blocks the loop or waits for a human,
+  and the post-PR Codex review remains the final authority.
+- **Fail-safe**: a missing specialist prompt or a render/git error is treated as a
+  non-blocking pass, so the gate can never dead-end a run. Under `dry_run` it makes
+  no mutations.
+
+Each specialist is a prompt pair under `prompts/` (`review-<name>.md` and
+`review-<name>-fix.md`). Enabling this gate adds one bounded `codex` review pass
+per relevant specialist per story (plus fix passes when findings are raised), so
+it trades extra worker time for fewer post-PR review threads.
+
+### Per-phase model and reasoning effort
+
+The `codex` section sets the base `model` and `reasoning_effort` used for every
+worker phase. An optional `codex.phase_overrides` object lets you tune the model
+and/or reasoning effort **per workflow phase**, so cheap mechanical phases can run
+fast while reasoning-heavy phases (reconcile, planning, review) run stronger:
+
+```json
+"codex": {
+  "model": "gpt-5.6-luna",
+  "reasoning_effort": "medium",
+  "phase_overrides": {
+    "IMPLEMENTING":   { "reasoning_effort": "medium" },
+    "REVIEWING_CODE": { "reasoning_effort": "high" },
+    "RECONCILING":    { "model": "gpt-5.6-luna", "reasoning_effort": "high" },
+    "FIXING_FEEDBACK":{ "reasoning_effort": "low" }
+  }
+}
+```
+
+- **Partial overrides**: a phase entry may set only `reasoning_effort` (or only
+  `model`) and inherit the rest from the base `codex` section.
+- **Backward-compatible**: omit `phase_overrides` entirely and every phase uses
+  the base settings exactly as before.
+- **Validated at load**: override keys must be known workflow phases and any
+  `reasoning_effort` must be a valid value (`low`, `medium`, `high`, `xhigh`,
+  `none`); an unknown phase or invalid effort fails config validation with a
+  clear message. Override keys that do not dispatch a `codex` worker (waiting/
+  terminal phases) are accepted but have no effect.
+- The effective model and effort for each run are printed in the `CODEX START`
+  log line, so per-phase resolution is observable.
+
+The example config lists all `codex`-invoking phases pre-seeded to the base
+defaults, ready to edit.
 
 ### Working tree and branch handling
 

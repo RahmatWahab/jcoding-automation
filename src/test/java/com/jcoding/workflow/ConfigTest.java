@@ -50,6 +50,44 @@ class ConfigTest {
     }
 
     @Test
+    void validPhaseOverridesAreAccepted() {
+        Map<String, Object> config = valid();
+        Config.section(config, "codex").put("phase_overrides", map(
+                "IMPLEMENTING", map("reasoning_effort", "high"),
+                "RECONCILING", map("model", "m2", "reasoning_effort", "xhigh")));
+        assertThatCode(() -> Config.validate(config)).doesNotThrowAnyException();
+    }
+
+    @Test
+    void unknownPhaseOverrideKeyIsRejected() {
+        Map<String, Object> config = valid();
+        Config.section(config, "codex").put("phase_overrides", map(
+                "NOT_A_PHASE", map("reasoning_effort", "high")));
+        assertThatThrownBy(() -> Config.validate(config))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("phase_overrides.NOT_A_PHASE");
+    }
+
+    @Test
+    void invalidReasoningEffortInPhaseOverrideIsRejected() {
+        Map<String, Object> config = valid();
+        Config.section(config, "codex").put("phase_overrides", map(
+                "IMPLEMENTING", map("reasoning_effort", "turbo")));
+        assertThatThrownBy(() -> Config.validate(config))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("phase_overrides.IMPLEMENTING.reasoning_effort");
+    }
+
+    @Test
+    void nonObjectPhaseOverridesIsRejected() {
+        Map<String, Object> config = valid();
+        Config.section(config, "codex").put("phase_overrides", "not-an-object");
+        assertThatThrownBy(() -> Config.validate(config))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("phase_overrides");
+    }
+
+    @Test
     void defaultMergePolicyIsManual() {
         // No auto_merge flag = manual merge; config is valid.
         assertThatCode(() -> Config.validate(valid())).doesNotThrowAnyException();

@@ -404,6 +404,151 @@ class WorkflowOrchestratorIntegrationTest {
     }
 
     @Test
+    void internalReviewGateRunsSpecialistPromptsBeforeCommitWhenEnabled(@TempDir Path root)
+            throws Exception {
+        // With workflow.internal_review=true, an IMPLEMENTING SUCCESS must run the
+        // pre-commit specialist review prompts against the local diff BEFORE the
+        // PR is created, then still deliver. Legacy (flag off) is covered by the
+        // other delivery tests, which do not render any review-*.md prompt.
+        Path repo = root.resolve("repo");
+        Files.createDirectories(repo);
+        runGit(repo, "init", "-q");
+        Path prompts = root.resolve("prompts");
+        Files.createDirectories(prompts);
+        Files.writeString(prompts.resolve("common.md"), "COMMON");
+        Files.writeString(prompts.resolve("implement.md"), "{{COMMON}}\nImplement.");
+        // Always-on specialists' prompts must exist to be rendered/run.
+        for (String p : List.of("review-general.md", "review-general-fix.md",
+                "review-test.md", "review-test-fix.md")) {
+            Files.writeString(prompts.resolve(p), "{{COMMON}}\nReview.");
+        }
+        Files.createDirectories(root.resolve("state"));
+
+        Map<String, Object> config = map(
+                "repository", map("local_path", repo.toString(), "owner", "owner",
+                        "name", "repo", "base_branch", "main"),
+                "epic", map("number", 27),
+                "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
+                "automation", map("dry_run", false, "delivery_verification_attempts", 1,
+                        "delivery_verification_delay_seconds", 0,
+                        "internal_review_max_fix_attempts", 2),
+                "budgets", map(),
+                "workflow", map("auto_merge", false, "allow_push", true,
+                        "allow_pr_creation", true, "allow_comments", true,
+                        "internal_review", true));
+
+        Map<String, Object> state = new LinkedHashMap<>();
+        state.put("phase", "IMPLEMENTING");
+        state.put("current_story", 180);
+        state.put("branch", "story/180-x");
+
+        boolean[] prCreated = {false};
+        GitHub github = new GitHub("owner", "repo", "GH_TOKEN", "gh", 30,
+                (command, timeout) -> new GitHub.CommandResult(0, "{}", ""), name -> "t") {
+            @Override
+            public Object issue(int number) {
+                if (number == 27) {
+                    return map("number", 27, "title", "EPIC", "state", "OPEN",
+                            "body", "Stories: #180", "url", "http://x/27");
+                }
+                return map("number", number, "title", "Story " + number, "state", "OPEN",
+                        "body", "Acceptance", "url", "http://x/" + number);
+            }
+
+            @Override
+            public Object prs() {
+                return new ArrayList<>();
+            }
+
+            @Override
+            public Object createPr(String title, String body, String base, String head) {
+                prCreated[0] = true;
+                return map("number", 200, "url", "http://x/pr/200", "state", "OPEN",
+                        "isDraft", false, "headRefName", head, "headRefOid", "newhead1234");
+            }
+
+            @Override
+            public Map<String, Object> pr(int number) {
+                return map("number", 200, "state", "OPEN", "mergedAt", null,
+                        "headRefOid", "newhead1234", "headRefName", "story/180-x",
+                        "url", "http://x/pr/200", "reviewDecision", "",
+                        "statusCheckRollup", List.of(map("status", "IN_PROGRESS")),
+                        "reviewThreadsAvailable", true, "reviewThreads", new ArrayList<>(),
+                        "reviews", new ArrayList<>(), "comments", new ArrayList<>());
+            }
+
+            @Override
+            public void comment(int number, String bodyText) {
+                // no-op
+            }
+        };
+
+        // Records which rendered prompt files the worker was asked to run. The
+        // orchestrator renders every prompt to state/prompt-27.md, so we capture
+        // the rendered content marker instead — simpler: count total runs and
+        // assert the review phase ran extra passes beyond the single implement.
+        List<String> renderedContents = new ArrayList<>();
+        CodexRunner codex = new CodexRunner(Map.of(), System::nanoTime) {
+            @Override
+            public CodexResult run(Map<String, Object> cfg, Path prompt, Path r, boolean dry,
+                                   Runnable hb, Integer timeout) {
+                try {
+                    renderedContents.add(Files.readString(prompt));
+                } catch (Exception ignored) {
+                    renderedContents.add("");
+                }
+                // implement + every specialist review all return SUCCESS/clean.
+                return new CodexResult(0,
+                        "RESULT_STATUS: SUCCESS\nRESULT_NEXT_PHASE: WAITING_FOR_CODEX_REVIEW\n"
+                        + "RESULT_BLOCKER: NONE\nRESULT_EVIDENCE: COMPLETE\n");
+            }
+        };
+
+        GitOperations.GitRunner gitRunner = (r, args) -> {
+            String key = String.join(" ", args);
+            if (key.startsWith("status --porcelain")) {
+                return new GitOperations.GitResult(0, " M src/new.txt\n", "");
+            }
+            if (key.startsWith("branch --show-current") || key.startsWith("branch --list")) {
+                return new GitOperations.GitResult(0, "story/180-x\n", "");
+            }
+            if (key.startsWith("rev-parse HEAD")) {
+                return new GitOperations.GitResult(0, "newhead1234\n", "");
+            }
+            if (key.startsWith("ls-remote origin")) {
+                return new GitOperations.GitResult(0, "newhead1234\trefs/heads/story/180-x\n", "");
+            }
+            return new GitOperations.GitResult(0, "", "");
+        };
+        Controller.GitOperationsFactory gitFactory = new Controller.GitOperationsFactory(repo) {
+            @Override
+            public GitOperations create() {
+                return new GitOperations(repo, gitRunner);
+            }
+        };
+
+        StateStore store = new StateStore(root.resolve("state").resolve("epic-27.json"));
+        WorkflowLock lock = WorkflowLock.acquire(root.resolve("state").resolve("epic-27.lock"), 900, 3, 10);
+        Map<String, Object> epic = map("number", 27, "title", "EPIC", "state", "OPEN",
+                "body", "Stories: #180", "url", "http://x/27");
+
+        WorkflowOrchestrator orchestrator = new WorkflowOrchestrator(
+                config, state, store, github, repo, root, epic, 27, false,
+                gitFactory, codex, new ReviewCoordinator(), lock);
+
+        orchestrator.reconcileAndExecute(new ArrayList<>(), null);
+
+        // The gate ran: beyond the single implement run, the always-on review
+        // specialists (general, test) were rendered and executed before commit.
+        assertThat(renderedContents.stream().filter(c -> c.contains("Review.")).count())
+                .isGreaterThanOrEqualTo(2);
+        // Delivery still proceeded after the gate: the PR was created.
+        assertThat(prCreated[0]).isTrue();
+        assertThat(state.get("current_pr")).isEqualTo(200);
+        lock.release();
+    }
+
+    @Test
     void firstImplementationSuccessCreatesPrEvenWhenWorkerWantsReview(@TempDir Path root) throws Exception {
         // Regression: a first-time story (no PR yet) whose IMPLEMENTING worker
         // returns SUCCESS with RESULT_NEXT_PHASE: WAITING_FOR_CODEX_REVIEW must

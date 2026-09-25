@@ -640,8 +640,8 @@ final class WorkflowOrchestrator {
                 phaseBudget == null ? "default" : phaseBudget,
                 prompt.getFileName());
         long phaseStartNanos = System.nanoTime();
-        CodexRunner.CodexResult result = codexRunner.run(config, renderedPrompt, repo, dryRun,
-                heartbeat, phaseBudget);
+        CodexRunner.CodexResult result = codexRunner.run(configForPhase(executionPhase),
+                renderedPrompt, repo, dryRun, heartbeat, phaseBudget);
         long phaseElapsedMs = (System.nanoTime() - phaseStartNanos) / 1_000_000L;
         log.info("PHASE EXIT: {} exit_code={} elapsed={}ms", executionPhase,
                 result.exitCode(), phaseElapsedMs);
@@ -703,6 +703,19 @@ final class WorkflowOrchestrator {
         // A zero exit only means the CLI completed; the structured worker
         // result controls whether mutations are allowed. Non-SUCCESS fails closed.
         if (result.exitCode() == 0 && "SUCCESS".equals(state.get("result_status"))) {
+            // Pre-commit sequential specialist review gate (opt-in via
+            // workflow.internal_review). Reviews the LOCAL, uncommitted diff and
+            // runs bounded per-specialist fix loops BEFORE the change is
+            // committed/pushed, so issues are caught privately instead of
+            // flooding the post-PR Codex review with threads. Fully autonomous:
+            // it never blocks the loop — an unsatisfiable specialist is carried
+            // forward as advisory and the post-PR Codex review remains the
+            // authority. Only runs for phases that produce a committable diff.
+            if (Engine.asBool(workflow.get("internal_review"), false)
+                    && ("IMPLEMENTING".equals(executionPhase)
+                        || "FIXING_FEEDBACK".equals(executionPhase))) {
+                runInternalReviewGate(git, current, context, heartbeat, phaseBudget);
+            }
             int deliveryResult = runDeliveryPipeline(git, current, currentPr, result.output(), feedbackToResolve);
             if (deliveryResult != Integer.MIN_VALUE) {
                 cleanup(renderedPrompt);
@@ -2065,6 +2078,79 @@ final class WorkflowOrchestrator {
         // not yet reached) let the normal accepted path handle it — a bounded
         // retry, not a permanent stall.
         return Integer.MIN_VALUE;
+    }
+
+    /**
+     * Build a per-call config whose {@code codex} section is resolved for the
+     * given phase (base settings overlaid with {@code codex.phase_overrides
+     * .<PHASE>}, if any). Returns the original config unchanged when there is no
+     * applicable override, so the worker command is byte-identical to legacy.
+     * Passing the resolved section through the existing {@code run(...)} entry
+     * keeps the injectable worker seam (and its test fakes) intact.
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> configForPhase(String phase) {
+        Object codexObj = config.get("codex");
+        if (!(codexObj instanceof Map<?, ?>)) {
+            return config;
+        }
+        Map<String, Object> codexSection = (Map<String, Object>) codexObj;
+        Map<String, Object> effective = CodexRunner.effectiveCodexConfig(codexSection, phase);
+        if (effective.equals(codexSection)) {
+            return config; // no override applied: identical to legacy
+        }
+        Map<String, Object> perCall = new LinkedHashMap<>(config);
+        perCall.put("codex", effective);
+        return perCall;
+    }
+
+    /**
+     * Run the pre-commit specialist review gate against the local diff. Renders
+     * and runs each relevant specialist prompt via the bounded Codex worker,
+     * reusing the same budget/heartbeat as a normal phase. Best-effort: any
+     * failure to render/run a specialist is logged and treated as a
+     * non-blocking pass, because the post-PR Codex review is the final
+     * authority and the autonomous loop must never dead-end on the gate.
+     */
+    private void runInternalReviewGate(GitOperations git, Integer current,
+                                       Map<String, Object> context, Runnable heartbeat,
+                                       Integer phaseBudget) {
+        int maxFix = (int) Engine.asLongOrDefault(
+                automation.get("internal_review_max_fix_attempts"), 2);
+        List<String> changedPaths;
+        try {
+            changedPaths = git.changedSourcePaths();
+        } catch (RuntimeException exc) {
+            log.warn("INTERNAL REVIEW: unable to read changed paths ({}); skipping gate", exc.getMessage());
+            return;
+        }
+        if (changedPaths.isEmpty()) {
+            log.info("INTERNAL REVIEW: no local diff to review; skipping gate");
+            return;
+        }
+        InternalReviewGate gate = new InternalReviewGate(
+                InternalReviewGate.DEFAULT_PANEL, maxFix);
+        Path rendered = root.resolve("state").resolve("prompt-" + epicNumber + ".md");
+        InternalReviewGate.ReviewRunner runner = promptFile -> {
+            Path promptPath = root.resolve(promptFile);
+            if (!Files.exists(promptPath)) {
+                // A missing specialist prompt must not block the loop: treat as a
+                // pass so the gate degrades gracefully when a prompt is absent.
+                log.warn("INTERNAL REVIEW: prompt {} not found; treating specialist as pass", promptFile);
+                return "RESULT_STATUS: SUCCESS\nRESULT_EVIDENCE: PROMPT_ABSENT\n";
+            }
+            try {
+                Files.writeString(rendered, PromptRenderer.render(root, promptFile, context));
+            } catch (java.io.IOException exc) {
+                log.warn("INTERNAL REVIEW: unable to render {} ({}); treating as pass",
+                        promptFile, exc.getMessage());
+                return "RESULT_STATUS: SUCCESS\nRESULT_EVIDENCE: RENDER_FAILED\n";
+            }
+            CodexRunner.CodexResult r = codexRunner.run(config, rendered, repo, dryRun,
+                    heartbeat, phaseBudget);
+            return r.output();
+        };
+        gate.run(changedPaths, runner);
     }
 
     private Integer prepareWorktreeForPhase(GitOperations git, Integer current,

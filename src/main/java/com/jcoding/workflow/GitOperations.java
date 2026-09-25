@@ -119,6 +119,23 @@ public final class GitOperations {
         return changes;
     }
 
+    /**
+     * The set of changed source file paths in the working tree (ignoring
+     * {@code .codex/} metadata). Read-only; used to select which specialist
+     * reviewers are relevant to the current diff. Never throws for a clean tree
+     * (returns an empty list).
+     */
+    public List<String> changedSourcePaths() {
+        List<String> paths = new ArrayList<>();
+        for (String line : sourceChanges()) {
+            String path = stripQuotes(pathOf(line));
+            if (!path.isEmpty()) {
+                paths.add(path);
+            }
+        }
+        return paths;
+    }
+
     /** Reject any pre-existing changes (ignoring .codex/ metadata). */
     public void requireCleanWorktree() {
         if (!sourceChanges().isEmpty()) {

@@ -90,6 +90,33 @@ public final class Config {
             missing.add("codex.phase_timeout_seconds(positive integer)");
         }
 
+        // Per-phase codex overrides (optional). Keys must be known workflow
+        // phases; each value must be an object; a nested reasoning_effort (if
+        // present) must be a valid effort. Model is a free string (not enumerable
+        // here). Backward-compatible: absent phase_overrides skips all checks.
+        Object phaseOverridesObj = codex.get("phase_overrides");
+        if (phaseOverridesObj != null) {
+            if (!(phaseOverridesObj instanceof Map<?, ?> phaseOverrides)) {
+                missing.add("codex.phase_overrides(object)");
+            } else {
+                for (Map.Entry<?, ?> entry : phaseOverrides.entrySet()) {
+                    String phase = String.valueOf(entry.getKey());
+                    if (!WorkflowMachine.KNOWN_PHASES.contains(phase)) {
+                        missing.add("codex.phase_overrides." + phase + "(unknown phase)");
+                        continue;
+                    }
+                    if (!(entry.getValue() instanceof Map<?, ?> override)) {
+                        missing.add("codex.phase_overrides." + phase + "(object)");
+                        continue;
+                    }
+                    Object phaseEffort = override.get("reasoning_effort");
+                    if (phaseEffort != null && !VALID_EFFORT.contains(phaseEffort)) {
+                        missing.add("codex.phase_overrides." + phase + ".reasoning_effort(valid value)");
+                    }
+                }
+            }
+        }
+
         for (Map.Entry<String, Object> entry : budgets.entrySet()) {
             String phase = entry.getKey();
             if (!KNOWN_BUDGET_PHASES.contains(phase)) {

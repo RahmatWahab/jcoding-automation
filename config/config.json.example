@@ -14,7 +14,7 @@
     "timeout_seconds": 30
   },
   "automation": {
-    "dry_run": true,
+    "dry_run": false,
     "stale_lock_seconds": 900,
     "quota_retry_seconds": 1800,
     "watchdog_observations": 3,
@@ -25,18 +25,34 @@
     "max_feedback_batch_size": 3,
     "max_resume_attempts": 3,
     "resume_loop_multiplier": 4,
+    "internal_review_max_fix_attempts": 2,
     "wait_poll_seconds": 0,
     "max_phase_attempts": 5,
-    "enable_planning": false
+    "enable_planning": true
   },
   "codex": {
     "executable": "codex",
     "model": "gpt-5.6-luna",
     "reasoning_effort": "medium",
-    "approval_policy": "never",
-    "dangerously_bypass_sandbox": false,
+    "approval_policy": "true",
+    "dangerously_bypass_sandbox": true,
     "execution_timeout_seconds": 3600,
-    "progress_interval_seconds": 30
+    "progress_interval_seconds": 30,
+    "phase_overrides": {
+      "IDLE": { "model": "gpt-5.6-luna", "reasoning_effort": "low" },
+      "PLANNING": { "model": "gpt-5.6-luna", "reasoning_effort": "high" },
+      "IMPLEMENTING": { "model": "gpt-5.6-luna", "reasoning_effort": "low" },
+      "VERIFYING": { "model": "gpt-5.6-luna", "reasoning_effort": "low" },
+      "REVIEWING_CODE": { "model": "gpt-5.6-luna", "reasoning_effort": "low" },
+      "FIXING_FEEDBACK": { "model": "gpt-5.6-luna", "reasoning_effort": "low" },
+      "CHANGES_REQUESTED": { "model": "gpt-5.6-luna", "reasoning_effort": "low" },
+      "READY_TO_MERGE": { "model": "gpt-5.6-luna", "reasoning_effort": "low" },
+      "RECONCILING": { "model": "gpt-5.6-luna", "reasoning_effort": "medium" },
+      "BLOCKED_REQUIREMENTS": { "model": "gpt-5.6-luna", "reasoning_effort": "low" },
+      "BLOCKED_REPOSITORY": { "model": "gpt-5.6-luna", "reasoning_effort": "low" },
+      "FAILED_RECOVERABLE": { "model": "gpt-5.6-luna", "reasoning_effort": "low" },
+      "CODEX_FAILURE": { "model": "gpt-5.6-luna", "reasoning_effort": "medium" }
+    }
   },
   "budgets": {
     "implementing": 1800,
@@ -46,12 +62,13 @@
     "reconciling": 600
   },
   "workflow": {
-    "allow_push": false,
-    "allow_pr_creation": false,
-    "allow_comments": false,
-    "allow_thread_resolution": false,
-    "auto_merge": false,
+    "allow_push": true,
+    "allow_pr_creation": true,
+    "allow_comments": true,
+    "allow_thread_resolution": true,
+    "auto_merge": true,
     "merge_method": "squash",
-    "terminal_policy": "hold"
+    "terminal_policy": "park_and_advance",
+    "internal_review": true
   }
 }

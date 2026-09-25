@@ -120,6 +120,36 @@ public class CodexRunner {
     }
 
     /**
+     * Resolve the effective {@code codex} settings for a phase by overlaying the
+     * optional per-phase override on the base section. Backward-compatible: when
+     * {@code phase} is null/blank or no {@code codex.phase_overrides.<PHASE>}
+     * entry exists, the base section is returned unchanged. Only keys present in
+     * the override replace the base value (partial overrides are supported), so a
+     * phase may override just {@code reasoning_effort} and inherit {@code model}.
+     * The {@code phase_overrides} key itself is never propagated into the command.
+     */
+    @SuppressWarnings("unchecked")
+    static Map<String, Object> effectiveCodexConfig(Map<String, Object> codex, String phase) {
+        Map<String, Object> base = new java.util.LinkedHashMap<>(codex);
+        base.remove("phase_overrides");
+        if (phase == null || phase.isEmpty()) {
+            return base;
+        }
+        Object overridesObj = codex.get("phase_overrides");
+        if (!(overridesObj instanceof Map<?, ?> overrides)) {
+            return base;
+        }
+        Object phaseOverrideObj = overrides.get(phase);
+        if (!(phaseOverrideObj instanceof Map<?, ?> phaseOverride)) {
+            return base;
+        }
+        for (Map.Entry<?, ?> e : phaseOverride.entrySet()) {
+            base.put(String.valueOf(e.getKey()), e.getValue());
+        }
+        return base;
+    }
+
+    /**
      * Run the bounded Codex worker. Returns exit 0 and empty output in dry-run.
      * Streams and captures output, enforces a timeout (exit 124), and classifies
      * a missing executable (exit 127).

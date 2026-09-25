@@ -156,4 +156,54 @@ class CodexRunnerTest {
         assertThat(command).contains("--approve-for-me");
         assertThat(command).doesNotContain("--ask-for-approval");
     }
+
+    // -- per-phase override resolution --------------------------------------
+
+    @Test
+    void effectiveConfigReturnsBaseWhenNoOverridesConfigured() {
+        Map<String, Object> codex = map("executable", "codex", "model", "base-model",
+                "reasoning_effort", "medium");
+        Map<String, Object> eff = CodexRunner.effectiveCodexConfig(codex, "IMPLEMENTING");
+        assertThat(eff.get("model")).isEqualTo("base-model");
+        assertThat(eff.get("reasoning_effort")).isEqualTo("medium");
+    }
+
+    @Test
+    void effectiveConfigReturnsBaseWhenPhaseNullOrUnlisted() {
+        Map<String, Object> codex = map("model", "base-model", "reasoning_effort", "medium",
+                "phase_overrides", map("RECONCILING", map("reasoning_effort", "high")));
+        // null phase -> base
+        assertThat(CodexRunner.effectiveCodexConfig(codex, null).get("reasoning_effort"))
+                .isEqualTo("medium");
+        // phase not present in overrides -> base
+        assertThat(CodexRunner.effectiveCodexConfig(codex, "IMPLEMENTING").get("reasoning_effort"))
+                .isEqualTo("medium");
+    }
+
+    @Test
+    void effectiveConfigAppliesPartialOverrideAndInheritsRest() {
+        Map<String, Object> codex = map("model", "base-model", "reasoning_effort", "medium",
+                "approval_policy", "never",
+                "phase_overrides", map("RECONCILING", map("reasoning_effort", "high")));
+        Map<String, Object> eff = CodexRunner.effectiveCodexConfig(codex, "RECONCILING");
+        // override wins for effort...
+        assertThat(eff.get("reasoning_effort")).isEqualTo("high");
+        // ...but model and other base keys are inherited...
+        assertThat(eff.get("model")).isEqualTo("base-model");
+        assertThat(eff.get("approval_policy")).isEqualTo("never");
+        // ...and the phase_overrides key never leaks into the effective config.
+        assertThat(eff).doesNotContainKey("phase_overrides");
+    }
+
+    @Test
+    void effectiveConfigOverrideFlowsIntoBuiltCommand() {
+        Map<String, Object> codex = map("executable", "codex", "model", "base-model",
+                "reasoning_effort", "medium",
+                "phase_overrides", map("PLANNING",
+                        map("model", "planner-model", "reasoning_effort", "high")));
+        List<String> command = CodexRunner.buildCommand(
+                CodexRunner.effectiveCodexConfig(codex, "PLANNING"), Path.of("/repo"));
+        assertThat(command).containsSequence("--model", "planner-model");
+        assertThat(command).contains("model_reasoning_effort=high");
+    }
 }
