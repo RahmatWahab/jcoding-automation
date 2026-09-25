@@ -164,4 +164,61 @@ class EngineTest {
         assertThat(Engine.reviewEvents(pr).get(0).get("id")).isEqualTo("r1");
         assertThat(Engine.reviewEvents(pr, "r1")).isEmpty();
     }
+
+    // -- false WAITING_FOR_CODEX_REVIEW detection ----------------------------
+
+    @Test
+    void hasCodexReviewTriggerDetectsTriggerComment() {
+        Map<String, Object> withTrigger = map("comments",
+                List.of(map("body", "@codex review")));
+        Map<String, Object> without = map("comments",
+                List.of(map("body", "some unrelated comment")));
+        assertThat(Engine.hasCodexReviewTrigger(withTrigger)).isTrue();
+        assertThat(Engine.hasCodexReviewTrigger(without)).isFalse();
+        assertThat(Engine.hasCodexReviewTrigger(map("comments", List.of()))).isFalse();
+    }
+
+    @Test
+    void waitingForCodexReviewWithoutTriggerIsADeviation() {
+        // Phase says waiting, PR is open at a head, review still pending, but NO
+        // @codex review trigger exists -> false wait -> must be a recoverable
+        // deviation so the WorkerSupervisor recovers it (never wait forever).
+        Map<String, Object> state = map("phase", "WAITING_FOR_CODEX_REVIEW",
+                "current_pr", 205, "branch", "story/68-x");
+        Map<String, Object> pr = map("state", "OPEN", "mergedAt", null,
+                "headRefOid", "deadbeef1234", "reviews", List.of(), "comments", List.of());
+        Engine.Deviation d = Engine.detectDeviation(state, pr, 5);
+        assertThat(d).isNotNull();
+        assertThat(d.code()).isEqualTo("STALLED_REVIEW_TRIGGER");
+        assertThat(d.recoverable()).isTrue();
+    }
+
+    @Test
+    void waitingForCodexReviewWithTriggerIsNotADeviation() {
+        // The legitimate case: trigger present, connector simply hasn't reviewed
+        // yet -> NO deviation (must keep waiting, not spam reconcile).
+        Map<String, Object> state = map("phase", "WAITING_FOR_CODEX_REVIEW",
+                "current_pr", 205, "branch", "story/68-x");
+        Map<String, Object> pr = map("state", "OPEN", "mergedAt", null,
+                "headRefOid", "deadbeef1234", "reviews", List.of(),
+                "comments", List.of(map("body", "@codex review")));
+        Engine.Deviation d = Engine.detectDeviation(state, pr, 5);
+        // No STALLED_REVIEW_TRIGGER deviation for the legitimate wait.
+        assertThat(d == null || !"STALLED_REVIEW_TRIGGER".equals(d.code())).isTrue();
+    }
+
+    @Test
+    void waitingForCodexReviewAlreadyReviewedIsNotADeviation() {
+        // Connector already reviewed the head -> review not pending -> no false
+        // wait, no deviation.
+        Map<String, Object> state = map("phase", "WAITING_FOR_CODEX_REVIEW",
+                "current_pr", 205, "branch", "story/68-x");
+        Map<String, Object> pr = map("state", "OPEN", "mergedAt", null,
+                "headRefOid", "deadbeef1234",
+                "reviews", List.of(map("author", map("login", "chatgpt-codex-connector"),
+                        "submittedAt", "2026-01-01", "commit", map("oid", "deadbeef1234"))),
+                "comments", List.of());
+        Engine.Deviation d = Engine.detectDeviation(state, pr, 5);
+        assertThat(d == null || !"STALLED_REVIEW_TRIGGER".equals(d.code())).isTrue();
+    }
 }

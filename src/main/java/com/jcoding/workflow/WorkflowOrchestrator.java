@@ -343,25 +343,50 @@ final class WorkflowOrchestrator {
                 return PrScopedResult.exit(blockedExternal("Unable to post Codex review trigger: " + exc.getMessage()));
             }
 
+            boolean reviewTriggerMissing = false;
             if (ReviewCoordinator.reviewGateOpen(currentPr)) {
+                // Only trust the wait when the @codex review trigger genuinely
+                // exists on the live PR. A false WAITING_FOR_CODEX_REVIEW (no
+                // trigger present — never posted, stripped, or lost on refresh)
+                // can never resolve on its own; instead of returning to wait
+                // forever, fall through to the deviation supervisor so the
+                // WorkerSupervisor (reconcile) re-checks PR status and recovers.
+                // Fully autonomous: no human, never a dead-end wait.
+                if (Engine.hasCodexReviewTrigger(currentPr)) {
+                    state.put("phase", "WAITING_FOR_CODEX_REVIEW");
+                    state.put("review_gate_head", currentPr.get("headRefOid"));
+                    state.put("next_action", "WAIT_FOR_CODEX_REVIEW");
+                    save();
+                    logStableState("WAIT_CODEX|" + current + "|" + shortSha(currentPr.get("headRefOid")),
+                            "WAITING: story #{}, phase=WAITING_FOR_CODEX_REVIEW", current);
+                    return PrScopedResult.exit(0);
+                }
+                // No trigger present: mark the phase and fall through to the
+                // generic deviation supervisor (STALLED_REVIEW_TRIGGER) below,
+                // which routes to reconcile for autonomous recovery.
+                log.info("REVIEW TRIGGER MISSING: story #{} PR #{} head {} is in "
+                        + "WAITING_FOR_CODEX_REVIEW but no @codex review trigger is present; "
+                        + "escalating to the supervisor for recovery",
+                        current, currentPr.get("number"), shortSha(currentPr.get("headRefOid")));
                 state.put("phase", "WAITING_FOR_CODEX_REVIEW");
-                state.put("review_gate_head", currentPr.get("headRefOid"));
-                state.put("next_action", "WAIT_FOR_CODEX_REVIEW");
                 save();
-                logStableState("WAIT_CODEX|" + current + "|" + shortSha(currentPr.get("headRefOid")),
-                        "WAITING: story #{}, phase=WAITING_FOR_CODEX_REVIEW", current);
-                return PrScopedResult.exit(0);
-            }
-            // The gate has closed for this head; record the connector review.
-            if (Engine.asString(state.get("review_gate_head"))
-                    .equals(Engine.asString(currentPr.get("headRefOid")))
-                    && !Engine.asString(currentPr.get("headRefOid")).isEmpty()) {
-                state.put("last_connector_review_commit", currentPr.get("headRefOid"));
-                state.remove("review_gate_head");
+                reviewTriggerMissing = true;
+            } else {
+                // The gate has closed for this head; record the connector review.
+                if (Engine.asString(state.get("review_gate_head"))
+                        .equals(Engine.asString(currentPr.get("headRefOid")))
+                        && !Engine.asString(currentPr.get("headRefOid")).isEmpty()) {
+                    state.put("last_connector_review_commit", currentPr.get("headRefOid"));
+                    state.remove("review_gate_head");
+                }
             }
 
             String phase = Engine.asString(state.get("phase"));
-            if (Set.of("WAITING_FOR_CI", "WAITING_FOR_CODEX_REVIEW", "WAITING_FOR_HUMAN_REVIEW",
+            // Skip the wait gate for a false WAITING_FOR_CODEX_REVIEW (no trigger):
+            // the wait gate would return 0 and end the run, waiting forever. Let it
+            // fall through to the deviation supervisor for autonomous recovery.
+            if (!reviewTriggerMissing
+                    && Set.of("WAITING_FOR_CI", "WAITING_FOR_CODEX_REVIEW", "WAITING_FOR_HUMAN_REVIEW",
                     "READY_TO_MERGE", "WAITING_FOR_MANUAL_MERGE").contains(phase)) {
                 Integer gate = handleWaitAndMergeGate(current, currentPr, phase);
                 if (gate != null) {

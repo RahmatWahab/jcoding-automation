@@ -303,6 +303,35 @@ public final class Engine {
     }
 
     /**
+     * Whether an {@code @codex review} trigger comment is actually present on the
+     * live PR. Used to detect a <em>false</em> {@code WAITING_FOR_CODEX_REVIEW}
+     * state: the controller believes it is waiting for a connector review, but no
+     * trigger comment exists on the PR (it was never posted, was stripped, or the
+     * PR object was refreshed and lost it). Such a wait can never resolve on its
+     * own, so it must be surfaced as a deviation for the WorkerSupervisor to
+     * recover — the fully-autonomous system never waits on a review it did not
+     * request. The trigger is posted by the controller, so any author is accepted;
+     * matching is on the exact {@code @codex review} directive in the body.
+     */
+    static boolean hasCodexReviewTrigger(Map<String, Object> pr) {
+        if (pr == null) {
+            return false;
+        }
+        for (Object c : asList(pr.get("comments"))) {
+            if (!(c instanceof Map<?, ?> cm)) {
+                continue;
+            }
+            @SuppressWarnings("unchecked")
+            Map<String, Object> comment = (Map<String, Object>) cm;
+            String body = asString(comment.get("body"));
+            if (body.toLowerCase().contains("@codex review")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Detect a connector-posted clean-review comment ("no major issues") that
      * references the current head commit (by full or short SHA in the
      * "Reviewed commit:" line).
@@ -449,6 +478,27 @@ public final class Engine {
                             + "; stale cross-story state.", true);
                 }
             }
+        }
+
+        // False WAITING_FOR_CODEX_REVIEW: the controller believes it is waiting
+        // for a connector review, but the live PR has NO @codex review trigger
+        // comment and the connector review is still pending for the head. Such a
+        // wait can never resolve on its own (nothing was requested), so — in a
+        // fully autonomous system with no human — surface it as a recoverable
+        // deviation so the WorkerSupervisor (reconcile) re-checks the real PR
+        // status and recovers (re-trigger the review, resume, or advance).
+        // Without this the run waits forever, because WAIT_PHASES are otherwise
+        // trusted blindly. Placed after the more specific stale-cursor check so
+        // that diagnosis wins when it applies.
+        if ("WAITING_FOR_CODEX_REVIEW".equals(phase) && hasPr && pr != null
+                && !currentHead.isEmpty()
+                && codexReviewPending(pr)
+                && !hasCodexReviewTrigger(pr)) {
+            return new Deviation("STALLED_REVIEW_TRIGGER",
+                    "Phase is WAITING_FOR_CODEX_REVIEW but no @codex review trigger is present "
+                    + "on PR head " + (currentHead.length() >= 10 ? currentHead.substring(0, 10)
+                    : currentHead) + "; the review was never requested or the trigger was lost.",
+                    true);
         }
 
         return null;
