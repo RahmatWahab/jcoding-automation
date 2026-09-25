@@ -1,4 +1,4 @@
-package com.jcoding.workflow;
+package com.jcoding.state;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;

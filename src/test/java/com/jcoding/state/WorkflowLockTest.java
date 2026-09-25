@@ -1,4 +1,4 @@
-package com.jcoding.workflow;
+package com.jcoding.state;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;

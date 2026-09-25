@@ -1,4 +1,7 @@
 package com.jcoding.workflow;
+import com.jcoding.github.GitHub;
+import com.jcoding.state.StateStore;
+import com.jcoding.state.WorkflowLock;
 
 import static org.assertj.core.api.Assertions.assertThat;
 

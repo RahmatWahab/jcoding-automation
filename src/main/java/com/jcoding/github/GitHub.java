@@ -1,4 +1,4 @@
-package com.jcoding.workflow;
+package com.jcoding.github;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.IOException;

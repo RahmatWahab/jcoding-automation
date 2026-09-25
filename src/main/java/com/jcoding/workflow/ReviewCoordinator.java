@@ -1,4 +1,6 @@
 package com.jcoding.workflow;
+import com.jcoding.github.GitHub;
+import com.jcoding.github.GitHubError;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;

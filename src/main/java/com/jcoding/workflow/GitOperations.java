@@ -1,4 +1,5 @@
 package com.jcoding.workflow;
+import com.jcoding.github.GitHub;
 
 import java.nio.file.Path;
 import java.text.Normalizer;

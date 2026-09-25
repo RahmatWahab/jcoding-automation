@@ -1,4 +1,5 @@
 package com.jcoding.workflow;
+import com.jcoding.github.GitHub;
 
 import static org.assertj.core.api.Assertions.assertThat;
 

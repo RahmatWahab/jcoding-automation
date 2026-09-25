@@ -1,4 +1,8 @@
 package com.jcoding.workflow;
+import com.jcoding.github.GitHub;
+import com.jcoding.github.GitHubError;
+import com.jcoding.state.StateStore;
+import com.jcoding.state.WorkflowLock;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;

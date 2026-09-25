@@ -1,4 +1,4 @@
-package com.jcoding.workflow;
+package com.jcoding.github;
 
 /** Raised for any GitHub CLI failure, timeout, or ambiguous response. */
 public class GitHubError extends RuntimeException {
