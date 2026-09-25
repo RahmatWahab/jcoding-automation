@@ -2146,8 +2146,11 @@ final class WorkflowOrchestrator {
                         promptFile, exc.getMessage());
                 return "RESULT_STATUS: SUCCESS\nRESULT_EVIDENCE: RENDER_FAILED\n";
             }
-            CodexRunner.CodexResult r = codexRunner.run(config, rendered, repo, dryRun,
-                    heartbeat, phaseBudget);
+            // Internal-review specialists are code review, so they honor the
+            // REVIEWING_CODE per-phase codex override (model/reasoning_effort)
+            // just like the post-PR review phase — not the base defaults.
+            CodexRunner.CodexResult r = codexRunner.run(configForPhase("REVIEWING_CODE"),
+                    rendered, repo, dryRun, heartbeat, phaseBudget);
             return r.output();
         };
         gate.run(changedPaths, runner);
