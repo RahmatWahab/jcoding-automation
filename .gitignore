@@ -12,7 +12,6 @@ logs/*
 
 # Operator-local configuration (copy from the .example template)
 config/config.json
-config/job-control.json
 
 # IDE / editor
 .idea/
