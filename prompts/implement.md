@@ -9,6 +9,7 @@ when its configuration permits.
 Implement every explicit acceptance criterion for the supplied story:
 - Inspect the existing architecture (AGENTS.md first) before editing; follow the
   repository's conventions and patterns rather than introducing new ones.
+- Fully use the internal skills - you have many internal skills make use of it.
 - Fully implement the behavior — no half-baking, no guessing, no assuming. If
   requirements or state are genuinely ambiguous, make no changes and report
   BLOCKED: REQUIREMENTS OR STATE UNCLEAR (per COMMON).
