@@ -45,6 +45,8 @@ final class WorkflowOrchestrator {
     private final WorkflowLock lock;
     private final Map<String, Object> automation;
     private final Map<String, Object> workflow;
+    private long phaseDeadlineNanos;
+    private int callSequence;
 
     WorkflowOrchestrator(Map<String, Object> config, Map<String, Object> state, StateStore store,
                          GitHub github, Path repo, Path root, Map<String, Object> epic, int epicNumber,
@@ -101,6 +103,27 @@ final class WorkflowOrchestrator {
         current = selection.current();
         currentPr = selection.currentPr();
 
+        // A delivery failure takes priority over PR feedback/wait classification.
+        // Otherwise the next tick erases the blocker and repeats the same work.
+        if (DeliveryRecovery.failure(state) != null) {
+            return recoverDelivery(current, currentPr);
+        }
+        if (state.get("held_failure") instanceof Map<?, ?> held) {
+            String head = currentPr == null ? "" : Engine.asString(currentPr.get("headRefOid"));
+            String evidence = gitFactory.create().recoveryFingerprint();
+            if (head.equals(Engine.asString(held.get("head")))
+                    && evidence.equals(Engine.asString(held.get("evidence")))) {
+                return 1;
+            }
+            state.remove("held_failure");
+            state.put("recovery_next_prompt", "prompts/reconcile.md");
+        }
+        String selectedRecovery = Engine.asString(state.remove("recovery_next_prompt"));
+        if (!selectedRecovery.isEmpty()) {
+            save();
+            return runWorkerPhase(current, currentPr, ReviewFindingQueue.activeBatch(state), selectedRecovery);
+        }
+
         List<Map<String, Object>> feedbackToResolve = new ArrayList<>();
         // PR-scoped reconciliation and wait/merge/blocked short-circuits
         // (Requirement 2: Feedback/PR handler). A non-null exitCode ends the run;
@@ -121,6 +144,64 @@ final class WorkflowOrchestrator {
         }
         forcedPrompt = deviationResult.forcedPrompt();
         return runWorkerPhase(current, currentPr, feedbackToResolve, forcedPrompt);
+    }
+
+    private int recoverDelivery(Integer current, Map<String, Object> currentPr) {
+        if (dryRun || !Engine.asBool(workflow.get("allow_push"), false)) {
+            return 1;
+        }
+        if (currentPr != null) {
+            try {
+                currentPr = github.pr(Engine.asInt(currentPr.get("number")));
+            } catch (GitHubError exc) {
+                return blockedExternal("Unable to inspect PR during delivery recovery: " + exc.getMessage());
+            }
+            if (!"OPEN".equals(currentPr.get("state"))) {
+                state.remove(DeliveryRecovery.KEY);
+                save();
+                return 0;
+            }
+        }
+        GitOperations git = gitFactory.create();
+        Map<String, Object> failure = DeliveryRecovery.failure(state);
+        String evidence = git.recoveryFingerprint() + ":"
+                + (currentPr == null ? "" : Engine.asString(currentPr.get("headRefOid")));
+        // A controller update can resolve a path false positive without changing
+        // the story worktree. Re-check the actual guard as part of the evidence.
+        if ("PROTECTED_PATH".equals(failure.get("code"))) {
+            try {
+                git.validateStagingPaths();
+                evidence += ":policy-clear";
+            } catch (RuntimeException exc) {
+                evidence += ":policy-blocked";
+            }
+        }
+        int cap = (int) Engine.asLongOrDefault(automation.get("max_delivery_recovery_attempts"), 4);
+        String prompt = DeliveryRecovery.nextPrompt(failure, evidence, cap);
+        if (prompt == null) {
+            state.put("phase", "PROTECTED_PATH".equals(failure.get("code"))
+                    ? "BLOCKED_REPOSITORY" : "BLOCKED_EXTERNAL");
+            state.put("error", failure.get("detail"));
+            state.put("next_action", "WAIT_FOR_DELIVERY_EVIDENCE");
+            save();
+            logStableState("DELIVERY_HELD|" + current + "|" + evidence,
+                    "DELIVERY HELD: story #{} recovery requires changed evidence; {}",
+                    current, failure.get("detail"));
+            return 1;
+        }
+        state.put("deviation_code", "DELIVERY_BLOCKED");
+        state.put("deviation_detail", failure.get("detail"));
+        save();
+        log.info("DELIVERY RECOVERY: story #{} attempt={} prompt={}", current, failure.get("attempts"), prompt);
+        int result = runWorkerPhase(current, currentPr, ReviewFindingQueue.activeBatch(state), prompt);
+        // A blocked/failed repair must return to diagnosis, not run the same
+        // implementation prompt on every tick. The budget survives both stages.
+        failure = DeliveryRecovery.failure(state);
+        if (failure != null && prompt.endsWith("delivery-repair.md")) {
+            failure.put("stage", "DIAGNOSE");
+            save();
+        }
+        return result;
     }
 
     /** Result of PR-scoped reconciliation: non-null exitCode ends the run. */
@@ -212,11 +293,7 @@ final class WorkflowOrchestrator {
                     ReviewFindingQueue.DEFAULT_BATCH_SIZE);
             state.put("feedback_batch_size", Math.max(1, feedbackBatchSize));
             ReviewFindingQueue.synchronize(state, feedback, feedbackBatchSize);
-            // Rule 1: force-close any unresolved thread raised on a commit older
-            // than the current head before selecting work. The finding queue is
-            // re-read afterwards so a closed thread is not dispatched to the
-            // worker this run.
-            closeOutdatedThreads(currentPr, Engine.asString(currentPr.get("headRefOid")));
+            // Findings remain actionable until a verified fix is delivered.
             Map<String, Object> activeFinding = ReviewFindingQueue.active(state);
             List<Map<String, Object>> activeFeedback = ReviewFindingQueue.activeBatch(state);
             List<Map<String, Object>> events = Engine.reviewEvents(
@@ -525,42 +602,11 @@ final class WorkflowOrchestrator {
             state.put("deviation_code", deviation.code());
             state.put("deviation_detail", deviation.detail());
 
-            // Fast, deterministic recovery when the fix is obvious and safe:
-            // committed work with no PR just needs the PR opened and CI to run.
-            boolean committedNoPr = "COMMITTED_NO_PR".equals(deviation.code());
-            if (!dryRun && committedNoPr
-                    && Engine.asBool(workflow.get("allow_push"), false)
-                    && Engine.asBool(workflow.get("allow_pr_creation"), false)) {
-                GitOperations recoveryGit = gitFactory.create();
-                try {
-                    recoveryGit.checkoutStoryBranch(Engine.asString(state.get("branch")));
-                } catch (RuntimeException exc) {
-                    log.error("SUPERVISOR RECOVERY: could not check out story branch {}: {}",
-                            state.get("branch"), exc.getMessage());
-                }
-                log.info("SUPERVISOR RECOVERY: story #{} committed but no PR (phase {}, attempt {}); "
-                        + "creating PR and deferring to CI", current,
-                        Engine.asString(state.get("phase")), state.get("phase_attempt"));
-                state.put("phase", "WAITING_FOR_CI");
-                state.put("result_status", "SUCCESS");
-                state.put("result_evidence", "DEFERRED_TO_CI");
-                state.put("delivery_mode", "CI_DEFERRED");
-                state.remove("error");
-                save();
-                int deliveryResult = runDeliveryPipeline(
-                        recoveryGit, current, null, "", new ArrayList<>(), true);
-                state.put("run_finished_at", Controller.now());
-                save();
-                // Report the concrete outcome so a persistent failure is visible
-                // in the logs instead of appearing to silently loop.
-                if (state.get("current_pr") != null) {
-                    log.info("SUPERVISOR RECOVERY COMPLETE: story #{} PR #{} created; phase={}",
-                            current, state.get("current_pr"), state.get("phase"));
-                } else {
-                    log.error("SUPERVISOR RECOVERY DID NOT CREATE A PR: story #{} phase={} error={}",
-                            current, state.get("phase"), state.get("error"));
-                }
-                return DeviationResult.exit(deliveryResult == Integer.MIN_VALUE ? 0 : deliveryResult);
+            // A commit alone does not prove validation. A fresh verification
+            // worker must authorize delivery of committed work without a PR.
+            if ("COMMITTED_NO_PR".equals(deviation.code())) {
+                state.put("recovery_action", "Verify the preserved implementation and deliver only with complete evidence");
+                return DeviationResult.proceed("prompts/verify.md");
             }
 
             // Otherwise escalate to the reasoning supervisor (reconcile.md),
@@ -644,6 +690,9 @@ final class WorkflowOrchestrator {
                 System.getenv("CODEX_AUTOMATION_LOG_FILE"));
 
         Integer phaseBudget = phaseBudget(executionPhase);
+        int totalSeconds = phaseBudget != null ? phaseBudget
+                : (int) Engine.asLongOrDefault(Config.section(config, "codex").get("execution_timeout_seconds"), 3600);
+        phaseDeadlineNanos = System.nanoTime() + totalSeconds * 1_000_000_000L;
         Runnable heartbeat = () -> {
             lock.refresh();
             store.heartbeatJob(jobId, "codex pid active; phase=" + executionPhase);
@@ -665,8 +714,14 @@ final class WorkflowOrchestrator {
                 phaseBudget == null ? "default" : phaseBudget,
                 prompt.getFileName());
         long phaseStartNanos = System.nanoTime();
-        CodexRunner.CodexResult result = codexRunner.run(configForPhase(executionPhase),
-                renderedPrompt, repo, dryRun, heartbeat, phaseBudget);
+        CodexRunner.CodexResult result;
+        try {
+            result = runMeteredWorker(executionPhase, renderedPrompt, heartbeat);
+        } catch (ExecutionBudget.Exhausted exhausted) {
+            store.finishJob(jobId, "BLOCKED", 1, exhausted.getMessage());
+            cleanup(renderedPrompt);
+            return holdOrPark(current, currentPr, exhausted.getMessage(), "PROCESS");
+        }
         long phaseElapsedMs = (System.nanoTime() - phaseStartNanos) / 1_000_000L;
         log.info("PHASE EXIT: {} exit_code={} elapsed={}ms", executionPhase,
                 result.exitCode(), phaseElapsedMs);
@@ -715,8 +770,27 @@ final class WorkflowOrchestrator {
         store.finishJob(jobId, journalStatus, result.exitCode(),
                 codexRunner.redactSensitive(tail(result.output(), 1000)));
 
+        if (!prompt.getFileName().toString().equals("reconcile.md")
+                && (result.exitCode() != 0 || !Engine.deliveryAccepted(state))) {
+            DeliveryRecovery.recordWorkerFailure(state, executionPhase, result.exitCode(),
+                    codexRunner.redactSensitive(tail(result.output(), 12000)),
+                    codexRunner.redactSensitive(tail(result.diagnostics(), 8000)));
+            save();
+        }
+
         // Reconciliation phase applies a bounded decision, not completion.
         if (prompt.getFileName().toString().equals("reconcile.md")) {
+            if (DeliveryRecovery.failure(state) != null) {
+                boolean accepted = StateRecovery.applyReconciliationDecision(
+                        state, result.exitCode(), result.output()).accepted();
+                DeliveryRecovery.applyDecision(state, accepted, git.recoveryFingerprint());
+                state.put("result_status", accepted ? "RECONCILIATION_ACCEPTED" : "BLOCKED");
+                state.put("result_evidence", accepted ? "DECISION_COMPLETE" : "BLOCKED");
+                state.put("run_finished_at", Controller.now());
+                save();
+                cleanup(renderedPrompt);
+                return accepted ? 0 : 1;
+            }
             return handleReconcileDecision(git, current, currentPr, result, renderedPrompt,
                     feedbackToResolve);
         }
@@ -727,7 +801,16 @@ final class WorkflowOrchestrator {
 
         // A zero exit only means the CLI completed; the structured worker
         // result controls whether mutations are allowed. Non-SUCCESS fails closed.
-        if (result.exitCode() == 0 && "SUCCESS".equals(state.get("result_status"))) {
+        if (result.exitCode() == 0 && Engine.deliveryAccepted(state)) {
+            if (!dryRun && Engine.asBool(workflow.get("allow_push"), false)) {
+                try {
+                    git.validateStagingPaths();
+                } catch (RuntimeException exc) {
+                    recordDeliveryFailure(exc, "STAGING_PREFLIGHT");
+                    cleanup(renderedPrompt);
+                    return 1;
+                }
+            }
             // Pre-commit sequential specialist review gate (opt-in via
             // workflow.internal_review). Reviews the LOCAL, uncommitted diff and
             // runs bounded per-specialist fix loops BEFORE the change is
@@ -739,7 +822,11 @@ final class WorkflowOrchestrator {
             if (Engine.asBool(workflow.get("internal_review"), false)
                     && ("IMPLEMENTING".equals(executionPhase)
                         || "FIXING_FEEDBACK".equals(executionPhase))) {
-                runInternalReviewGate(git, current, context, heartbeat, phaseBudget);
+                if (!runInternalReviewGate(git, current, context, heartbeat)) {
+                    cleanup(renderedPrompt);
+                    return holdOrPark(current, currentPr,
+                            "Internal review could not verify or clear all findings", "VALIDATION");
+                }
             }
             int deliveryResult = runDeliveryPipeline(git, current, currentPr, result.output(), feedbackToResolve);
             if (deliveryResult != Integer.MIN_VALUE) {
@@ -773,60 +860,32 @@ final class WorkflowOrchestrator {
     @SuppressWarnings("unchecked")
     private int runDeliveryPipeline(GitOperations git, Integer current, Map<String, Object> currentPr,
                                     String output, List<Map<String, Object>> feedbackToResolve) {
-        return runDeliveryPipeline(git, current, currentPr, output, feedbackToResolve, false);
+        if (!Engine.deliveryAccepted(state)) {
+            return holdOrPark(current, currentPr, "Delivery rejected: validation evidence is incomplete", "VALIDATION");
+        }
+        return deliverVerifiedWork(git, current, currentPr, output, feedbackToResolve);
     }
 
-    /**
-     * @param autoResolveAllThreads when true (autonomous auto-delivery), treat
-     *        every currently-unresolved review thread as addressed by the
-     *        delivered changes: reply with the fix evidence and resolve them,
-     *        then re-trigger {@code @codex review}. The connector review is the
-     *        self-correcting safety net — a prematurely resolved thread is
-     *        re-surfaced by the next review. This keeps the fully autonomous
-     *        loop closing threads without a per-thread worker declaration.
-     */
     @SuppressWarnings("unchecked")
-    private int runDeliveryPipeline(GitOperations git, Integer current, Map<String, Object> currentPr,
-                                    String output, List<Map<String, Object>> feedbackToResolve,
-                                    boolean autoResolveAllThreads) {
+    private int deliverVerifiedWork(GitOperations git, Integer current, Map<String, Object> currentPr,
+                                    String output, List<Map<String, Object>> feedbackToResolve) {
         boolean deliveryVerified = false;
         String deliveredCommit = null;
-        boolean newCommitDelivered = false;
         Set<String> declaredFixedIds = ReviewCoordinator.fixedThreadIds(output);
         Set<String> declaredSupersededIds = ReviewCoordinator.supersededThreadIds(output);
         declaredFixedIds.addAll(declaredSupersededIds);
-
-        // On autonomous auto-delivery there is no per-thread FIXED_THREAD
-        // declaration (the worker returned a reconcile decision). Treat all
-        // currently-unresolved threads on the PR as addressed by the delivered
-        // controller-owned changes, and synthesize the feedback list so the
-        // reply/resolve loop below has items to act on.
-        if (autoResolveAllThreads && currentPr != null) {
-            List<Map<String, Object>> synthesized = new ArrayList<>();
-            Set<String> allUnresolved = new LinkedHashSet<>();
-            for (Object t : Engine.asList(currentPr.get("reviewThreads"))) {
-                if (t instanceof Map<?, ?> tm) {
-                    Map<String, Object> thread = castMap(tm);
-                    String threadId = Engine.asString(thread.get("id"));
-                    if (!threadId.isEmpty() && !Engine.asBool(thread.get("isResolved"), true)) {
-                        allUnresolved.add(threadId);
-                        Map<String, Object> item = new LinkedHashMap<>(thread);
-                        item.put("thread_id", threadId);
-                        synthesized.add(item);
-                    }
-                }
-            }
-            declaredFixedIds = allUnresolved;
-            feedbackToResolve = synthesized;
-        }
-
+        String deliveryOperation = "COMMIT_PUSH";
         if (!dryRun && Engine.asBool(workflow.get("allow_push"), false)) {
             try {
                 String branch = git.gitBranch();
                 String committed = git.commitAndPush(branch, current);
+                if (committed == null && DeliveryRecovery.failure(state) != null) {
+                    // A previous commit may have succeeded while its push failed.
+                    // A clean tree is not proof that origin contains local HEAD.
+                    git.pushBranch(branch);
+                }
                 deliveredCommit = committed;
                 if (committed != null) {
-                    newCommitDelivered = true;
                     state.put("branch", branch);
                     state.put("last_processed_commit", committed);
                     // A real head advance means progress was made; clear the
@@ -840,6 +899,7 @@ final class WorkflowOrchestrator {
                     state.remove("stuck_head_reason");
                 }
                 if (currentPr != null) {
+                    deliveryOperation = "VERIFY_HEAD";
                     int attempts = (int) Engine.asLongOrDefault(
                             automation.get("delivery_verification_attempts"), 5);
                     double delay = Engine.asLongOrDefault(
@@ -864,13 +924,12 @@ final class WorkflowOrchestrator {
                         throw new IllegalStateException(
                                 "local, origin, and PR heads do not match after delivery");
                     }
+                    deliveryOperation = "REVIEW_TRIGGER";
                     review.ensureCodexReviewTrigger(github, currentPr, state, workflow, dryRun, this::save);
                 }
             } catch (RuntimeException exc) {
-                state.put("phase", "BLOCKED_EXTERNAL");
-                state.put("error", "Unable to commit/push Codex changes: " + exc.getMessage());
-                save();
-                log.error("DELIVERY FAILED (commit/push): {}", exc.getMessage());
+                recordDeliveryFailure(exc, deliveryOperation);
+                return 1;
             }
         }
 
@@ -900,14 +959,8 @@ final class WorkflowOrchestrator {
         }
 
         // Reply to and resolve only verified, delivered, explicitly-fixed threads.
-        // For the autonomous auto-resolve-all path, additionally require that a
-        // genuinely NEW commit was delivered this run — otherwise we would be
-        // resolving unfixed findings on an unchanged head, which hides real
-        // feedback. When nothing advanced, threads are left open for the
-        // connector to re-evaluate.
         boolean mayResolveThreads = deliveryVerified && deliveredCommit != null && currentPr != null
-                && !mapping.canonical().isEmpty()
-                && (!autoResolveAllThreads || newCommitDelivered);
+                && !mapping.canonical().isEmpty();
         if (mayResolveThreads
                 && (Engine.asBool(workflow.get("allow_comments"), false)
                     || Engine.asBool(workflow.get("allow_thread_resolution"), false))) {
@@ -940,8 +993,8 @@ final class WorkflowOrchestrator {
                     }
                 }
             } catch (RuntimeException exc) {
-                state.put("phase", "BLOCKED_EXTERNAL");
-                state.put("error", "Unable to resolve delivered review feedback: " + exc.getMessage());
+                recordDeliveryFailure(exc, "RESOLVE_FEEDBACK");
+                return 1;
             }
         }
 
@@ -1005,154 +1058,61 @@ final class WorkflowOrchestrator {
                     Map<String, Object> createdDetail = github.pr(Engine.asInt(created.get("number")));
                     review.ensureCodexReviewTrigger(github, createdDetail, state, workflow, dryRun, this::save);
                 } catch (RuntimeException exc) {
-                    state.put("phase", "BLOCKED_EXTERNAL");
-                    state.put("error", "Unable to create PR: " + exc.getMessage());
-                    save();
-                    log.error("PR CREATION FAILED: story #{} — {}", current, exc.getMessage());
+                    recordDeliveryFailure(exc, "CREATE_PR");
+                    return 1;
                 }
             }
+        }
+        if (!dryRun && Engine.asBool(workflow.get("allow_push"), false)
+                && !"BLOCKED_EXTERNAL".equals(state.get("phase"))) {
+            state.remove(DeliveryRecovery.KEY);
+            state.remove("error");
+            state.put("blocker_class", "NONE");
+            if ("DELIVERY_BLOCKED".equals(state.get("deviation_code"))) {
+                state.remove("deviation_code");
+                state.remove("deviation_detail");
+            }
+            if (Set.of("RECOVER_DELIVERY", "WAIT_FOR_DELIVERY_EVIDENCE")
+                    .contains(Engine.asString(state.get("next_action")))) {
+                state.remove("next_action");
+            }
+            save();
         }
         return Integer.MIN_VALUE;
     }
 
-    /**
-     * Force-close a review thread without a code fix: post an explanatory reply
-     * (when comments are enabled) and resolve the thread on GitHub (when thread
-     * resolution is enabled), record the update in the durable journal, and mark
-     * the finding FORCE_CLOSED so it is never reprocessed. Shared by Rule 1
-     * (outdated thread) and Rule 2 (unfixable after the attempt cap). No-op in
-     * dry-run. Returns true if the thread was resolved on GitHub.
-     *
-     * <p>The reply intentionally records that a genuinely-still-present issue
-     * will be re-raised by the next Codex review on the advanced head, so
-     * closing here does not permanently hide a real defect.</p>
-     */
-    private boolean forceCloseThread(Map<String, Object> currentPr, String threadId,
-                                     String head, String replyBody, String reason) {
-        if (threadId == null || threadId.isEmpty()) {
-            return false;
-        }
-        boolean resolved = false;
-        if (!dryRun) {
-            try {
-                if (Engine.asBool(workflow.get("allow_comments"), false)
-                        && replyBody != null && !replyBody.isEmpty()) {
-                    github.replyThread(threadId, replyBody);
-                    recordThreadUpdate(threadId, head, "FORCE_CLOSE_REPLIED");
-                }
-                if (Engine.asBool(workflow.get("allow_thread_resolution"), false)) {
-                    github.resolveThread(threadId);
-                    recordThreadUpdate(threadId, head, "RESOLVED");
-                    resolved = true;
-                }
-            } catch (GitHubError exc) {
-                // Best-effort: if GitHub rejects the close, leave the finding as
-                // is so a later run can retry; do not crash the workflow.
-                log.warn("FORCE-CLOSE: unable to resolve thread {} on PR #{}: {}",
-                        threadId, currentPr == null ? "?" : currentPr.get("number"),
-                        exc.getMessage());
-                return false;
-            }
-        }
-        ReviewFindingQueue.forceClose(state, threadId, reason);
-        return resolved;
+    private void recordDeliveryFailure(RuntimeException exc, String operation) {
+        String message = codexRunner.redactSensitive("Unable to deliver Codex changes ("
+                + operation + "): " + exc.getMessage());
+        DeliveryRecovery.record(state, exc, operation, message);
+        save();
+        log.error("DELIVERY FAILED: {}", message);
     }
 
-    /**
-     * Rule 1: force-close any unresolved review thread that was raised on a
-     * commit strictly older than the current PR head. The rationale: the code
-     * the finding anchored to has since changed, so the old thread is not a
-     * reliable signal; if the underlying issue is genuinely still present, the
-     * next Codex review on the advanced head raises a fresh thread. This keeps
-     * the PR clean and prevents the worker from grinding on stale findings.
-     *
-     * <p>Only threads whose finding carries a non-empty anchoring commit that
-     * differs from the current head are closed; a finding raised on the current
-     * head (no advance yet) is left untouched so live feedback is honoured.
-     * Returns the number of threads closed.</p>
-     */
-    private int closeOutdatedThreads(Map<String, Object> currentPr, String head) {
-        if (currentPr == null || head == null || head.isEmpty()) {
-            return 0;
+    /** Stop spending on unfinished work without claiming completion or closing findings. */
+    private int holdOrPark(Integer current, Map<String, Object> currentPr, String reason, String blockerClass) {
+        String head = currentPr == null ? "" : Engine.asString(currentPr.get("headRefOid"));
+        state.put("held_failure", Map.of("head", head, "evidence", gitFactory.create().recoveryFingerprint(),
+                "reason", reason, "blocker_class", blockerClass));
+        state.put("error", reason);
+        state.put("blocker_class", blockerClass);
+        state.put("result_status", "BLOCKED");
+        state.put("result_evidence", "BLOCKED");
+        state.put("phase", "BLOCKED_REQUIREMENTS");
+        state.put("exit_code", 1);
+        state.put("run_finished_at", Controller.now());
+        if (current != null && ParkPolicy.enabled(workflow)) {
+            ParkPolicy.parkWithCheckpoint(state, current, head, reason, Controller.now());
+            clearActiveStory();
+            state.put("phase", "IDLE");
+            log.warn("PARKED UNFINISHED: story #{} — {}", current, reason);
+        } else {
+            log.warn("HELD UNFINISHED: story #{} — {}", current, reason);
         }
-        int closed = 0;
-        for (Map<String, Object> finding : ReviewFindingQueue.findings(state)) {
-            String status = Engine.asString(finding.get("status"));
-            if (!"PENDING".equals(status) && !"IN_PROGRESS".equals(status)) {
-                continue;
-            }
-            String threadId = Engine.asString(finding.get("thread_id"));
-            if (threadId.isEmpty()) {
-                continue;
-            }
-            String findingCommit = Engine.asString(finding.get("commit"));
-            // Only close a thread that was anchored to an EARLIER commit. A
-            // finding with no recorded commit, or one raised on the current
-            // head, is treated as live and left for the normal feedback path.
-            if (findingCommit.isEmpty() || findingCommit.equals(head)) {
-                continue;
-            }
-            String reply = "Auto-closing this review thread: it was raised on commit `"
-                    + shortSha(findingCommit) + "`, and the pull request head has since advanced to `"
-                    + shortSha(head) + "`. The affected code has changed, so this thread no longer "
-                    + "reflects the current head. If the issue is still present, the next automated "
-                    + "review will re-raise it against the current commit.\n\n"
-                    + "<!-- codex-automation-force-close:thread=" + threadId + ":reason=OUTDATED:head="
-                    + head + " -->";
-            forceCloseThread(currentPr, threadId, head, reply, "OUTDATED_PASSED_COMMIT");
-            log.info("THREAD FORCE-CLOSED (outdated): PR #{} thread {} raised on {} < head {}",
-                    currentPr.get("number"), threadId, shortSha(findingCommit), shortSha(head));
-            closed++;
-        }
-        if (closed > 0) {
-            save();
-        }
-        return closed;
+        save();
+        return 1;
     }
 
-    /**
-     * Rule 2: force-close the active review finding as unresolvable and set the
-     * next phase so the workflow advances instead of dead-ending. Posts an
-     * explanatory reply/resolve (best-effort, honoring the config gates), marks
-     * the finding FORCE_CLOSED, clears the per-finding/terminal/reconcile guards,
-     * and selects {@code FIXING_FEEDBACK} when independent findings remain or
-     * {@code REVIEWING_CODE} otherwise. Does not persist or return — the caller
-     * owns save() and the run's exit code. Shared by the feedback attempt-cap
-     * path and the reconcile no-deliverable path so both behave identically.
-     */
-    private void forceCloseUnfixableAndAdvance(Map<String, Object> currentPr, String head,
-                                               String reasonPhrase) {
-        Map<String, Object> active = ReviewFindingQueue.active(state);
-        String threadId = active == null ? "" : Engine.asString(active.get("thread_id"));
-        if (!threadId.isEmpty()) {
-            String reply = "Auto-closing this review thread as unresolvable by automation: "
-                    + reasonPhrase + ". Marking the finding invalid and continuing. If the issue is "
-                    + "still present, the next automated review will re-raise it against the current "
-                    + "commit.\n\n<!-- codex-automation-force-close:thread=" + threadId
-                    + ":reason=UNFIXABLE_AFTER_CAP:head=" + head + " -->";
-            forceCloseThread(currentPr, threadId, head, reply, "UNFIXABLE_AFTER_CAP");
-            log.info("THREAD FORCE-CLOSED (unfixable): PR #{} thread {} on head {}",
-                    currentPr == null ? "?" : currentPr.get("number"), threadId, shortSha(head));
-        }
-        state.remove("feedback_guard_key");
-        state.remove("feedback_attempts");
-        state.remove("stuck_head");
-        state.remove("stuck_head_reason");
-        state.remove("stuck_finding_key");
-        state.remove("resume_guard_head");
-        state.remove("resume_attempts");
-        state.remove("resume_total_story");
-        state.remove("resume_total_attempts");
-        state.remove("resume_total_resolved_baseline");
-        state.remove("last_feedback_result");
-        state.remove("last_feedback_result_head");
-        state.remove("error");
-        state.put("reconciliation_attempts", 0);
-        Map<String, Object> nextFinding = ReviewFindingQueue.next(
-                ReviewFindingQueue.findings(state));
-        state.put("phase", nextFinding != null ? "FIXING_FEEDBACK" : "REVIEWING_CODE");
-        state.put("phase_attempt", 0);
-    }
 
     private void recordThreadUpdate(String threadId, String head, String action) {
         Object existing = state.get("thread_updates");
@@ -1271,6 +1231,10 @@ final class WorkflowOrchestrator {
                 List<Map<String, Object>> open = new ArrayList<>();
                 for (Map<String, Object> p : matches) {
                     if ("OPEN".equals(p.get("state"))) {
+                        if (ParkPolicy.enabled(workflow) && ParkPolicy.parkedStoryNumbers(state).contains(story)
+                                && ParkPolicy.parkedHead(state, story).equals(Engine.asString(p.get("headRefOid")))) {
+                            continue;
+                        }
                         open.add(p);
                     }
                 }
@@ -1287,6 +1251,7 @@ final class WorkflowOrchestrator {
             if (!candidates.isEmpty()) {
                 current = (Integer) candidates.get(0)[0];
                 currentPr = castMap(candidates.get(0)[1]);
+                ParkPolicy.restoreCheckpoint(state, current, Engine.asString(currentPr.get("headRefOid")));
                 state.put("current_story", current);
                 state.put("current_pr", currentPr.get("number"));
                 state.put("current_pr_url", currentPr.get("url"));
@@ -1309,11 +1274,15 @@ final class WorkflowOrchestrator {
                         ? ParkPolicy.excludeParked(stories, state) : stories;
                 Map<String, Object> selected = Engine.selectStory(selectable, completedStories());
                 if (selected == null) {
-                    state.put("phase", "EPIC_COMPLETE");
-                    state.put("message", "No eligible incomplete stories remain");
+                    boolean unfinished = !ParkPolicy.parkedStoryNumbers(state).isEmpty()
+                            || stories.stream().anyMatch(s -> "OPEN".equals(s.get("state"))
+                                    && !completedStories().contains(Engine.asInt(s.get("number"))));
+                    state.put("phase", unfinished ? "BLOCKED_REQUIREMENTS" : "EPIC_COMPLETE");
+                    state.put("message", unfinished ? "Unfinished stories remain parked or ineligible"
+                            : "No eligible incomplete stories remain");
                     save();
-                    log.info("EPIC COMPLETE");
-                    return SelectionResult.exit(0);
+                    log.info("STORY SELECTION: {}", state.get("message"));
+                    return SelectionResult.exit(unfinished ? 1 : 0);
                 }
                 current = Engine.asInt(selected.get("number"));
                 state.put("current_story", current);
@@ -1488,9 +1457,29 @@ final class WorkflowOrchestrator {
             try {
                 String mergeMethod = Engine.asString(
                         workflow.getOrDefault("merge_method", "squash"));
-                github.mergePr(Engine.asInt(currentPr.get("number")), mergeMethod);
+                int prNumber = Engine.asInt(currentPr.get("number"));
+                String expectedHead = Engine.asString(currentPr.get("headRefOid"));
+                github.mergePr(prNumber, mergeMethod);
+                Map<String, Object> mergedPr = github.pr(prNumber);
+                if (!isMerged(mergedPr)) {
+                    state.put("phase", "WAITING_FOR_CI");
+                    state.put("error", "Merge command returned without GitHub confirming PR #"
+                            + prNumber + " as merged");
+                    save();
+                    log.warn("AUTO-MERGE UNCONFIRMED: PR #{} remains {}; retaining story state",
+                            prNumber, mergedPr.get("state"));
+                    return 0;
+                }
+                String mergedHead = Engine.asString(mergedPr.get("headRefOid"));
+                if (!expectedHead.isEmpty() && !mergedHead.isEmpty() && !expectedHead.equals(mergedHead)) {
+                    state.put("phase", "BLOCKED_EXTERNAL");
+                    state.put("error", "PR head changed while merge was being confirmed; refusing to "
+                            + "advance the story");
+                    save();
+                    return 1;
+                }
                 log.info("AUTO-MERGE: merged PR #{} for story #{} (head {}) via {}",
-                        currentPr.get("number"), current,
+                        prNumber, current,
                         shortSha(currentPr.get("headRefOid")), mergeMethod);
                 advanceStory(current);
                 save();
@@ -1546,73 +1535,8 @@ final class WorkflowOrchestrator {
     private PrScopedResult handleFeedbackCapExceeded(Integer current, Map<String, Object> currentPr,
                                                      String head, int feedbackAttempts,
                                                      List<Map<String, Object>> activeFeedback) {
-        if (!dryRun && Engine.asBool(workflow.get("allow_push"), false)) {
-            GitOperations fbGit = gitFactory.create();
-            try {
-                fbGit.checkoutStoryBranch(Engine.asString(state.get("branch")));
-            } catch (RuntimeException exc) {
-                log.error("FEEDBACK AUTO-DELIVER: checkout failed: {}", exc.getMessage());
-            }
-            boolean hasDeliverableChanges;
-            try {
-                hasDeliverableChanges =
-                        fbGit.classifyWorktree(state) != GitOperations.WorktreeState.CLEAN;
-            } catch (RuntimeException exc) {
-                hasDeliverableChanges = false;
-            }
-            if (hasDeliverableChanges) {
-                log.info("FEEDBACK AUTO-DELIVER: PR #{} head {} reprocessed {} times; "
-                        + "delivering worker changes and deferring to CI",
-                        currentPr.get("number"), shortSha(head), feedbackAttempts);
-                state.put("phase", "WAITING_FOR_CI");
-                state.put("result_status", "SUCCESS");
-                state.put("result_evidence", "DEFERRED_TO_CI");
-                state.put("delivery_mode", "CI_DEFERRED");
-                state.remove("feedback_guard_key");
-                state.remove("feedback_attempts");
-                state.remove("error");
-                save();
-                int deliveryResult = runDeliveryPipeline(
-                        fbGit, current, currentPr, "", new ArrayList<>(activeFeedback), false);
-                state.put("run_finished_at", Controller.now());
-                save();
-                log.info("FEEDBACK AUTO-DELIVER COMPLETE: PR #{} phase={}",
-                        currentPr.get("number"), state.get("phase"));
-                return PrScopedResult.exit(deliveryResult == Integer.MIN_VALUE ? 0 : deliveryResult);
-            }
-            // Nothing to deliver: Rule 2 — the worker has tried up to the
-            // attempt cap and cannot produce a fix. Rather than looping or
-            // dead-ending, force-close the active finding thread as invalid and
-            // advance. Any committed work stays on the PR; if the issue is
-            // genuinely still present, the next Codex review re-raises it.
-            forceCloseUnfixableAndAdvance(currentPr, head,
-                    "the worker attempted a fix " + feedbackAttempts + " times on head `"
-                    + shortSha(head) + "` without a verifiable resolution");
-            state.put("run_finished_at", Controller.now());
-            save();
-            log.info("FEEDBACK CAP RESOLVED BY FORCE-CLOSE: PR #{} advancing (next phase={})",
-                    currentPr.get("number"), state.get("phase"));
-            // End this tick so the next run re-reads the PR from GitHub with the
-            // thread now resolved and re-evaluates from clean state. Continuing
-            // within this tick would re-run reconcile on the stale PR snapshot
-            // (which still reports CHANGES_REQUESTED until GitHub reflects the
-            // resolution) and re-route into the loop we just broke.
-            return PrScopedResult.exit(0);
-        }
-        // Simulation (dry-run) or push disabled: mark terminally stuck and stop
-        // so the controller does not re-enter feedback every tick.
-        state.put("phase", "BLOCKED_EXTERNAL");
-        state.put("stuck_head", head);
-        state.put("stuck_head_reason", "DELIVERY_DISABLED");
-        state.remove("feedback_guard_key");
-        state.remove("feedback_attempts");
-        state.put("error", "Feedback for PR #" + currentPr.get("number")
-                + " head " + shortSha(head) + " was reprocessed " + feedbackAttempts
-                + " times without resolution and delivery is disabled (dry_run or "
-                + "allow_push=false)");
-        save();
-        log.error("BLOCKED: " + state.get("error"));
-        return PrScopedResult.exit(1);
+        return PrScopedResult.exit(holdOrPark(current, currentPr,
+                "Feedback exhausted its retry budget without a verified resolution", "REVIEW_FEEDBACK"));
     }
 
     private PrScopedResult handleStuckHeadForFeedback(Map<String, Object> currentPr, String head,
@@ -1819,7 +1743,7 @@ final class WorkflowOrchestrator {
             return result.exitCode();
         }
         StateRecovery.ReconciliationOutcome outcome =
-                StateRecovery.applyReconciliationDecision(state, result.output());
+                StateRecovery.applyReconciliationDecision(state, result.exitCode(), result.output());
         if (!outcome.accepted()) {
             int attempts = (int) Engine.asLongOrDefault(state.get("reconciliation_attempts"), 0) + 1;
             state.put("phase", "BLOCKED_REQUIREMENTS");
@@ -1906,75 +1830,16 @@ final class WorkflowOrchestrator {
             state.remove("resume_attempts");
         }
 
-        if (forceDelivery && currentPr != null) {
-            boolean hasDeliverable;
-            try {
-                hasDeliverable = git.classifyWorktree(state) != GitOperations.WorktreeState.CLEAN;
-            } catch (RuntimeException exc) {
-                hasDeliverable = false;
-            }
-            if (!hasDeliverable) {
-                // Rule 2: the active finding could not be advanced after the
-                // resume cap and nothing is deliverable. Force-close it as
-                // unresolvable instead of dead-ending on operator intervention.
-                // Any committed work remains on the PR; a genuinely-present
-                // issue is re-raised by the next Codex review on the head.
-                forceCloseUnfixableAndAdvance(currentPr, reconcileHead,
-                        "the fix could not be advanced on head `" + shortSha(reconcileHead)
-                        + "` after repeated attempts, and no deliverable change was produced");
-                state.put("exit_code", result.exitCode());
-                state.put("run_finished_at", Controller.now());
-                save();
-                cleanup(renderedPrompt);
-                log.info("AUTO-DELIVER RESOLVED BY FORCE-CLOSE: PR #{} advancing (next phase={})",
-                        currentPr.get("number"), state.get("phase"));
-                return 0;
-            }
-            state.put("result_status", "SUCCESS");
-            state.put("result_evidence", "DEFERRED_TO_CI");
-            state.put("delivery_mode", "CI_DEFERRED");
-            state.put("phase", "WAITING_FOR_CI");
-            state.remove("resume_guard_head");
-            state.remove("resume_attempts");
-            state.remove("resume_total_story");
-            state.remove("resume_total_attempts");
-            state.remove("resume_total_resolved_baseline");
-            save();
-            int deliveryResult = runDeliveryPipeline(git, current, currentPr,
-                    result.output(), feedbackToResolve, true);
+        if (forceDelivery) {
             cleanup(renderedPrompt);
-            if (deliveryResult != Integer.MIN_VALUE) {
-                return deliveryResult;
-            }
-            state.put("exit_code", result.exitCode());
-            state.put("run_finished_at", Controller.now());
-            save();
-            log.info("AUTO-DELIVER COMPLETE: story #{} phase={}", current, state.get("phase"));
-            return 0;
+            return holdOrPark(current, currentPr,
+                    "Reconciliation exhausted its no-progress budget; work remains unverified", "PROCESS");
         }
-
-        // Autonomous execution of a RESUME/PROCESS decision when the story has
-        // NO PR yet. The supervisor (reconcile via Codex) is the on-behalf-of-
-        // human actor: when it decides to resume a PR-dependent phase
-        // (REVIEWING_CODE / FIXING_FEEDBACK) but no PR exists, the controller
-        // must MAKE that decision productive instead of merely flipping the
-        // phase — otherwise the target phase is a no-op and the workflow loops
-        // forever (observed: story blocked pre-PR, RESUME_REVIEW re-entered 50+
-        // times with pr=none). The fully autonomous rule is deliver-or-advance,
-        // never wait:
-        //   • deliverable work on the story branch -> commit + push + create the
-        //     PR (the existing delivery pipeline), so review/CI can actually run;
-        //   • nothing deliverable and the resume caps are exhausted -> advance to
-        //     the next story so the EPIC keeps moving.
-        // States that already work (a PR exists) are untouched: this block is
-        // gated on currentPr == null and a PR-dependent resume target.
-        if (currentPr == null && resumeAction
-                && isPrDependentPhase(Engine.asString(state.get("phase")))) {
-            int prLessResult = executePrLessResume(git, current, result,
-                    renderedPrompt, feedbackToResolve, forceDelivery);
-            if (prLessResult != Integer.MIN_VALUE) {
-                return prLessResult;
-            }
+        if (resumeAction) {
+            String target = Engine.asString(state.get("phase"));
+            // Keep the chosen recovery direction ahead of PR feedback routing.
+            state.put("recovery_next_prompt", currentPr == null && isPrDependentPhase(target)
+                    ? "prompts/verify.md" : Controller.phasePromptFor(target));
         }
 
         save();
@@ -2014,96 +1879,6 @@ final class WorkflowOrchestrator {
         return "REVIEWING_CODE".equals(phase) || "FIXING_FEEDBACK".equals(phase);
     }
 
-    /**
-     * Autonomously carry out a supervisor RESUME/PROCESS decision for a story
-     * that has NO PR yet. Fully autonomous, never waits for a human:
-     * <ul>
-     *   <li>deliverable story work present ({@code RECOVERABLE_STORY_BRANCH}) ->
-     *       commit + push + create the PR via the existing delivery pipeline,
-     *       then let CI/review run against the new head;</li>
-     *   <li>nothing deliverable ({@code CLEAN}) AND the resume caps are exhausted
-     *       ({@code forceDelivery}) -> advance to the next story so the EPIC keeps
-     *       moving instead of looping on an empty pre-PR state.</li>
-     * </ul>
-     * Returns an exit code to propagate, or {@link Integer#MIN_VALUE} to let the
-     * caller fall through to the normal {@code RECONCILIATION ACCEPTED} path
-     * (used when work exists but push/PR creation is disabled, or when the
-     * worktree is clean but the caps are not yet exhausted — a bounded retry).
-     */
-    private int executePrLessResume(GitOperations git, Integer current,
-                                    CodexRunner.CodexResult result, Path renderedPrompt,
-                                    List<Map<String, Object>> feedbackToResolve,
-                                    boolean forceDelivery) {
-        GitOperations.WorktreeState worktreeState;
-        try {
-            worktreeState = git.classifyWorktree(state);
-        } catch (RuntimeException exc) {
-            // Cannot classify the tree — do not guess. Fall through to the
-            // normal accepted path (a subsequent tick re-evaluates).
-            log.warn("PRE-PR RESUME: unable to classify worktree for story #{}: {}",
-                    current, exc.getMessage());
-            return Integer.MIN_VALUE;
-        }
-
-        boolean hasDeliverable =
-                worktreeState == GitOperations.WorktreeState.RECOVERABLE_STORY_BRANCH;
-
-        // Case 1: deliver the existing story work as the first PR. Only when the
-        // workflow permits real mutations; otherwise fall through so the plain
-        // accepted path records the decision (dry-run / push disabled).
-        if (hasDeliverable && !dryRun
-                && Engine.asBool(workflow.get("allow_push"), false)
-                && Engine.asBool(workflow.get("allow_pr_creation"), false)) {
-            log.info("PRE-PR DELIVER: story #{} has implementation but no PR; committing, "
-                    + "pushing, and creating the PR so review/CI can proceed (phase={})",
-                    current, state.get("phase"));
-            // runDeliveryPipeline creates the PR for a currentPr==null story when
-            // the phase is a PR-ready phase (REVIEWING_CODE / FIXING_FEEDBACK
-            // qualify) and then returns MIN_VALUE. Clear the resume guards: a real
-            // head is about to exist, mirroring the post-commit reset in the
-            // delivery pipeline so a fresh PR does not inherit pre-commit counters.
-            state.remove("resume_guard_head");
-            state.remove("resume_attempts");
-            state.remove("resume_total_story");
-            state.remove("resume_total_attempts");
-            state.remove("resume_total_resolved_baseline");
-            save();
-            int deliveryResult = runDeliveryPipeline(git, current, null,
-                    result.output(), feedbackToResolve);
-            cleanup(renderedPrompt);
-            if (deliveryResult != Integer.MIN_VALUE) {
-                return deliveryResult;
-            }
-            state.put("exit_code", result.exitCode());
-            state.put("run_finished_at", Controller.now());
-            save();
-            log.info("PRE-PR DELIVER COMPLETE: story #{} phase={}", current, state.get("phase"));
-            return 0;
-        }
-
-        // Case 2: nothing to deliver AND the resume caps are exhausted. The
-        // supervisor cannot advance a PR-dependent phase without a PR and there
-        // is no work to turn into one. Autonomously advance to the next story
-        // rather than looping on an empty pre-PR state (never waits for a human).
-        if (!hasDeliverable && forceDelivery && current != null) {
-            log.info("PRE-PR ADVANCE: story #{} has no deliverable work and the resume caps "
-                    + "are exhausted with no PR; advancing to the next story to keep the EPIC "
-                    + "moving", current);
-            advanceStory(current);
-            state.put("exit_code", result.exitCode());
-            state.put("run_finished_at", Controller.now());
-            save();
-            cleanup(renderedPrompt);
-            log.info("PRE-PR ADVANCE COMPLETE: story #{} completed-and-advanced; phase={}",
-                    current, state.get("phase"));
-            return 0;
-        }
-
-        // Otherwise (work exists but mutations disabled, or clean tree but caps
-        // not yet reached) let the normal accepted path handle it — a bounded
-        // retry, not a permanent stall.
-        return Integer.MIN_VALUE;
-    }
 
     /**
      * Build a per-call config whose {@code codex} section is resolved for the
@@ -2129,56 +1904,132 @@ final class WorkflowOrchestrator {
         return perCall;
     }
 
-    /**
-     * Run the pre-commit specialist review gate against the local diff. Renders
-     * and runs each relevant specialist prompt via the bounded Codex worker,
-     * reusing the same budget/heartbeat as a normal phase. Best-effort: any
-     * failure to render/run a specialist is logged and treated as a
-     * non-blocking pass, because the post-PR Codex review is the final
-     * authority and the autonomous loop must never dead-end on the gate.
-     */
-    private void runInternalReviewGate(GitOperations git, Integer current,
-                                       Map<String, Object> context, Runnable heartbeat,
-                                       Integer phaseBudget) {
+    private CodexRunner.CodexResult runMeteredWorker(String phase, Path prompt, Runnable heartbeat) {
+        int remaining = (int) Math.min(Integer.MAX_VALUE,
+                Math.max(0, (phaseDeadlineNanos - System.nanoTime()) / 1_000_000_000L));
+        int timeout = ExecutionBudget.reserve(state, automation, remaining);
+        save();
+        String callId = Engine.asString(state.get("execution_id")) + ":call:" + System.nanoTime() + ":" + (++callSequence);
+        String model = Engine.asString(Config.section(configForPhase(phase), "codex").get("model"));
+        long started = System.nanoTime();
+        long bytes;
+        try { bytes = Files.size(prompt); } catch (java.io.IOException exc) { bytes = 0; }
+        CodexRunner.CodexResult result = codexRunner.run(configForPhase(phase), prompt, repo, dryRun, heartbeat, timeout);
+        long elapsed = Math.max(0, (System.nanoTime() - started) / 1_000_000L);
+        Map<String, Long> usage = new LinkedHashMap<>();
+        if (result.usage().inputTokens() != null) usage.put("input_tokens", result.usage().inputTokens());
+        if (result.usage().cachedInputTokens() != null) usage.put("cached_input_tokens", result.usage().cachedInputTokens());
+        if (result.usage().outputTokens() != null) usage.put("output_tokens", result.usage().outputTokens());
+        ExecutionBudget.finish(state, elapsed, usage);
+        String output = codexRunner.redactSensitive(result.output());
+        String diagnostics = codexRunner.redactSensitive(result.diagnostics());
+        state.put("last_worker_evidence", Map.of("job_id", callId, "phase", phase,
+                "exit_code", result.exitCode(), "output", tail(output, 12000), "failed_commands", diagnostics));
+        store.recordWorkerUsage(callId, Engine.asInt(state.get("current_story")), phase, model,
+                elapsed, bytes, result.exitCode(), result.usage().inputTokens(),
+                result.usage().cachedInputTokens(), result.usage().outputTokens(), output, diagnostics);
+        save();
+        return result;
+    }
+
+    /** Review the exact local diff; any missing or failed evidence stops delivery. */
+    @SuppressWarnings("unchecked")
+    private boolean runInternalReviewGate(GitOperations git, Integer current,
+                                          Map<String, Object> context, Runnable heartbeat) {
         int maxFix = (int) Engine.asLongOrDefault(
                 automation.get("internal_review_max_fix_attempts"), 2);
-        List<String> changedPaths;
-        try {
-            changedPaths = git.changedSourcePaths();
-        } catch (RuntimeException exc) {
-            log.warn("INTERNAL REVIEW: unable to read changed paths ({}); skipping gate", exc.getMessage());
-            return;
-        }
+        List<String> changedPaths = git.changedSourcePaths();
         if (changedPaths.isEmpty()) {
             log.info("INTERNAL REVIEW: no local diff to review; skipping gate");
-            return;
+            return true;
         }
         InternalReviewGate gate = new InternalReviewGate(
                 InternalReviewGate.DEFAULT_PANEL, maxFix);
         Path rendered = root.resolve("state").resolve("prompt-" + epicNumber + ".md");
-        InternalReviewGate.ReviewRunner runner = promptFile -> {
+        ReviewContext reviewContext = new ReviewContext() {
+            @Override public String snapshot() { return git.recoveryFingerprint(); }
+            @Override public List<String> changedPaths() { return git.changedSourcePaths(); }
+            @Override public String signature(InternalReviewGate.Specialist specialist) {
+                Path reviewPrompt = root.resolve(specialist.reviewPrompt());
+                Path fixPrompt = root.resolve(specialist.fixPrompt());
+                Path commonPrompt = root.resolve("prompts/common.md");
+                if (!Files.isRegularFile(reviewPrompt) || !Files.isRegularFile(fixPrompt)
+                        || !Files.isRegularFile(commonPrompt)) return "";
+                try {
+                    String effective = Config.section(configForPhase("REVIEWING_CODE"), "codex").toString();
+                    byte[] bytes = java.security.MessageDigest.getInstance("SHA-256").digest(
+                            (Files.readString(commonPrompt) + "\n" + Files.readString(reviewPrompt)
+                                    + "\n" + Files.readString(fixPrompt) + "\n" + effective + "\n"
+                                    + Engine.asString(state.get("current_story_title")))
+                                    .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    return java.util.HexFormat.of().formatHex(bytes);
+                } catch (Exception exc) {
+                    return "";
+                }
+            }
+            @Override public Map<String, Object> cache() {
+                Object existing = state.get("review_cache");
+                return existing instanceof Map<?, ?> ? (Map<String, Object>) existing : new LinkedHashMap<>();
+            }
+            @Override public List<InternalReviewGate.Finding> unresolved() {
+                List<InternalReviewGate.Finding> findings = new ArrayList<>();
+                Object existing = state.get("internal_review_findings");
+                if (existing instanceof List<?> list) for (Object item : list) {
+                    if (!(item instanceof Map<?, ?> finding)) continue;
+                    Object evidence = finding.get("evidence");
+                    if (evidence instanceof Map<?, ?> e) findings.add(new InternalReviewGate.Finding(
+                            Engine.asString(finding.get("specialist")), Engine.asString(finding.get("snapshot")),
+                            new ReviewEvidence(Engine.asInt(e.get("exit_code")), Engine.asString(e.get("output"))),
+                            Engine.asString(finding.get("reason"))));
+                }
+                return findings;
+            }
+            @Override public void persist(InternalReviewGate.Report report) {
+                Map<String, Object> cache = cache();
+                // Cache is useful only for a bounded recent history of snapshots.
+                while (cache.size() > 64) cache.remove(cache.keySet().iterator().next());
+                state.put("review_cache", cache);
+                List<Object> findings = new ArrayList<>();
+                for (InternalReviewGate.Finding f : report.unresolved()) findings.add(Map.of(
+                        "specialist", f.specialist(), "snapshot", f.snapshot(), "reason", f.reason(),
+                        "evidence", Map.of("exit_code", f.evidence().exitCode(), "output", f.evidence().output())));
+                state.put("internal_review_findings", findings);
+                state.put("internal_review_snapshot", report.snapshot());
+                state.put("internal_review_passed", report.passed());
+                save();
+            }
+        };
+        InternalReviewGate.Report report = gate.run(reviewContext, request -> {
+            String promptFile = request.promptFile();
             Path promptPath = root.resolve(promptFile);
-            if (!Files.exists(promptPath)) {
-                // A missing specialist prompt must not block the loop: treat as a
-                // pass so the gate degrades gracefully when a prompt is absent.
-                log.warn("INTERNAL REVIEW: prompt {} not found; treating specialist as pass", promptFile);
-                return "RESULT_STATUS: SUCCESS\nRESULT_EVIDENCE: PROMPT_ABSENT\n";
+            if (!Files.isRegularFile(promptPath)) {
+                return new ReviewEvidence(-1, "review prompt missing: " + promptFile);
             }
             try {
-                Files.writeString(rendered, PromptRenderer.render(root, promptFile, context));
-            } catch (java.io.IOException exc) {
-                log.warn("INTERNAL REVIEW: unable to render {} ({}); treating as pass",
-                        promptFile, exc.getMessage());
-                return "RESULT_STATUS: SUCCESS\nRESULT_EVIDENCE: RENDER_FAILED\n";
+                Map<String, Object> scoped = new LinkedHashMap<>();
+                scoped.put("epic", epic);
+                scoped.put("current_story", current);
+                scoped.put("current_story_title", state.getOrDefault("current_story_title", ""));
+                scoped.put("current_pr", context.get("current_pr"));
+                scoped.put("diff_fingerprint", reviewContext.snapshot());
+                scoped.put("changed_paths", reviewContext.changedPaths());
+                scoped.put("review_specialist", request.specialist().name());
+                if (request.findings() != null) scoped.put("review_findings", request.findings().output());
+                Files.writeString(rendered, PromptRenderer.render(root, promptFile, scoped));
+            } catch (Exception exc) {
+                return new ReviewEvidence(-1, "unable to render " + promptFile + ": " + exc.getMessage());
             }
-            // Internal-review specialists are code review, so they honor the
-            // REVIEWING_CODE per-phase codex override (model/reasoning_effort)
-            // just like the post-PR review phase — not the base defaults.
-            CodexRunner.CodexResult r = codexRunner.run(configForPhase("REVIEWING_CODE"),
-                    rendered, repo, dryRun, heartbeat, phaseBudget);
-            return r.output();
-        };
-        gate.run(changedPaths, runner);
+            try {
+                CodexRunner.CodexResult result = runMeteredWorker("REVIEWING_CODE", rendered, heartbeat);
+                return new ReviewEvidence(result.exitCode(), result.output());
+            } catch (RuntimeException exc) {
+                return new ReviewEvidence(-1, "review worker failed: " + exc.getMessage());
+            }
+        });
+        if (!report.passed()) {
+            log.warn("INTERNAL REVIEW: blocking delivery with {} unresolved finding(s)", report.unresolved().size());
+        }
+        return report.passed();
     }
 
     private Integer prepareWorktreeForPhase(GitOperations git, Integer current,
@@ -2280,6 +2131,15 @@ final class WorkflowOrchestrator {
         }
         completed.add(current);
         state.put("completed_stories", completed);
+        clearActiveStory();
+    }
+
+    private static boolean isMerged(Map<String, Object> pr) {
+        return pr != null && (!Engine.asString(pr.get("mergedAt")).isBlank()
+                || "MERGED".equalsIgnoreCase(Engine.asString(pr.get("state"))));
+    }
+
+    private void clearActiveStory() {
         state.put("current_story", null);
         state.put("current_pr", null);
         state.put("current_pr_url", null);

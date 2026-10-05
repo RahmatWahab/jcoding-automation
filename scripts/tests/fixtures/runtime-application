@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+dist="$(cd "$(dirname "$0")/.." && pwd)"
+[[ "$dist" == "$PWD/out/launcher-runtime/distributions/"* ]]
+[[ "$FAKE_SETSID" == yes ]]
+printf '%s\n' "$dist" > "$PWD/launched-dist"
+printf '%s\0' "$@" > "$PWD/launched-args"
+printf '%s\n' "$JAVA_OPTS" > "$PWD/launched-java-opts"
+printf '%s\n' "$CODEX_AUTOMATION_LOG_FILE" > "$PWD/launched-log"
+before="$(<"$dist/lib/jcoding-automation-test.jar")"
+if [[ -n "${APP_HOLD:-}" ]]; then
+  touch "$APP_HOLD.started"
+  until [[ -e "$APP_HOLD.release" ]]; do sleep 0.02; done
+  [[ "$(<"$dist/lib/jcoding-automation-test.jar")" == "$before" ]]
+  touch "$APP_HOLD.verified"
+fi
+echo 'fake application output'
+exit "${APP_EXIT:-0}"
+

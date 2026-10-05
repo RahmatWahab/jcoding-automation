@@ -163,6 +163,7 @@ class WorkflowOrchestratorIntegrationTest {
         int blockReturns = 0;
         int maxAttemptsSeen = 0;
         boolean stuckHeadSet = false;
+        boolean heldFailureSet = false;
         for (int run = 1; run <= 12; run++) {
             Map<String, Object> state = store.load();
             state.put("phase", "FIXING_FEEDBACK");
@@ -185,17 +186,20 @@ class WorkflowOrchestratorIntegrationTest {
             if (!Engine.asString(store.load().get("stuck_head")).isEmpty()) {
                 stuckHeadSet = true;
             }
+            if (store.load().get("held_failure") instanceof Map<?, ?>) {
+                heldFailureSet = true;
+            }
             lock.release();
         }
 
-        // The head is terminally marked stuck (block is idempotent).
-        assertThat(stuckHeadSet).isTrue();
-        // Crucially, feedback_attempts NEVER runs away: it is capped at/around
-        // max_feedback_attempts and cleared once stuck (never reaching 12+ as in
-        // the old unbounded loop).
+        // The unchanged finding is held with its evidence; it is never declared
+        // resolved or force-closed just to escape the loop.
+        assertThat(stuckHeadSet).isFalse();
+        assertThat(heldFailureSet).isTrue();
+        // Feedback attempts remain bounded rather than growing on every tick.
         assertThat(maxAttemptsSeen).isLessThanOrEqualTo(4);
-        // It keeps returning a blocked exit (does not falsely progress) but does
-        // so quietly/idempotently rather than re-incrementing forever.
+        // It keeps returning a blocked exit (does not falsely progress) rather
+        // than re-incrementing forever.
         assertThat(blockReturns).isGreaterThan(0);
     }
 
@@ -920,6 +924,7 @@ class WorkflowOrchestratorIntegrationTest {
         Files.createDirectories(prompts);
         Files.writeString(prompts.resolve("common.md"), "COMMON");
         Files.writeString(prompts.resolve("reconcile.md"), "{{COMMON}}\nReconcile.");
+        Files.writeString(prompts.resolve("implement.md"), "{{COMMON}}\nImplement.");
         Files.createDirectories(root.resolve("state"));
 
         String head = "abc123def456";
@@ -2249,6 +2254,201 @@ class WorkflowOrchestratorIntegrationTest {
         lock.release();
     }
 
+    @Test
+    void protectedDeliveryRoutesToSupervisorAndTargetedRepairBeforeFeedback(@TempDir Path root) throws Exception {
+        try (DeliveryRecoveryFixture f = new DeliveryRecoveryFixture(root)) {
+            f.status = "?? tests/api_token.txt\n";
+            assertThat(f.tick()).isEqualTo(1);
+            assertThat(f.state.get("phase")).isEqualTo("BLOCKED_REPOSITORY");
+            assertThat(f.github.resolvedThreads).isEmpty();
+            assertThat(f.calls).noneMatch(c -> c.startsWith("add ") || c.startsWith("push "));
+            assertThat(f.workerPrompts).hasSize(1);
+
+            // Reload durable state, exactly as a new scheduler tick does.
+            f.state.clear();
+            f.state.putAll(f.store.load());
+            assertThat(f.tick()).isZero();
+            assertThat(f.workerPrompts.getLast()).contains("SUPERVISOR", "PROTECTED_PATH", "tests/api_token.txt");
+            assertThat(f.state.get("result_status")).isEqualTo("RECONCILIATION_ACCEPTED");
+
+            // Model a legitimate source change after the blocker was diagnosed.
+            f.status = "?? tests/release/test_manager_api_token_provisioning.sh\n";
+            assertThat(f.tick()).isZero();
+            assertThat(f.workerPrompts.get(2)).contains("TARGETED REPAIR");
+            assertThat(f.calls).anyMatch(c -> c.startsWith("commit -m"));
+            assertThat(f.github.resolvedThreads).containsExactly("PRRT_1");
+            assertThat(f.state).doesNotContainKey(DeliveryRecovery.KEY);
+        }
+    }
+
+    @Test
+    void failedWorkerIsDiagnosedThenResumedAtSupervisorSelectedPhase(@TempDir Path root) throws Exception {
+        try (DeliveryRecoveryFixture f = new DeliveryRecoveryFixture(root)) {
+            f.status = " M src/Fix.java\n";
+            f.failNextWorker = true;
+
+            assertThat(f.tick()).isEqualTo(124);
+            assertThat(DeliveryRecovery.failure(f.state)).containsEntry("code", "WORKER_FAILED")
+                    .containsEntry("exit_code", 124)
+                    .containsEntry("output", "partial worker response")
+                    .containsEntry("diagnostics", "test command timed out");
+            assertThat(f.github.resolvedThreads).isEmpty();
+
+            assertThat(f.tick()).isZero(); // supervisor classifies the worker timeout
+            assertThat(f.workerPrompts.getLast()).contains("SUPERVISOR");
+            assertThat(DeliveryRecovery.failure(f.state).get("stage")).isEqualTo("REPAIR");
+
+            assertThat(f.tick()).isZero(); // resume the chosen verification phase
+            assertThat(f.workerPrompts.getLast()).contains("VERIFY");
+            assertThat(f.github.resolvedThreads).containsExactly("PRRT_1");
+            assertThat(f.state).doesNotContainKey(DeliveryRecovery.KEY);
+        }
+    }
+
+    @Test
+    void repeatedDeliveryBlockerDoesNotConsumeUnboundedWorkersOrResolveThreads(@TempDir Path root) throws Exception {
+        try (DeliveryRecoveryFixture f = new DeliveryRecoveryFixture(root)) {
+            f.status = "?? config/secrets/token.txt\n";
+            f.tick(); // initial failure
+            f.tick(); // supervisor
+            f.tick(); // repair cannot make the protected path deliverable
+            f.tick(); // budget reached
+            int workers = f.workerPrompts.size();
+            for (int i = 0; i < 5; i++) {
+                assertThat(f.tick()).isEqualTo(1);
+            }
+            assertThat(f.workerPrompts).hasSize(workers);
+            assertThat(DeliveryRecovery.failure(f.state).get("stage")).isEqualTo("HELD");
+            assertThat(f.github.resolvedThreads).isEmpty();
+            assertThat(f.github.repliedThreads).isEmpty();
+            f.status = " M src/Fix.java\n"; // changed evidence automatically wakes recovery
+            assertThat(f.tick()).isZero();
+            assertThat(f.workerPrompts).hasSize(workers + 1);
+        }
+    }
+
+    @Test
+    void failedPushRetriesCommittedCleanTreeAndVerifiesBeforeResolving(@TempDir Path root) throws Exception {
+        try (DeliveryRecoveryFixture f = new DeliveryRecoveryFixture(root)) {
+            f.status = " M src/Fix.java\n";
+            f.failPush = true;
+            assertThat(f.tick()).isEqualTo(1);
+            assertThat(f.status).isEmpty(); // commit succeeded before push failed
+            assertThat(f.github.resolvedThreads).isEmpty();
+            assertThat(DeliveryRecovery.failure(f.state).get("operation")).isEqualTo("COMMIT_PUSH");
+            f.failPush = false;
+            f.tick(); // supervisor
+            assertThat(f.tick()).isZero(); // verify/repair -> normal push -> head verification
+            assertThat(f.calls.stream().filter(c -> c.startsWith("commit -m")).count()).isEqualTo(1);
+            assertThat(f.calls.stream().filter(c -> c.startsWith("push ")).count()).isEqualTo(2);
+            assertThat(f.github.resolvedThreads).containsExactly("PRRT_1");
+            assertThat(f.state).doesNotContainKey(DeliveryRecovery.KEY);
+        }
+    }
+
+    private static final class DeliveryRecoveryFixture implements AutoCloseable {
+        final Map<String, Object> state = map("phase", "FIXING_FEEDBACK", "current_story", 45,
+                "current_pr", 218, "branch", "story/45-x");
+        final List<String> calls = new ArrayList<>();
+        final List<String> workerPrompts = new ArrayList<>();
+        final WorkflowLock lock;
+        final StateStore store;
+        final DeliveryGitHub github;
+        final WorkflowOrchestrator orchestrator;
+        final Map<String, Object> pr;
+        String status = "";
+        boolean failPush;
+        boolean failNextWorker;
+
+        DeliveryRecoveryFixture(Path root) throws Exception {
+            Path repo = Files.createDirectories(root.resolve("repo"));
+            Path prompts = Files.createDirectories(root.resolve("prompts"));
+            Files.createDirectories(root.resolve("state"));
+            Files.writeString(prompts.resolve("common.md"), "COMMON");
+            Files.writeString(prompts.resolve("feedback.md"), "FEEDBACK");
+            Files.writeString(prompts.resolve("reconcile.md"), "SUPERVISOR");
+            Files.writeString(prompts.resolve("delivery-repair.md"), "TARGETED REPAIR");
+            Files.writeString(prompts.resolve("verify.md"), "VERIFY");
+            Files.writeString(prompts.resolve("implement.md"), "IMPLEMENT");
+            Files.writeString(prompts.resolve("review.md"), "REVIEW");
+            Files.writeString(prompts.resolve("review-general.md"), "SPECIALIST");
+            Files.writeString(prompts.resolve("review-test.md"), "SPECIALIST");
+            Files.writeString(prompts.resolve("review-general-fix.md"), "SPECIALIST FIX");
+            Files.writeString(prompts.resolve("review-test-fix.md"), "SPECIALIST FIX");
+            for (String name : List.of("simplification", "architecture", "security", "performance",
+                    "database", "deployment", "resilience")) {
+                Files.writeString(prompts.resolve("review-" + name + ".md"), "SPECIALIST");
+                Files.writeString(prompts.resolve("review-" + name + "-fix.md"), "SPECIALIST FIX");
+            }
+            String head = "abc123";
+            pr = map("number", 218, "state", "OPEN", "headRefOid", head,
+                    "headRefName", "story/45-x", "url", "http://x/pr/218",
+                    "reviewDecision", "CHANGES_REQUESTED", "statusCheckRollup", List.of(),
+                    "reviewThreadsAvailable", true, "comments", List.of(),
+                    "reviews", List.of(map("author", map("login", "chatgpt-codex-connector"),
+                            "submittedAt", "2026-02-01", "commit", map("oid", head))),
+                    "reviewThreads", List.of(map("id", "PRRT_1", "isResolved", false,
+                            "comments", map("nodes", List.of(map("id", "PRRC_1", "body", "fix bug",
+                                    "createdAt", "2026-01-01", "author", map("login", "reviewer")))))));
+            github = new DeliveryGitHub(pr);
+            Map<String, Object> config = map("repository", map("local_path", repo.toString(),
+                    "owner", "owner", "name", "repo", "base_branch", "main"),
+                    "epic", map("number", 27), "codex", map("model", "m"), "budgets", map(),
+                    "automation", map("max_delivery_recovery_attempts", 2,
+                            "delivery_verification_attempts", 1, "delivery_verification_delay_seconds", 0),
+                    "workflow", map("allow_push", true, "allow_thread_resolution", true,
+                            "allow_comments", true, "internal_review", true));
+            GitOperations.GitRunner runner = (r, args) -> {
+                String key = String.join(" ", args);
+                calls.add(key);
+                if (key.startsWith("status --porcelain")) return new GitOperations.GitResult(0, status, "");
+                if (key.equals("branch --show-current")) return new GitOperations.GitResult(0, "story/45-x", "");
+                if (key.equals("rev-parse HEAD")) return new GitOperations.GitResult(0, head, "");
+                if (key.startsWith("ls-remote")) return new GitOperations.GitResult(0, head + "\trefs/heads/story/45-x", "");
+                if (key.startsWith("commit ")) status = "";
+                if (key.startsWith("push ") && failPush) return new GitOperations.GitResult(1, "", "network unavailable");
+                return new GitOperations.GitResult(0, "", "");
+            };
+            CodexRunner codex = new CodexRunner(Map.of(), System::nanoTime) {
+                @Override
+                public CodexResult run(Map<String, Object> cfg, Path prompt, Path r, boolean dry,
+                                       Runnable heartbeat, Integer timeout) {
+                    try {
+                        String text = Files.readString(prompt);
+                        workerPrompts.add(text);
+                        if (failNextWorker) {
+                            failNextWorker = false;
+                            return new CodexResult(124, "partial worker response",
+                                    CodexRunner.TokenUsage.unavailable(), "test command timed out");
+                        }
+                        if (text.startsWith("SUPERVISOR")) {
+                            return new CodexResult(0, "DECISION_ACTION: RESUME_VERIFICATION\n"
+                                    + "DECISION_REASON: inspect current delivery blocker\nBLOCKER_CLASS: PROCESS\n"
+                                    + "RECOVERY_ACTION: validate repair then retry delivery\nRESULT_STATUS: SUCCESS\n"
+                                    + "RESULT_EVIDENCE: COMPLETE\nRESULT_NEXT_PHASE: VERIFYING\nRESULT_BLOCKER: NONE\n");
+                        }
+                        return new CodexResult(0, "RESULT_STATUS: SUCCESS\nRESULT_EVIDENCE: COMPLETE\n"
+                                + "RESULT_NEXT_PHASE: WAITING_FOR_CI\nRESULT_BLOCKER: NONE\nFIXED_THREAD: PRRT_1\n");
+                    } catch (Exception exc) {
+                        throw new RuntimeException(exc);
+                    }
+                }
+            };
+            store = new StateStore(root.resolve("state/epic-27.json"));
+            lock = WorkflowLock.acquire(root.resolve("state/epic-27.lock"), 900, 3, 10);
+            Controller.GitOperationsFactory factory = new Controller.GitOperationsFactory(repo) {
+                @Override public GitOperations create() { return new GitOperations(repo, runner); }
+            };
+            orchestrator = new WorkflowOrchestrator(config, state, store, github, repo, root,
+                    map("number", 27, "body", "Stories: #45"), 27, false, factory, codex,
+                    new ReviewCoordinator(), lock);
+        }
+
+        int tick() { return orchestrator.reconcileAndExecute(new ArrayList<>(List.of(pr)), null); }
+
+        @Override public void close() { lock.release(); }
+    }
+
     /** Fake GitHub serving an existing PR and recording thread mutations. */
     private static class DeliveryGitHub extends GitHub {
         final List<String> resolvedThreads = new ArrayList<>();
@@ -2300,6 +2500,8 @@ class WorkflowOrchestratorIntegrationTest {
         @Override
         public void mergePr(int number, String method) {
             mergedPrs.add(new int[] {number});
+            prSnapshot.put("state", "MERGED");
+            prSnapshot.put("mergedAt", "2026-10-05T12:00:00Z");
         }
     }
 
@@ -3190,15 +3392,14 @@ class WorkflowOrchestratorIntegrationTest {
         orchestrator.reconcileAndExecute(new ArrayList<>(List.of(prSnapshot)), null);
         lock.release();
 
-        // The stale thread was resolved on GitHub...
-        assertThat(github.resolvedThreads).contains(threadId);
-        // ...and marked terminally FORCE_CLOSED in the durable queue so it is
-        // never dispatched to the worker again.
+        // An old commit reference is not sufficient proof that a review thread
+        // is obsolete. Keep it unresolved until GitHub or a verified worker says so.
+        assertThat(github.resolvedThreads).doesNotContain(threadId);
         Map<String, Object> after = store.load();
         boolean forceClosed = ReviewFindingQueue.findings(after).stream()
                 .anyMatch(f -> threadId.equals(Engine.asString(f.get("thread_id")))
                         && "FORCE_CLOSED".equals(Engine.asString(f.get("status"))));
-        assertThat(forceClosed).isTrue();
+        assertThat(forceClosed).isFalse();
     }
 
     @Test
@@ -3417,23 +3618,18 @@ class WorkflowOrchestratorIntegrationTest {
             lock.release();
         }
 
-        // The finding is force-closed as unfixable and the workflow advances —
-        // it never dead-ends in a terminal BLOCKED loop...
-        assertThat(forceClosed).isTrue();
+        // The workflow stops safely with the finding still open. It never lies
+        // to GitHub about a fix merely to keep the automation loop moving.
+        assertThat(forceClosed).isFalse();
         assertThat(everBlockedExternal).isFalse();
-        assertThat(lastCode).isNotEqualTo(1);
-        // ...the finding is terminally FORCE_CLOSED in the durable queue...
+        assertThat(lastCode).isEqualTo(1);
         Map<String, Object> end = store.load();
         assertThat(ReviewFindingQueue.findings(end)).anySatisfy(f -> {
             if (threadId.equals(Engine.asString(f.get("thread_id")))) {
-                assertThat(f.get("status")).isEqualTo("FORCE_CLOSED");
+                assertThat(f.get("status")).isNotEqualTo("FORCE_CLOSED");
             }
         });
-        // ...and it converges: after the thread is resolved the PR is no longer
-        // in a feedback/blocked phase, and the thread is not force-closed over
-        // and over (idempotent — resolved at most a small bounded number of
-        // times, not once per tick across 12 ticks).
-        assertThat(finalPhase).isNotIn("BLOCKED_EXTERNAL", "BLOCKED_REQUIREMENTS", "FIXING_FEEDBACK");
+        assertThat(finalPhase).isIn("BLOCKED_REQUIREMENTS", "IDLE");
         assertThat(forceCloseCount).isLessThanOrEqualTo(2);
     }
 

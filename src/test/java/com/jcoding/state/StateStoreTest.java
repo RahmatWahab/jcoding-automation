@@ -8,6 +8,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.sql.DriverManager;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -72,5 +73,33 @@ class StateStoreTest {
 
         assertThat(store.recoverAbandonedJobs("active")).isEqualTo(1);
         assertThat(store.runningJob().get("job_id")).isEqualTo("active");
+    }
+
+    @Test
+    void workerUsageStoresReportedCountersAndUnavailableUsageAsNull(@TempDir Path tmp) throws Exception {
+        StateStore store = new StateStore(tmp.resolve("epic-1.json"));
+        store.recordWorkerUsage("call-1", 12, "IMPLEMENTING", "test-model", 321,
+                2048, 0, 100L, 40L, 20L, "redacted output", "tool diagnostics");
+        store.recordWorkerUsage("call-2", 12, "REVIEWING_CODE", "test-model", 123,
+                1024, 1, null, null, null, "", "process failed");
+
+        try (var connection = DriverManager.getConnection("jdbc:sqlite:" + store.dbPath());
+             var statement = connection.createStatement();
+             var rows = statement.executeQuery("SELECT job_id, phase, input_tokens, "
+                     + "cached_input_tokens, output_tokens, output FROM worker_usage ORDER BY job_id")) {
+            assertThat(rows.next()).isTrue();
+            assertThat(rows.getString("job_id")).isEqualTo("call-1");
+            assertThat(rows.getString("phase")).isEqualTo("IMPLEMENTING");
+            assertThat(rows.getLong("input_tokens")).isEqualTo(100);
+            assertThat(rows.getLong("cached_input_tokens")).isEqualTo(40);
+            assertThat(rows.getLong("output_tokens")).isEqualTo(20);
+            assertThat(rows.getString("output")).isEqualTo("redacted output");
+            assertThat(rows.next()).isTrue();
+            assertThat(rows.getString("job_id")).isEqualTo("call-2");
+            assertThat(rows.getObject("input_tokens")).isNull();
+            assertThat(rows.getObject("cached_input_tokens")).isNull();
+            assertThat(rows.getObject("output_tokens")).isNull();
+            assertThat(rows.next()).isFalse();
+        }
     }
 }

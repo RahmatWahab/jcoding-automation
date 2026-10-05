@@ -2,6 +2,11 @@ package com.jcoding.workflow;
 import com.jcoding.github.GitHub;
 
 import java.nio.file.Path;
+import java.nio.file.Files;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.HexFormat;
+import java.util.Locale;
 import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -35,6 +40,22 @@ public final class GitOperations {
 
     private static final Set<String> DEFAULT_BRANCHES = Set.of("main", "master");
     private static final Pattern SLUG_CLEAN = Pattern.compile("[^a-z0-9]+");
+    private static final Set<String> SOURCE_EXTENSIONS = Set.of(
+            "java", "kt", "py", "sh", "bash", "js", "jsx", "ts", "tsx", "go", "rs", "c", "h", "cpp");
+
+    /** A local policy rejection, distinct from authentication/network failures. */
+    public static final class ProtectedPathsException extends IllegalStateException {
+        private final List<String> paths;
+
+        ProtectedPathsException(List<String> paths) {
+            super("refusing to stage protected or credential-like paths: " + String.join(", ", paths));
+            this.paths = List.copyOf(paths);
+        }
+
+        public List<String> paths() {
+            return paths;
+        }
+    }
 
     private final Path repo;
     private final GitRunner runner;
@@ -109,7 +130,7 @@ public final class GitOperations {
     }
 
     private List<String> sourceChanges() {
-        String out = checkedStdout("status", "--porcelain");
+        String out = checkedStdout("status", "--porcelain", "--untracked-files=all");
         List<String> changes = new ArrayList<>();
         for (String line : out.split("\n", -1)) {
             if (!line.isEmpty() && !pathOf(line).startsWith(".codex/")) {
@@ -282,30 +303,72 @@ public final class GitOperations {
         if (sourceLines.isEmpty()) {
             return null;
         }
+        validateStagingPaths(sourceLines);
+        checked("add", "-A", "--", ".", ":(exclude).codex");
+        checked("commit", "-m", "fix: address story #" + story + " automation changes");
+        pushBranch(branch);
+        return checkedStdout("rev-parse", "HEAD").strip();
+    }
+
+    /** Cheap read-only preflight, also used before expensive specialist reviews. */
+    public void validateStagingPaths() {
+        validateStagingPaths(sourceChanges());
+    }
+
+    private void validateStagingPaths(List<String> sourceLines) {
         List<String> protectedPaths = new ArrayList<>();
         for (String line : sourceLines) {
             String path = stripQuotes(pathOf(line));
-            String lower = path.toLowerCase();
+            String lower = path.toLowerCase(Locale.ROOT);
             String fileName = Path.of(lower).getFileName().toString();
-            boolean isProtected = lower.startsWith(".env")
+            int dot = fileName.lastIndexOf('.');
+            boolean sourceFile = dot > 0 && SOURCE_EXTENSIONS.contains(fileName.substring(dot + 1))
+                    && (lower.startsWith("src/") || lower.startsWith("tests/")
+                        || lower.startsWith("test/") || lower.startsWith("scripts/"))
+                    && !Files.isSymbolicLink(repo.resolve(path));
+            // Source about credentials is different from credential storage. Hard
+            // secret locations/extensions always win, even inside tests/ or src/.
+            boolean isProtected = pathParts(lower).stream().anyMatch(p -> p.startsWith(".env"))
                     || lower.endsWith(".pem") || lower.endsWith(".key")
                     || lower.endsWith(".p12") || lower.endsWith(".pfx")
                     || pathParts(lower).stream().anyMatch(p -> p.equals("secrets") || p.equals("credentials"))
-                    || fileName.contains("token") || fileName.contains("password")
-                    || fileName.contains("credential");
+                    || ((fileName.contains("token") || fileName.contains("password")
+                        || fileName.contains("credential")) && !sourceFile);
             if (isProtected) {
                 protectedPaths.add(path);
             }
         }
         if (!protectedPaths.isEmpty()) {
             protectedPaths.sort(String::compareTo);
-            throw new IllegalStateException("refusing to stage protected or credential-like paths: "
-                    + String.join(", ", protectedPaths));
+            throw new ProtectedPathsException(protectedPaths);
         }
-        checked("add", "-A", "--", ".", ":(exclude).codex");
-        checked("commit", "-m", "fix: address story #" + story + " automation changes");
-        pushBranch(branch);
-        return checkedStdout("rev-parse", "HEAD").strip();
+    }
+
+    /** Opaque evidence for waking a held recovery; never stores file contents. */
+    public String recoveryFingerprint() {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            digest.update(checkedStdout("rev-parse", "HEAD").getBytes(StandardCharsets.UTF_8));
+            digest.update(checkedStdout("diff", "--binary", "HEAD", "--", ".", ":(exclude).codex")
+                    .getBytes(StandardCharsets.UTF_8));
+            for (String line : sourceChanges()) {
+                digest.update(line.getBytes(StandardCharsets.UTF_8));
+                Path file = repo.resolve(stripQuotes(pathOf(line)));
+                if (Files.isRegularFile(file) && !Files.isSymbolicLink(file)) {
+                    try (var input = Files.newInputStream(file)) {
+                        byte[] buffer = new byte[8192];
+                        int count;
+                        while ((count = input.read(buffer)) != -1) {
+                            digest.update(buffer, 0, count);
+                        }
+                    }
+                }
+            }
+            return HexFormat.of().formatHex(digest.digest());
+        } catch (Exception exc) {
+            // Missing evidence must not repeatedly reset the retry budget.
+            return "unavailable";
+        }
     }
 
     /** Confirm local, origin, and PR heads all reference the same commit. */

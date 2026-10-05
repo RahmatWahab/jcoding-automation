@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+export FAKE_SETSID=yes
+exec "$@"
+

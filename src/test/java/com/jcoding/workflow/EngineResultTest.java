@@ -7,6 +7,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * Normal-engine tests. All inputs are realistic in-memory mocks (worker output
@@ -274,7 +276,103 @@ class EngineResultTest {
     void unknownSuccessIsNotClaimedComplete() {
         Map<String, Object> result = Engine.applyCodexResult(map(), 0, "finished");
         assertThat(result.get("phase")).isEqualTo("BLOCKED_REQUIREMENTS");
-        assertThat(result.get("result_status")).isEqualTo("UNSTRUCTURED");
+        assertThat(result.get("result_status")).isEqualTo("BLOCKED");
+        assertThat(result.get("worker_result_status")).isEqualTo("UNSTRUCTURED");
+    }
+
+    private static String deliveryFooter(String phase, String evidence) {
+        return "RESULT_STATUS: SUCCESS\nRESULT_NEXT_PHASE: " + phase
+                + "\nRESULT_BLOCKER: NONE\nRESULT_EVIDENCE: " + evidence + "\n";
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"VERIFYING", "REVIEWING_CODE", "FIXING_FEEDBACK", "WAITING_FOR_CI",
+        "WAITING_FOR_CODEX_REVIEW", "WAITING_FOR_HUMAN_REVIEW", "READY_TO_MERGE",
+        "WAITING_FOR_MANUAL_MERGE"})
+    void explicitCompleteDeliveryIsAccepted(String phase) {
+        String output = deliveryFooter(phase, "COMPLETE");
+        assertThat(Engine.isDeliveryAccepted(0, output)).isTrue();
+        assertThat(Engine.applyCodexResult(map(), 0, output))
+                .containsEntry("phase", phase).containsEntry("result_status", "SUCCESS");
+        assertThat(Engine.deliveryAccepted(Engine.applyCodexResult(map(), 0, output))).isTrue();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "UNKNOWN", "BLOCKED", "BLOCKED_REQUIREMENTS", "BLOCKED_EXTERNAL",
+        "CONFLICT_DETECTED", "CODEX_FAILURE", "FAILED_RECOVERABLE", "PAUSED_QUOTA", "IDLE",
+        "PLANNING", "RECONCILING", "IMPLEMENTING", "EPIC_COMPLETE", "CHANGES_REQUESTED"})
+    void successCannotDeliverIntoNonDeliveryPhase(String phase) {
+        assertDeliveryRejected(deliveryFooter(phase, "COMPLETE"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "BLOCKED", "UNKNOWN", "DEFERRED_TO_CI", "PROMPT_ABSENT", "RENDER_FAILED"})
+    void invalidEvidenceNeverLeavesUsableSuccess(String evidence) {
+        assertDeliveryRejected(deliveryFooter("VERIFYING", evidence));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"SUCCESS", "BLOCKED", "FAILED", "UNKNOWN", ""})
+    void blockerAlwaysPreventsDeliveryEvenWithDeferredCi(String status) {
+        String output = deliveryFooter("WAITING_FOR_CI", "DEFERRED_TO_CI")
+                .replace("RESULT_STATUS: SUCCESS", "RESULT_STATUS: " + status)
+                .replace("RESULT_BLOCKER: NONE", "RESULT_BLOCKER: required test still fails");
+        assertDeliveryRejected(output);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"RESULT_STATUS", "RESULT_NEXT_PHASE", "RESULT_BLOCKER", "RESULT_EVIDENCE"})
+    void missingOrFinalEmptyFieldCannotReuseEarlierSuccess(String key) {
+        String output = deliveryFooter("VERIFYING", "COMPLETE");
+        assertDeliveryRejected(output.replaceAll("(?m)^" + key + ":[^\\n]*\\n", ""));
+        assertDeliveryRejected(output + key + ":\n");
+        assertDeliveryRejected(output + key + ":   \nIGNORED: COMPLETE\n");
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-15, 1, 124})
+    void failedExitCannotInheritPriorSuccess(int exitCode) {
+        String output = deliveryFooter("WAITING_FOR_CI", "DEFERRED_TO_CI");
+        assertThat(Engine.isDeliveryAccepted(exitCode, output)).isFalse();
+        Map<String, Object> result = Engine.applyCodexResult(
+                map("result_status", "SUCCESS", "delivery_mode", "CI_DEFERRED"), exitCode, output);
+        assertThat(result).containsEntry("result_status", "BLOCKED").doesNotContainKey("delivery_mode");
+        assertThat(Engine.deliveryAccepted(result)).isFalse();
+    }
+
+    @Test
+    void deliveryPredicateAcceptsDeferredCiAndCrLfButRejectsAbsentOutput() {
+        String output = deliveryFooter("WAITING_FOR_CI", "DEFERRED_TO_CI").replace("\n", "\r\n");
+        assertThat(Engine.isDeliveryAccepted(0, output)).isTrue();
+        assertThat(Engine.applyCodexResult(map(), 0, output)).containsEntry("delivery_mode", "CI_DEFERRED");
+        assertThat(Engine.deliveryAccepted(Engine.applyCodexResult(map(), 0, output))).isTrue();
+        assertDeliveryRejected(null);
+    }
+
+    @Test
+    void deliveryBoundaryRequiresExitAndBlockersAndRejectsChangedState() {
+        Map<String, Object> state = Engine.applyCodexResult(map(), 0, deliveryFooter("VERIFYING", "COMPLETE"));
+        for (String key : List.of("exit_code", "result_status", "result_evidence", "phase", "blockers")) {
+            Map<String, Object> incomplete = new LinkedHashMap<>(state);
+            incomplete.remove(key);
+            assertThat(Engine.deliveryAccepted(incomplete)).as("missing %s", key).isFalse();
+        }
+        state.put("blockers", List.of("delivery blocked"));
+        assertThat(Engine.deliveryAccepted(state)).isFalse();
+        state.put("blockers", List.of());
+        state.put("phase", "BLOCKED_EXTERNAL");
+        assertThat(Engine.deliveryAccepted(state)).isFalse();
+        assertThat(Engine.deliveryAccepted(null)).isFalse();
+    }
+
+    private static void assertDeliveryRejected(String output) {
+        assertThat(Engine.isDeliveryAccepted(0, output)).isFalse();
+        Map<String, Object> result = Engine.applyCodexResult(
+                map("result_status", "SUCCESS", "delivery_mode", "CI_DEFERRED"), 0, output);
+        assertThat(result).containsEntry("phase", "BLOCKED_REQUIREMENTS")
+                .containsEntry("result_status", "BLOCKED").doesNotContainKey("delivery_mode");
+        assertThat((List<?>) result.get("blockers")).isNotEmpty();
+        assertThat(Engine.deliveryAccepted(result)).isFalse();
     }
 
     // -- parse_decision  -------------------------

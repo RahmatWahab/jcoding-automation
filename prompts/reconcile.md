@@ -28,6 +28,21 @@ Inspect the authoritative EPIC, current story, GitHub PR/CI state, review
 threads, local branch, worktree, commits, lock/process state, and the exact
 controller deviation. Decide the safest next direction.
 
+When deviation_code is DELIVERY_BLOCKED, inspect state.delivery_failure first.
+It preserves the failed operation, paths, detail and bounded recovery budget.
+Normal PR feedback must not replace this delivery diagnosis. Check whether the
+condition still exists. Choose RESUME_IMPLEMENTATION only for a concrete safe
+repair in the active repository; choose RESUME_VERIFICATION when an existing fix
+or controller update needs validation before the controller retries delivery.
+The next worker receives a targeted delivery-repair prompt. A supervisor decision
+alone is never evidence that a fix was delivered. Do not disable guards, rename
+credentials to evade them, omit required tests, force-push, or change another
+repository. A persistent controller-policy false positive is PROCESS; identify
+the exact rule needing repair. If no safe recovery is available, state the
+missing condition explicitly. The controller holds unchanged failures after its
+recovery budget and resumes when the worktree, PR head, or path-policy evidence
+changes; do not repeatedly select unrelated feedback or review work.
+
 Choose exactly one action:
 
 - RESUME_CURRENT_STORY — current story/branch/worktree ownership is consistent.

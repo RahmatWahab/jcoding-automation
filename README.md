@@ -187,19 +187,63 @@ post-PR Codex review threads.
 - **Diff-gated**: `general` and `test` always run; the rest run only when the
   changed files match their trigger patterns (e.g. `security` on auth/input/crypto
   paths, `database` on migrations/entities/SQL, `deployment` on Docker/Helm/CI).
-- **Bounded and fully autonomous**: each specialist's fix loop is capped by
-  `automation.internal_review_max_fix_attempts` (default `2`). A specialist that
-  cannot be satisfied within the cap is **carried forward as advisory** and
-  delivery still proceeds — the gate never blocks the loop or waits for a human,
-  and the post-PR Codex review remains the final authority.
-- **Fail-safe**: a missing specialist prompt or a render/git error is treated as a
-  non-blocking pass, so the gate can never dead-end a run. Under `dry_run` it makes
-  no mutations.
+- **Bounded and evidence-based**: each specialist's fix loop is capped by
+  `automation.internal_review_max_fix_attempts` (default `2`). Findings are sent
+  verbatim to the fix worker and retained with the exact reviewed diff identity.
+  After any mutation, applicable reviewers run again against the new diff.
+- **Fail-closed**: missing prompts, failed reviewer processes, unstable diff
+  identity, or unresolved findings prevent commit and push. The story is held
+  with its checkpoint; changed repository evidence wakes recovery. Under
+  `dry_run` it makes no mutations.
 
 Each specialist is a prompt pair under `prompts/` (`review-<name>.md` and
 `review-<name>-fix.md`). Enabling this gate adds one bounded `codex` review pass
 per relevant specialist per story (plus fix passes when findings are raised), so
 it trades extra worker time for fewer post-PR review threads.
+
+### Worker budgets and recovery
+
+Every model call, including supervisor and specialist calls, is counted against
+a persistent per-story budget. Defaults are `automation.max_story_worker_calls`
+`24` and `automation.max_story_active_seconds` `7200`. Set
+`automation.max_story_tokens` to a positive ceiling to enforce reported input
+plus output tokens; `0` disables the token ceiling. Missing provider usage is
+recorded as unavailable, while call and elapsed-time limits still apply. A
+crashed call consumes its reserved timeout so restarts cannot evade the budget.
+Set `automation.recovery_epoch` to a larger integer only when intentionally
+granting an existing story a fresh budget; the previous ledger is retained.
+
+Each Codex JSON event stream is parsed for final turn usage and concise failure
+diagnostics. Per-call duration, prompt size, exit code, token usage, redacted
+output, and diagnostics are stored in SQLite's `worker_usage` table. This makes
+token/time comparisons auditable and separates the model's final answer from
+tool chatter.
+
+### Delivery recovery
+
+Delivery failures persist in `state.delivery_failure` with the failed operation,
+protected paths (when applicable), error evidence, and a retry budget independent
+of PR feedback. The next run routes this blocker to the supervisor before normal
+feedback processing. An accepted resume decision dispatches `delivery-repair.md`
+to validate or repair the active story and retry delivery. A supervisor decision
+does not count as delivery or resolve review threads.
+
+`automation.max_delivery_recovery_attempts` defaults to `4` total supervisor and
+repair dispatches. Unchanged failures then hold without launching more workers;
+changed worktree contents, PR head, or a corrected protected-path policy wake
+recovery automatically. Access failures may require credentials/infrastructure
+repair and an operator to clear `delivery_failure` before retrying if repository
+evidence has not changed. The worker must not bypass guards or modify a controller
+outside its active repository. State is cleared after successful delivery or when
+the story is cleared.
+
+Staging checks allow credential-related source filenames under `src/`, `tests/`,
+`test/`, and `scripts/`, including `test_manager_api_token_provisioning.sh`.
+Secret directories, `.env` paths, key/certificate files, credential-like data
+files, and credential-named symlinks remain blocked. This is a path heuristic,
+not content-based secret detection. The preflight runs before specialist reviews
+and is checked again immediately before staging. Recovery also retries a normal
+push when a prior commit succeeded but its push failed, then verifies the head.
 
 ### Per-phase model and reasoning effort
 
@@ -264,15 +308,12 @@ manual-merge gate is preserved — the automation never merges. A worker must us
 `DEFERRED_TO_CI` only when the fix itself is proven by the strongest safe
 in-budget substitute; an unproven fix must report `BLOCKED`.
 
-The system is fully autonomous — there is no human in the delivery loop. If
-reconciliation keeps resuming work on the same PR head without the head
-advancing (for example a worker that repeatedly chooses `RESUME_IMPLEMENTATION`
-but never self-certifies done), the controller does **not** stall waiting for a
-human. After `automation.max_resume_attempts` (default 3) same-head resumes it
-auto-delivers: it commits and pushes the controller-owned changes and routes to
-`WAITING_FOR_CI`, so the fix reaches the PR and CI plus the mandatory
-manual-merge gate become the validation authority. This guarantees the workflow
-never dead-ends or loops.
+Recovery is bounded and evidence-gated. Repeated resume decisions never count
+as proof that implementation or validation succeeded, and reaching a retry cap
+does not authorize a commit, PR-thread resolution, or story completion. When no
+safe recovery is supported by current evidence, the controller retains the
+story and worktree in a held or blocked state. New commits, changed worktree
+evidence, or corrected configuration can wake the story automatically.
 
 > Note: this Java build's behavior is validated by an offline, mock-only test
 > suite. Real `gh` responses and the real `codex` worker have not been exercised
@@ -360,7 +401,8 @@ Runtime state and locks are generated automatically per EPIC under `state/`:
 
 - `state/epic-<number>.sqlite3` — the authoritative durable state store (SQLite,
   WAL) recording workflow phases, recovery metadata, and each worker job with
-  its heartbeat, timeout, log path, and terminal result.
+  its heartbeat, timeout, log path, and terminal result, plus per-call model
+  usage and redacted worker evidence in `worker_usage`.
 - `state/epic-<number>.json` — a human-readable export view.
 - `state/epic-<number>.events.jsonl` — a compact operator audit trail.
 - `state/epic-<number>.lock` — the atomic run lock.

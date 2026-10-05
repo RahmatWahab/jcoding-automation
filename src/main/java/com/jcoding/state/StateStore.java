@@ -137,6 +137,11 @@ public final class StateStore {
                     + "event_type TEXT NOT NULL,"
                     + "payload TEXT NOT NULL,"
                     + "created_at TEXT NOT NULL)");
+            statement.execute("CREATE TABLE IF NOT EXISTS worker_usage ("
+                    + "job_id TEXT PRIMARY KEY, story INTEGER, phase TEXT NOT NULL, model TEXT, "
+                    + "duration_ms INTEGER NOT NULL, prompt_bytes INTEGER NOT NULL, exit_code INTEGER NOT NULL, "
+                    + "input_tokens INTEGER, cached_input_tokens INTEGER, output_tokens INTEGER, "
+                    + "output TEXT NOT NULL, diagnostics TEXT NOT NULL, created_at TEXT NOT NULL)");
         }
         return connection;
     }
@@ -330,6 +335,33 @@ public final class StateStore {
             update.executeUpdate();
         } catch (SQLException exc) {
             throw new IllegalStateException("unable to finish job: " + jobId, exc);
+        }
+    }
+
+    /** Every actual model call, including specialists; null counters mean unavailable, not free. */
+    public void recordWorkerUsage(String jobId, Integer story, String phase, String model,
+                                  long durationMillis, long promptBytes, int exitCode,
+                                  Long inputTokens, Long cachedTokens, Long outputTokens,
+                                  String output, String diagnostics) {
+        try (Connection connection = connect();
+             PreparedStatement insert = connection.prepareStatement(
+                     "INSERT INTO worker_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)")) {
+            insert.setString(1, jobId);
+            setNullableInt(insert, 2, story);
+            insert.setString(3, phase);
+            insert.setString(4, model);
+            insert.setLong(5, durationMillis);
+            insert.setLong(6, promptBytes);
+            insert.setInt(7, exitCode);
+            insert.setObject(8, inputTokens);
+            insert.setObject(9, cachedTokens);
+            insert.setObject(10, outputTokens);
+            insert.setString(11, output);
+            insert.setString(12, diagnostics);
+            insert.setString(13, utcNow());
+            insert.executeUpdate();
+        } catch (SQLException exc) {
+            throw new IllegalStateException("unable to persist worker usage/evidence: " + jobId, exc);
         }
     }
 

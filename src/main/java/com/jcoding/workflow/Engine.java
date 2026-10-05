@@ -703,16 +703,70 @@ public final class Engine {
     // -- apply_codex_result --------------------------------------------------
 
     private static Pattern footerPattern(String key) {
-        return Pattern.compile("^" + key + ":\\s*(.+)$", Pattern.MULTILINE);
+        return Pattern.compile("^" + key + ":[\\t ]*([^\\r\\n]*)$", Pattern.MULTILINE);
     }
 
     private static String lastMatch(Pattern pattern, String output) {
-        Matcher matcher = pattern.matcher(output);
+        Matcher matcher = pattern.matcher(output == null ? "" : output);
         String last = null;
         while (matcher.find()) {
             last = matcher.group(1).strip();
         }
         return last;
+    }
+
+    private static final Set<String> DELIVERY_PHASES = Set.of(
+            "VERIFYING", "REVIEWING_CODE", "FIXING_FEEDBACK", "WAITING_FOR_CI",
+            "WAITING_FOR_CODEX_REVIEW", "WAITING_FOR_HUMAN_REVIEW",
+            "READY_TO_MERGE", "WAITING_FOR_MANUAL_MERGE");
+
+    /**
+     * Authoritative delivery gate for callers before commit/push or completion
+     * side effects. Planning and reconciliation success are not delivery.
+     * Requires an explicit NONE blocker, including for deferred CI validation.
+     */
+    public static boolean isDeliveryAccepted(int exitCode, String output) {
+        return deliveryRejection(exitCode, StateRecovery.parseResult(output)).isEmpty();
+    }
+
+    /**
+     * Delivery boundary gate for controller state produced by applyCodexResult.
+     * Missing exit/blocker data fails closed; reconciliation verdicts cannot
+     * authorize delivery. Uses the same contract as the raw-output gate.
+     */
+    public static boolean deliveryAccepted(Map<String, Object> state) {
+        if (state == null) {
+            return false;
+        }
+        boolean noBlockers = state.get("blockers") instanceof List<?> blockers && blockers.isEmpty();
+        Map<String, String> footer = Map.of(
+                "result_status", asString(state.get("result_status")),
+                "result_next_phase", asString(state.get("phase")),
+                "result_evidence", asString(state.get("result_evidence")),
+                "result_blocker", noBlockers ? "NONE" : "BLOCKED");
+        return deliveryRejection("0".equals(asString(state.get("exit_code"))) ? 0 : 1, footer).isEmpty();
+    }
+
+    private static String deliveryRejection(int exitCode, Map<String, String> footer) {
+        if (exitCode != 0) {
+            return "Codex worker did not exit successfully";
+        }
+        if (!"SUCCESS".equals(footer.get("result_status"))) {
+            return "Codex returned no valid SUCCESS result";
+        }
+        if (!DELIVERY_PHASES.contains(footer.getOrDefault("result_next_phase", ""))) {
+            return "Codex returned SUCCESS with an invalid next phase";
+        }
+        String evidence = footer.get("result_evidence");
+        if (!"COMPLETE".equals(evidence)
+                && !("DEFERRED_TO_CI".equals(evidence)
+                && "WAITING_FOR_CI".equals(footer.get("result_next_phase")))) {
+            return "Codex returned SUCCESS without complete acceptance/validation evidence";
+        }
+        if (!"NONE".equals(footer.get("result_blocker"))) {
+            return "Codex returned SUCCESS without an explicit absence of blockers";
+        }
+        return "";
     }
 
     /**
@@ -724,6 +778,15 @@ public final class Engine {
     public static Map<String, Object> applyCodexResult(Map<String, Object> state, int exitCode,
                                                         String output, int retrySeconds) {
         Map<String, Object> result = new LinkedHashMap<>(state);
+        result.put("exit_code", exitCode);
+        Map<String, String> footer = StateRecovery.parseResult(output);
+        String status = footer.getOrDefault("result_status", "UNSTRUCTURED");
+        String evidence = footer.getOrDefault("result_evidence", "");
+        String rejection = deliveryRejection(exitCode, footer);
+        result.put("worker_result_status", status);
+        result.put("result_status", rejection.isEmpty() ? "SUCCESS" : "BLOCKED");
+        result.put("result_evidence", evidence);
+        result.remove("delivery_mode");
         if (exitCode != 0) {
             if (exitCode < 0) {
                 result.put("phase", "FAILED_RECOVERABLE");
@@ -743,51 +806,17 @@ public final class Engine {
             }
             return result;
         }
-        String status = lastMatch(footerPattern("RESULT_STATUS"), output);
-        String phase = lastMatch(footerPattern("RESULT_NEXT_PHASE"), output);
-        String blocker = lastMatch(footerPattern("RESULT_BLOCKER"), output);
-        String evidence = lastMatch(footerPattern("RESULT_EVIDENCE"), output);
-        if (status == null) {
-            status = "UNSTRUCTURED";
-        }
-        if (evidence == null) {
-            evidence = "";
-        }
-        // A fix can be complete yet unable to run heavy validation (e.g. Docker
-        // E2E) within the phase budget. In that case the worker may declare
-        // SUCCESS with RESULT_EVIDENCE: DEFERRED_TO_CI and RESULT_NEXT_PHASE:
-        // WAITING_FOR_CI. This is a deliverable result: the controller commits
-        // and pushes, and CI (already a merge gate) becomes the validation
-        // authority. The manual-merge gate still protects the final merge.
-        boolean deferredToCi = "SUCCESS".equals(status)
-                && "DEFERRED_TO_CI".equals(evidence)
-                && "WAITING_FOR_CI".equals(phase);
-        boolean acceptableEvidence = "COMPLETE".equals(evidence) || deferredToCi;
-        if ("BLOCKED".equals(status) || "BLOCKED".equals(phase)) {
+        String blocker = footer.get("result_blocker");
+        if (!rejection.isEmpty()) {
             result.put("phase", "BLOCKED_REQUIREMENTS");
-        } else if (!"SUCCESS".equals(status) || phase == null || !PhaseModel.PHASES.contains(phase)
-                || !acceptableEvidence) {
-            result.put("phase", "BLOCKED_REQUIREMENTS");
+            result.put("blockers", new ArrayList<>(List.of(
+                    blocker != null && !blocker.isBlank() && !"NONE".equals(blocker)
+                            ? blocker : rejection)));
         } else {
-            result.put("phase", phase);
-        }
-        result.put("result_status", status);
-        result.put("result_evidence", evidence);
-        if (deferredToCi) {
-            result.put("delivery_mode", "CI_DEFERRED");
-        } else {
-            result.remove("delivery_mode");
-        }
-        if (blocker != null && !blocker.equals("NONE")) {
-            result.put("blockers", new ArrayList<>(List.of(blocker)));
-        } else if (!"SUCCESS".equals(status)) {
-            result.put("blockers", new ArrayList<>(List.of("Codex returned no valid SUCCESS result")));
-        } else if (phase == null || !PhaseModel.PHASES.contains(phase)) {
-            result.put("blockers", new ArrayList<>(List.of("Codex returned SUCCESS with an invalid next phase")));
-        } else if (!acceptableEvidence) {
-            result.put("blockers", new ArrayList<>(
-                    List.of("Codex returned SUCCESS without complete acceptance/validation evidence")));
-        } else {
+            result.put("phase", footer.get("result_next_phase"));
+            if ("DEFERRED_TO_CI".equals(evidence)) {
+                result.put("delivery_mode", "CI_DEFERRED");
+            }
             result.put("blockers", new ArrayList<>());
             result.remove("error");
         }
@@ -804,13 +833,13 @@ public final class Engine {
             "DECISION_ACTION", "DECISION_REASON", "BLOCKER_CLASS", "RECOVERY_ACTION");
 
     private static final Map<String, Pattern> DECISION_ALIASES = Map.of(
-            "decision_action", Pattern.compile("^Decision:\\s*`?([A-Z_]+)`?\\s*$",
+            "decision_action", Pattern.compile("^Decision:[\\t ]*`?([A-Z_]*)`?[\\t ]*$",
                     Pattern.MULTILINE | Pattern.CASE_INSENSITIVE),
-            "decision_reason", Pattern.compile("^Decision reason:\\s*(.+)$",
+            "decision_reason", Pattern.compile("^Decision reason:[\\t ]*([^\\r\\n]*)$",
                     Pattern.MULTILINE | Pattern.CASE_INSENSITIVE),
-            "blocker_class", Pattern.compile("^Blocker class:\\s*`?([A-Z_]+)`?\\s*$",
+            "blocker_class", Pattern.compile("^Blocker class:[\\t ]*`?([A-Z_]*)`?[\\t ]*$",
                     Pattern.MULTILINE | Pattern.CASE_INSENSITIVE),
-            "recovery_action", Pattern.compile("^Recovery action:\\s*(.+)$",
+            "recovery_action", Pattern.compile("^Recovery action:[\\t ]*([^\\r\\n]*)$",
                     Pattern.MULTILINE | Pattern.CASE_INSENSITIVE));
 
     /**
@@ -819,6 +848,7 @@ public final class Engine {
      * accepted only when the exact marker was omitted.
      */
     public static Map<String, String> parseDecision(String output) {
+        output = output == null ? "" : output;
         Map<String, String> values = new LinkedHashMap<>();
         for (String key : DECISION_KEYS) {
             String match = lastMatch(footerPattern(key), output);

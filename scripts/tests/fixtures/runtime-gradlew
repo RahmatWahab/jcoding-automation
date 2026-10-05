@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+build_dir= cache_dir= init_script=
+while (($#)); do
+  case "$1" in
+    clean) echo 'shared clean forbidden' >&2; exit 91 ;;
+    -Djcoding.runtime.buildDir=*) build_dir="${1#*=}" ;;
+    --project-cache-dir) shift; cache_dir="$1" ;;
+    --init-script) shift; init_script="$1" ;;
+  esac
+  shift
+done
+[[ "$build_dir" == "$PWD/out/launcher-runtime/staging."*/build ]]
+[[ "$cache_dir" == "${build_dir%/build}/project-cache" ]]
+[[ -f "$init_script" ]]
+# mkdir fails if another build entered without the publication lock.
+mkdir "$PWD/build-active"
+trap 'rmdir "$PWD/build-active"' EXIT
+printf 'build\n' >> "$PWD/build-count"
+if [[ -n "${BUILD_HOLD:-}" ]]; then
+  touch "$BUILD_HOLD.started"
+  until [[ -e "$BUILD_HOLD.release" ]]; do sleep 0.02; done
+fi
+dist="$build_dir/install/jcoding-automation"
+mkdir -p "$dist/bin" "$dist/lib"
+cp "$PWD/fake-application" "$dist/bin/jcoding-automation"
+chmod +x "$dist/bin/jcoding-automation"
+[[ "${BUILD_FAIL:-0}" != 1 ]] || exit 42
+if [[ "${BUILD_INTERRUPT:-0}" == 1 ]]; then
+  kill -TERM "$PPID"
+  exit 143
+fi
+[[ "${BUILD_PARTIAL:-0}" != 1 ]] || exit 0
+cp "$PWD/src/main/input.txt" "$dist/lib/jcoding-automation-test.jar"

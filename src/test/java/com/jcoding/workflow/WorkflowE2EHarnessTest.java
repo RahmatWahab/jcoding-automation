@@ -96,6 +96,7 @@ class WorkflowE2EHarnessTest {
         Files.writeString(prompts.resolve("common.md"), "COMMON");
         Files.writeString(prompts.resolve("feedback.md"), "{{COMMON}}\nFix.");
         Files.writeString(prompts.resolve("reconcile.md"), "{{COMMON}}\nReconcile.");
+        Files.writeString(prompts.resolve("implement.md"), "{{COMMON}}\nImplement.");
         Files.createDirectories(root.resolve("state"));
 
         Map<String, Object> config = map(
@@ -104,7 +105,7 @@ class WorkflowE2EHarnessTest {
                 "epic", map("number", 27),
                 "codex", map("executable", "codex", "model", "m", "reasoning_effort", "low"),
                 "automation", map("dry_run", false, "max_feedback_attempts", 3,
-                        "max_resume_attempts", 3),
+                        "max_resume_attempts", 3, "max_story_worker_calls", 100),
                 "budgets", map(),
                 "workflow", map("allow_push", true, "allow_comments", true,
                         "allow_thread_resolution", true));
@@ -119,7 +120,8 @@ class WorkflowE2EHarnessTest {
                                    Runnable hb, Integer timeout) {
                 return new CodexResult(0,
                         "RESULT_STATUS: SUCCESS\nRESULT_NEXT_PHASE: FIXING_FEEDBACK\n"
-                        + "RESULT_BLOCKER: NONE\nRESULT_EVIDENCE: COMPLETE\n");
+                        + "RESULT_BLOCKER: NONE\nRESULT_EVIDENCE: COMPLETE\n"
+                        + "FIXED_THREAD: PRRT_" + github.round + "\n");
             }
         };
 

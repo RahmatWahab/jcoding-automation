@@ -3,37 +3,59 @@ package com.jcoding.workflow;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.BufferedReader;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Supplier;
-import java.util.regex.Matcher;
+import java.util.LinkedHashSet;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 
 /**
- * Bounded {@code codex exec} worker execution and output redaction.
- *
- * <p>Implements the corresponding workflow behavior
- * {@code redact_sensitive}). Command construction and redaction are pure and
- * unit-tested directly. Execution streams worker output with a phase timeout;
- * because process-group signalling is not portable, abnormal
- * termination is reproduced behaviorally: timeout maps to exit 124, a missing
- * executable to 127, and a broken input pipe to a bounded failure — preserving
- * the controller's classification contract.</p>
+ * Bounded {@code codex exec --json} execution. Only completed agent messages
+ * supply authoritative output; command failures are separate redacted evidence.
+ * Timeout maps to 124, interruption to 130, and launch failure to 127.
  */
 public class CodexRunner {
 
     private static final Logger log = LoggerFactory.getLogger(CodexRunner.class);
 
-    /** Worker result: process exit code plus captured (unredacted) output. */
-    public record CodexResult(int exitCode, String output) {
+    /**
+     * Totals across completed turns. A counter is null if unavailable in any
+     * completed turn (or no turn completed); a reported zero remains zero.
+     */
+    public record TokenUsage(Long inputTokens, Long cachedInputTokens, Long outputTokens) {
+        public static TokenUsage unavailable() {
+            return new TokenUsage(null, null, null);
+        }
     }
+
+    /**
+     * Output is exclusively the final completed agent message, never tool text.
+     * Diagnostics is redacted command failure evidence, capped at 16 KiB of
+     * characters; truncation may cut the final JSON line. Never parse it as a footer.
+     */
+    public record CodexResult(int exitCode, String output, TokenUsage usage, String diagnostics) {
+        public CodexResult(int exitCode, String output) {
+            this(exitCode, output, TokenUsage.unavailable(), "");
+        }
+
+        public CodexResult(int exitCode, String output, TokenUsage usage) {
+            this(exitCode, output, usage, "");
+        }
+    }
+
+    private static final int MAX_EVENT_CHARS = 1_048_576;
+    private static final int MAX_OUTPUT_CHARS = 262_144;
+    private static final int MAX_DESCENDANTS = 4096;
+    private static final int MAX_DIAGNOSTIC_CHARS = 16_384;
 
     private static final Pattern AUTH_BEARER = Pattern.compile(
             "(authorization\\s*:\\s*bearer\\s+)[^\\s]+", Pattern.CASE_INSENSITIVE);
@@ -112,6 +134,7 @@ public class CodexRunner {
             command.add("--approve-for-me");
         }
         command.add("exec");
+        command.add("--json");
         if (bypass) {
             command.add("--dangerously-bypass-approvals-and-sandbox");
         }
@@ -175,128 +198,240 @@ public class CodexRunner {
         int progressInterval = Math.max(5, (int) Engine.asLongOrDefault(
                 codex.get("progress_interval_seconds"), 30));
 
-        StringBuilder output = new StringBuilder();
+        long deadline = monotonicMillis.get() + Math.max(0L, timeout) * 1000L;
         Process process;
         try {
-            ProcessBuilder builder = new ProcessBuilder(command)
-                    .directory(repo.toFile())
-                    .redirectErrorStream(true);
-            process = builder.start();
+            // A regular-file stdin cannot block this thread on a child that never reads.
+            process = new ProcessBuilder(command).directory(repo.toFile())
+                    .redirectInput(prompt.toFile())
+                    .redirectError(ProcessBuilder.Redirect.DISCARD).start();
         } catch (IOException exc) {
-            log.info("CODEX END: unavailable executable=" + command.get(0));
-            return new CodexResult(127, "Codex executable unavailable: " + command.get(0) + "\n");
+            log.info("CODEX END: unable to start executable={}", command.get(0));
+            return new CodexResult(127, "", TokenUsage.unavailable(), redactSensitive(exc.getMessage()));
         }
 
+        EventReader events = new EventReader(process, this::redactSensitive);
+        Thread reader = Thread.ofPlatform().daemon().name("codex-events-" + process.pid()).unstarted(events);
+        Set<ProcessHandle> owned = new LinkedHashSet<>();
         try {
-            byte[] promptBytes = Files.readString(prompt).getBytes(StandardCharsets.UTF_8);
-            process.getOutputStream().write(promptBytes);
-            process.getOutputStream().close();
-        } catch (IOException brokenPipe) {
-            process.destroyForcibly();
-            waitQuietly(process);
-            return new CodexResult(1, "Codex exited before accepting the prompt\n");
-        }
-
-        long deadline = monotonicMillis.get() + (long) timeout * 1000L;
-        long lastProgress = monotonicMillis.get();
-        // Persist the durable heartbeat at most once per progress interval. The
-        // read loop spins every ~50 ms; calling the heartbeat (which writes the
-        // state file) on every iteration produced hundreds of redundant state
-        // writes per phase. Interval-gating keeps the liveness signal fresh for
-        // the stale-heartbeat monitor without the per-loop I/O churn.
-        long lastHeartbeat;
-        try (BufferedReader reader = new BufferedReader(
-                new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
-            // Initial heartbeat is inside the protected region so a lost-lock at
-            // the first beat also cleans up the child process (see catch below).
+            reader.start();
             if (heartbeat != null) {
                 heartbeat.run();
             }
-            lastHeartbeat = monotonicMillis.get();
+            long lastHeartbeat = monotonicMillis.get();
             while (true) {
-                long nowMillis = monotonicMillis.get();
-                if (heartbeat != null
-                        && nowMillis - lastHeartbeat >= (long) progressInterval * 1000L) {
-                    heartbeat.run();
-                    lastHeartbeat = nowMillis;
+                rememberDescendants(process, owned);
+                long now = monotonicMillis.get();
+                if (!process.isAlive() && !reader.isAlive()) {
+                    int code = process.exitValue();
+                    return events.result(code);
                 }
-                if (nowMillis - lastProgress >= (long) progressInterval * 1000L) {
-                    log.debug("CODEX HEARTBEAT: pid=" + process.pid()
-                            + " elapsed_seconds=" + ((nowMillis - (deadline - (long) timeout * 1000L)) / 1000L));
-                    lastProgress = nowMillis;
-                }
-                if (nowMillis >= deadline) {
-                    process.destroyForcibly();
-                    String remainder = drain(reader);
-                    output.append(remainder);
+                if (now >= deadline) {
                     log.info("CODEX END: timeout");
-                    return new CodexResult(124, output + "\nCodex execution timed out\n");
+                    return events.result(124);
                 }
-                if (reader.ready()) {
-                    String line = reader.readLine();
-                    if (line != null) {
-                        output.append(line).append('\n');
-                        // Worker stdout is captured in `output` (and journaled via
-                        // the phase result tail). Mirroring every line to the
-                        // console previously flooded the cron log with full EPIC
-                        // and PR/JSON payloads (hundreds of MB/day). Route it to
-                        // the logger at DEBUG so `--verbose` still surfaces the
-                        // live worker stream without bloating the default log.
-                        if (log.isDebugEnabled()) {
-                            log.debug("CODEX OUT: {}", redactSensitive(line));
+                if (heartbeat != null && now - lastHeartbeat >= (long) progressInterval * 1000L) {
+                    heartbeat.run();
+                    lastHeartbeat = now;
+                }
+                Thread.sleep(20);
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return events.result(130);
+        } catch (RuntimeException failure) {
+            log.warn("CODEX END: runner failed while supervising process", failure);
+            CodexResult partial = events.result(125);
+            return new CodexResult(125, partial.output(), partial.usage(),
+                    redactSensitive("Codex runner supervision failed: " + failure.getMessage()));
+        } finally {
+            cleanup(process, owned);
+            // Never close a reader from the control thread: close can wait on its read lock.
+            reader.interrupt();
+        }
+    }
+
+    private static void rememberDescendants(Process process, Set<ProcessHandle> owned) {
+        owned.removeIf(child -> !child.isAlive());
+        try (var descendants = process.descendants()) {
+            var iterator = descendants.iterator();
+            while (iterator.hasNext()) {
+                ProcessHandle child = iterator.next();
+                if (owned.size() >= MAX_DESCENDANTS && !owned.contains(child)) {
+                    throw new IllegalStateException("Codex descendant limit exceeded");
+                }
+                owned.add(child);
+            }
+        }
+    }
+
+    private static void cleanup(Process process, Set<ProcessHandle> owned) {
+        boolean interrupted = Thread.interrupted();
+        try {
+            rememberDescendants(process, owned);
+        } catch (RuntimeException failure) {
+            log.warn("Unable to finish Codex descendant discovery", failure);
+        }
+        // Children first gives their still-running parent an opportunity to reap them.
+        List<ProcessHandle> children = new ArrayList<>(owned);
+        java.util.Collections.reverse(children);
+        long reapDeadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(500);
+        try {
+            for (ProcessHandle child : children) {
+                child.destroyForcibly();
+                // Allow each parent to reap its child before killing that parent.
+                long childDeadline = Math.min(reapDeadline,
+                        System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(100));
+                while (child.isAlive() && System.nanoTime() < childDeadline) {
+                    Thread.sleep(5);
+                }
+            }
+            while (children.stream().anyMatch(ProcessHandle::isAlive) && System.nanoTime() < reapDeadline) {
+                Thread.sleep(10);
+            }
+            process.destroyForcibly();
+            if (!process.waitFor(1, TimeUnit.SECONDS)) {
+                log.warn("Codex process did not terminate after forced cleanup: {}", process.pid());
+            }
+        } catch (InterruptedException failure) {
+            interrupted = true;
+            process.destroyForcibly();
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /** One bounded JSON line at a time; no queue and no captured command output. */
+    private static final class EventReader implements Runnable {
+        private final Process process;
+        private final ObjectMapper mapper = new ObjectMapper();
+        private final java.util.function.UnaryOperator<String> redact;
+        private String output = "";
+        private String diagnostics = "";
+        private TokenUsage usage = TokenUsage.unavailable();
+        private boolean completed;
+        private boolean failed;
+
+        private EventReader(Process process, java.util.function.UnaryOperator<String> redact) {
+            this.process = process;
+            this.redact = redact;
+        }
+
+        @Override
+        public void run() {
+            try (var reader = new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8)) {
+                char[] chunk = new char[8192];
+                StringBuilder line = new StringBuilder();
+                boolean oversized = false;
+                int count;
+                while ((count = reader.read(chunk)) != -1) {
+                    for (int i = 0; i < count; i++) {
+                        char ch = chunk[i];
+                        if (ch == '\n') {
+                            if (!oversized && !line.isEmpty()) {
+                                accept(line.toString());
+                            }
+                            line.setLength(0);
+                            oversized = false;
+                        } else if (!oversized) {
+                            if (line.length() == MAX_EVENT_CHARS) {
+                                markFailed();
+                                line.setLength(0);
+                                oversized = true;
+                            } else {
+                                line.append(ch);
+                            }
                         }
                     }
-                } else if (!process.isAlive()) {
-                    output.append(drain(reader));
-                    break;
-                } else {
-                    sleepQuietly(50);
                 }
+                if (!oversized && !line.isEmpty()) {
+                    accept(line.toString());
+                }
+            } catch (IOException failure) {
+                markFailed();
             }
-        } catch (IOException exc) {
-            // Stream closed; fall through to exit-code reporting.
-        } catch (RuntimeException abort) {
-            // The read loop was abandoned by a non-I/O runtime failure — most
-            // importantly a LockOwnershipLost thrown by the heartbeat when this
-            // run lost the lock mid-phase. Never orphan the child: force-destroy
-            // it and reap it, then rethrow so the controller ends the run
-            // cleanly (the takeover process is now the authority).
-            process.destroyForcibly();
-            waitQuietly(process);
-            throw abort;
         }
-        waitQuietly(process);
-        int code = process.exitValue();
-        log.info("CODEX END: exit_code=" + code);
-        return new CodexResult(code, output.toString());
-    }
 
-    private static String drain(BufferedReader reader) {
-        StringBuilder remainder = new StringBuilder();
-        try {
-            String line;
-            while (reader.ready() && (line = reader.readLine()) != null) {
-                remainder.append(line).append('\n');
+        private synchronized void markFailed() {
+            failed = true;
+        }
+
+        private synchronized void accept(String line) {
+            try {
+                JsonNode event = mapper.readTree(line);
+                if (event == null || !event.isObject()) {
+                    failed = true;
+                    return;
+                }
+                switch (event.path("type").asText()) {
+                    case "item.completed" -> {
+                        JsonNode item = event.path("item");
+                        if ("command_execution".equals(item.path("type").asText())
+                                && (item.path("exit_code").asInt(0) != 0
+                                    || "failed".equals(item.path("status").asText()))) {
+                            commandFailure(item);
+                        }
+                        if ("agent_message".equals(item.path("type").asText())) {
+                            JsonNode text = item.path("text");
+                            if (!text.isTextual() || text.textValue().length() > MAX_OUTPUT_CHARS) {
+                                output = "";
+                                failed = true;
+                            } else {
+                                output = text.textValue();
+                            }
+                        }
+                    }
+                    case "turn.completed" -> {
+                        JsonNode counters = event.path("usage");
+                        usage = new TokenUsage(
+                                add(usage.inputTokens(), counters.get("input_tokens")),
+                                add(usage.cachedInputTokens(), counters.get("cached_input_tokens")),
+                                add(usage.outputTokens(), counters.get("output_tokens")));
+                        completed = true;
+                    }
+                    case "turn.failed", "error" -> {
+                        failed = true;
+                        String message = event.path("error").path("message")
+                                .asText(event.path("message").asText());
+                        diagnostics = bounded(diagnostics + redact.apply(message) + "\n",
+                                MAX_DIAGNOSTIC_CHARS);
+                    }
+                    default -> { /* Other event types are deliberately not output. */ }
+                }
+            } catch (IOException | ArithmeticException invalid) {
+                failed = true;
             }
-        } catch (IOException ignored) {
-            // best effort
         }
-        return remainder.toString();
-    }
 
-    private static void waitQuietly(Process process) {
-        try {
-            process.waitFor();
-        } catch (InterruptedException exc) {
-            Thread.currentThread().interrupt();
+        private Long add(Long previous, JsonNode value) {
+            if (value == null || !value.isIntegralNumber() || !value.canConvertToLong()
+                    || value.longValue() < 0 || (completed && previous == null)) {
+                return null;
+            }
+            return Math.addExact(previous == null ? 0 : previous, value.longValue());
         }
-    }
 
-    private static void sleepQuietly(long millis) {
-        try {
-            Thread.sleep(millis);
-        } catch (InterruptedException exc) {
-            Thread.currentThread().interrupt();
+        private void commandFailure(JsonNode item) throws IOException {
+            // Redact before truncating so a boundary cannot expose a partial credential.
+            String command = redact.apply(item.path("command").asText());
+            String detail = redact.apply(item.path("aggregated_output").asText());
+            var evidence = mapper.createObjectNode();
+            evidence.put("command", bounded(command, 2048));
+            evidence.set("exit_code", item.path("exit_code"));
+            evidence.put("output", bounded(detail, 8192));
+            String entry = mapper.writeValueAsString(evidence) + "\n";
+            diagnostics = bounded(diagnostics + entry, MAX_DIAGNOSTIC_CHARS);
+        }
+
+        private static String bounded(String value, int limit) {
+            return value.length() <= limit ? value : value.substring(0, limit - 14) + "...[truncated]";
+        }
+
+        private synchronized CodexResult result(int exitCode) {
+            int code = exitCode == 0 && (failed || !completed) ? 1 : exitCode;
+            return new CodexResult(code, output, usage, diagnostics);
         }
     }
 }

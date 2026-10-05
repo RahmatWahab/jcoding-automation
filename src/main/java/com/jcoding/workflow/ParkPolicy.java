@@ -66,6 +66,36 @@ public final class ParkPolicy {
         return true;
     }
 
+    /** Preserve recovery evidence separately from active state, never in completed_stories. */
+    public static void parkWithCheckpoint(Map<String, Object> state, int story, String head,
+                                          String reason, String timestamp) {
+        park(state, story, head, reason, timestamp);
+        Map<String, Object> checkpoint = new LinkedHashMap<>();
+        Set<String> keys = new LinkedHashSet<>(WorkflowStateCodec.STORY_SCOPED_KEYS);
+        keys.addAll(List.of("branch", "base_commit", "current_pr", "current_pr_head", "current_pr_url",
+                "review_findings", "active_review_findings", "active_review_finding"));
+        for (String key : keys) {
+            if (state.containsKey(key)) checkpoint.put(key, state.get(key));
+        }
+        @SuppressWarnings("unchecked") Map<String, Object> record =
+                (Map<String, Object>) records(state).get(String.valueOf(story));
+        record.put("checkpoint", checkpoint);
+    }
+
+    /** A new PR head wakes parked work; cumulative story budgets intentionally survive. */
+    public static void restoreCheckpoint(Map<String, Object> state, int story, String head) {
+        Object existing = records(state).get(String.valueOf(story));
+        if (!(existing instanceof Map<?, ?> record) || head.equals(record.get("head"))) return;
+        if (record.get("checkpoint") instanceof Map<?, ?> checkpoint) {
+            checkpoint.forEach((key, value) -> state.put(String.valueOf(key), value));
+        }
+        state.remove("held_failure");
+        state.remove("stuck_head");
+        state.remove("stuck_head_reason");
+        state.put("recovery_next_prompt", "prompts/reconcile.md");
+        unparkIfHeadAdvanced(state, story, head);
+    }
+
     /** The set of story numbers currently parked. */
     public static Set<Integer> parkedStoryNumbers(Map<String, Object> state) {
         Set<Integer> result = new LinkedHashSet<>();

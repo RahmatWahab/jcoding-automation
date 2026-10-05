@@ -1,0 +1,11 @@
+// Used only by run_once.sh. Configure before plugins resolve their outputs;
+// never clean or install into the developer's build directory.
+gradle.beforeProject { project ->
+    def runtimeBuild = System.getProperty('jcoding.runtime.buildDir')
+    if (!runtimeBuild) {
+        throw new GradleException('jcoding.runtime.buildDir is required')
+    }
+    def projectKey = project.path == ':' ? 'root' : project.path.substring(1).replace(':', '/')
+    project.layout.buildDirectory.set(new File(runtimeBuild,
+        project == gradle.rootProject ? '' : projectKey))
+}

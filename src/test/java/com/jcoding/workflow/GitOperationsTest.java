@@ -116,6 +116,52 @@ class GitOperationsTest {
                 .hasMessageContaining("credential-like paths");
     }
 
+    @Test
+    void credentialRelatedSourceAndRegressionTestsCanBeDelivered() {
+        for (String path : List.of("tests/release/test_manager_api_token_provisioning.sh",
+                "src/main/java/auth/TokenProvider.java", "src/auth/passwordReset.ts",
+                "scripts/provision_credentials.py")) {
+            FakeGit git = new FakeGit().output("status --porcelain", "?? " + path + "\n");
+            new GitOperations(Path.of("/repo"), git).commitAndPush("story/81-test", 81);
+            assertThat(git.hasCall("commit")).as(path).isTrue();
+            assertThat(git.hasCall("push")).as(path).isTrue();
+        }
+    }
+
+    @Test
+    void hardSecretPathsStillBlockBeforeAnyMutation() {
+        for (String path : List.of("tests/secrets/test_token.sh", "src/credentials/Token.java",
+                "tests/fixture.pem", "tests/.env.local", "config/.env/token",
+                "tests/api_token.txt", "config/access_token.json", "password.txt")) {
+            FakeGit git = new FakeGit().output("status --porcelain", "?? " + path + "\n");
+            assertThatThrownBy(() -> new GitOperations(Path.of("/repo"), git)
+                    .commitAndPush("story/81-test", 81))
+                    .as(path).isInstanceOf(GitOperations.ProtectedPathsException.class);
+            assertThat(git.calls).hasSize(1);
+            assertThat(git.calls.getFirst()).contains("--untracked-files=all");
+        }
+    }
+
+    @Test
+    void sourceNamedSymlinkCannotUseSourceException(@TempDir Path repo) throws Exception {
+        Files.createDirectories(repo.resolve("tests"));
+        Files.createSymbolicLink(repo.resolve("tests/test_token.sh"), Path.of("../actual-secret"));
+        FakeGit git = new FakeGit().output("status --porcelain", "?? tests/test_token.sh\n");
+        assertThatThrownBy(() -> new GitOperations(repo, git).validateStagingPaths())
+                .isInstanceOf(GitOperations.ProtectedPathsException.class);
+    }
+
+    @Test
+    void fingerprintDetectsUntrackedContentChangesWithoutExposingContents(@TempDir Path repo) throws Exception {
+        Path file = repo.resolve("token.txt");
+        Files.writeString(file, "first fixture");
+        FakeGit git = new FakeGit().output("status --porcelain", "?? token.txt\n");
+        GitOperations ops = new GitOperations(repo, git);
+        String before = ops.recoveryFingerprint();
+        Files.writeString(file, "second fixture");
+        assertThat(ops.recoveryFingerprint()).hasSize(64).isNotEqualTo(before);
+    }
+
     // -- prepare_story_branch ------------------------------------------------
 
     @Test

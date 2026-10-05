@@ -21,16 +21,7 @@ public final class StateRecovery {
     }
 
     private static final List<String> RESULT_KEYS =
-            List.of("RESULT_STATUS", "RESULT_NEXT_PHASE", "RESULT_BLOCKER");
-
-    private static final Map<String, String> PHASE_TO_ACTION = Map.of(
-            "IMPLEMENTING", "RESUME_IMPLEMENTATION",
-            "VERIFYING", "RESUME_VERIFICATION",
-            "REVIEWING_CODE", "RESUME_REVIEW",
-            "FIXING_FEEDBACK", "PROCESS_FEEDBACK",
-            "WAITING_FOR_CI", "WAIT_FOR_CI",
-            "WAITING_FOR_HUMAN_REVIEW", "WAIT_FOR_HUMAN_MERGE",
-            "PAUSED_QUOTA", "PAUSE_QUOTA");
+            List.of("RESULT_STATUS", "RESULT_NEXT_PHASE", "RESULT_BLOCKER", "RESULT_EVIDENCE");
 
     private static final Map<String, String> ACTION_TO_TARGET = Map.ofEntries(
             Map.entry("RESUME_CURRENT_STORY", "IMPLEMENTING"),
@@ -48,7 +39,8 @@ public final class StateRecovery {
     }
 
     private static String lastMatch(String key, String output) {
-        Matcher matcher = Pattern.compile("^" + key + ":\\s*(.+)$", Pattern.MULTILINE).matcher(output);
+        Matcher matcher = Pattern.compile("^" + key + ":[\\t ]*([^\\r\\n]*)$", Pattern.MULTILINE)
+                .matcher(output == null ? "" : output);
         String last = null;
         while (matcher.find()) {
             last = matcher.group(1).strip();
@@ -56,7 +48,7 @@ public final class StateRecovery {
         return last;
     }
 
-    /** Parse the minimal worker result footer (status/next_phase/blocker). */
+    /** Parse raw worker fields. This is not an acceptance or delivery verdict. */
     public static Map<String, String> parseResult(String output) {
         Map<String, String> values = new java.util.LinkedHashMap<>();
         for (String key : RESULT_KEYS) {
@@ -124,33 +116,46 @@ public final class StateRecovery {
      * Apply a bounded reconciliation decision to state. Returns whether the
      * decision was accepted plus a human-readable detail. Fails closed on
      * invalid/missing action, missing evidence, invalid blocker class, or a
-     * resume without a current story and branch.
+     * resume without a current story and branch. This overload assumes the
+     * caller has checked exit zero; prefer the exit-aware overload for new code.
+     */
+    public static ReconciliationOutcome applyReconciliationDecision(Map<String, Object> state, String output) {
+        return applyReconciliationDecision(state, 0, output);
+    }
+
+    /**
+     * Exit-aware decision gate. Rejections leave state untouched, including
+     * quota/backoff classification already applied by {@link Engine}.
      */
     @SuppressWarnings("unchecked")
-    public static ReconciliationOutcome applyReconciliationDecision(Map<String, Object> state, String output) {
+    public static ReconciliationOutcome applyReconciliationDecision(Map<String, Object> state,
+                                                                     int exitCode, String output) {
+        Map<String, String> result = parseResult(output);
+        if (exitCode != 0 || !"SUCCESS".equals(result.get("result_status"))) {
+            return new ReconciliationOutcome(false,
+                    "Codex returned no valid SUCCESS reconciliation result");
+        }
+        if (!"COMPLETE".equals(result.get("result_evidence"))) {
+            return new ReconciliationOutcome(false,
+                    "Codex returned a reconciliation decision without complete evidence");
+        }
         Map<String, String> decision = Engine.parseDecision(output);
         String action = decision.getOrDefault("decision_action", "");
         String reason = decision.getOrDefault("decision_reason", "");
         String blockerClass = decision.getOrDefault("blocker_class", "");
 
-        // Compatibility fallback: derive the action from a declared bounded
-        // next phase when DECISION_ACTION was omitted.
-        if (action.isEmpty()) {
-            Map<String, String> result = parseResult(output);
-            action = PHASE_TO_ACTION.getOrDefault(result.getOrDefault("result_next_phase", ""), "");
-            if (reason.isEmpty()) {
-                reason = result.getOrDefault("result_blocker", "");
-            }
-        }
-
         if (!PhaseModel.DECISION_ACTIONS.contains(action)) {
             return new ReconciliationOutcome(false, "Codex returned an invalid or missing reconciliation action");
         }
-        if (reason.isEmpty()) {
+        if (reason.isBlank()) {
             return new ReconciliationOutcome(false, "Codex returned a reconciliation action without evidence");
         }
-        if (!blockerClass.isEmpty() && !PhaseModel.BLOCKER_CLASSES.contains(blockerClass)) {
+        if (!PhaseModel.BLOCKER_CLASSES.contains(blockerClass)) {
             return new ReconciliationOutcome(false, "Codex returned an invalid blocker class: " + blockerClass);
+        }
+        String recoveryAction = decision.getOrDefault("recovery_action", "");
+        if (recoveryAction.isBlank()) {
+            return new ReconciliationOutcome(false, "Codex returned no reconciliation recovery action");
         }
 
         String target = ACTION_TO_TARGET.get(action);
@@ -162,6 +167,10 @@ public final class StateRecovery {
         }
 
         int attempts = intValue(state.getOrDefault("reconciliation_attempts", 0));
+        state.put("worker_result_status", result.get("result_status"));
+        state.put("result_status", "RECONCILIATION_ACCEPTED");
+        state.put("result_evidence", "DECISION_COMPLETE");
+        state.remove("delivery_mode");
         if (action.equals("BLOCK_REQUIREMENTS") || action.equals("BLOCK_EXTERNAL")) {
             attempts += 1;
             if (ProgressGuard.reconcileCapReached(attempts)) {
@@ -178,9 +187,8 @@ public final class StateRecovery {
         state.put("decision_action", action);
         state.put("decision_reason", reason);
         state.put("reconciliation_attempts", attempts);
-        state.put("blocker_class", !blockerClass.isEmpty()
-                ? blockerClass : String.valueOf(state.getOrDefault("blocker_class", "")));
-        state.put("recovery_action", decision.getOrDefault("recovery_action", ""));
+        state.put("blocker_class", blockerClass);
+        state.put("recovery_action", recoveryAction);
 
         if (!action.equals("BLOCK_REQUIREMENTS") && !action.equals("BLOCK_EXTERNAL")
                 && !action.equals("PAUSE_QUOTA")) {
@@ -196,7 +204,7 @@ public final class StateRecovery {
     }
 
     private static boolean isBlank(Object value) {
-        return value == null || String.valueOf(value).isEmpty();
+        return value == null || String.valueOf(value).isBlank();
     }
 
     private static int intValue(Object value) {

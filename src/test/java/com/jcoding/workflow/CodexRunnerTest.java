@@ -34,7 +34,7 @@ class CodexRunnerTest {
                 Path.of("/repo"));
         assertThat(command).containsSubsequence("codex", "--cd", "/repo",
                 "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=medium",
-                "--approve-for-me", "exec", "-");
+                "--approve-for-me", "exec", "--json", "-");
     }
 
     @Test
@@ -131,19 +131,7 @@ class CodexRunnerTest {
         assertThat(result.output()).isEmpty();
     }
 
-    // -- mid-phase lost-lock handling ----------------------------------------
-    //
-    // The mid-phase lost-lock path (heartbeat throws LockOwnershipLost while the
-    // worker runs) is verified deterministically without launching a process:
-    //  - WorkflowLockTest proves refresh() throws LockOwnershipLost when the
-    //    owner file is removed or ownership changes (the source of the throw).
-    //  - ControllerTest/Controller proves the top-level handler catches
-    //    LockOwnershipLost and ends the run cleanly (INFO, return 0).
-    //  - CodexRunner.run() wraps the read loop in `catch (RuntimeException abort)`
-    //    which force-destroys and reaps the child before rethrowing, so the
-    //    worker is never orphaned. A real-process test here is intentionally
-    //    avoided: run() builds its own command internally, leaving no seam to
-    //    inject a controllable long-lived child without launching a real codex.
+    // Subprocess timeout and heartbeat cleanup are covered by CodexRunnerProcessTest.
 
     // -- command construction (approval flag) --------------------------------
 
