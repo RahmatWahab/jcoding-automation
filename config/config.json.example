@@ -1,12 +1,12 @@
 {
   "repository": {
-    "local_path": "/local/cquant_platform",
-    "owner": "RahmatWahab",
-    "name": "cquant_platform",
+    "local_path": "/path/to/your/repo",
+    "owner": "your-org-or-user",
+    "name": "your-repo",
     "base_branch": "main"
   },
   "epic": {
-    "number": 27
+    "number": 1
   },
   "github": {
     "token_environment_variable": "GH_TOKEN",

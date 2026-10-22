@@ -11,6 +11,50 @@ The controller owns all authority — scheduling, locking, durable state, GitHub
 reconciliation, and the merge gate. Codex runs only as a constrained,
 time-boxed worker.
 
+## What it does
+
+- **Picks up work from a GitHub EPIC.** It reads one EPIC issue and the stories
+  linked to it, selects the next eligible story, and drives it through the whole
+  delivery loop automatically on a cron tick.
+- **Understands intent before acting.** Each story is captured as a versioned
+  goal contract (requirements, acceptance criteria, permissions). Supported
+  intents are `implement_story` and `repair_story`; an unknown or ambiguous
+  intent is blocked for clarification instead of guessed.
+- **Plans, then implements.** When planning is enabled it builds a task plan
+  bound to the requirements, then runs the Codex worker to implement each task
+  in order, persisting a checkpoint after each one.
+- **Runs the worker in a sandbox.** The Codex worker executes inside Bubblewrap
+  isolation with a private network, resource limits, and no delivery
+  credentials; it reaches the model only through a controller-side scoped
+  gateway.
+- **Verifies independently.** Delivery requires the controller to run your
+  configured verification commands (tests, linters, builds) against the exact
+  delivered revision — a worker saying "done" is never accepted as proof.
+- **Opens and manages the pull request.** It creates the PR, triggers Codex
+  review, and runs the feedback → fix → re-review cycle, optionally through a
+  pre-commit panel of specialist reviewers (`internal_review`).
+- **Gates the merge.** With `auto_merge: false` (default) it posts
+  `READY TO MERGE` and waits for a human. With `auto_merge: true` it merges only
+  after verification, required CI, review, and unresolved-thread gates all pass
+  and the PR head still matches the verified delivery.
+- **Is durable and recoverable.** All state lives in SQLite; an interrupted run
+  resumes from the last safe checkpoint, with bounded budgets, locking, and
+  automatic reconciliation.
+- **Can also run a local request** (`--request-file`) to implement a task in a
+  sibling worktree without touching GitHub.
+
+## What it does not do
+
+- It does not bypass GitHub branch protection or any configured gate.
+- It does not merge by default, and never force-merges.
+- It does not hand the model provider credential to the worker.
+- It does not act on an ambiguous or unsupported intent — it asks first.
+- It does not make any commit, push, comment, PR, or merge while
+  `automation.dry_run = true` or the relevant `workflow.allow_*` flag is `false`.
+
+> This build is validated by an offline, mock-only test suite; real `gh` and the
+> real `codex` worker are exercised by your first dry-run, not by the tests.
+
 ## Requirements
 
 | Tool | Purpose |
@@ -21,7 +65,25 @@ time-boxed worker.
 | `jq` | JSON parsing in the cron/install scripts |
 | `flock`, `setsid` | Lock and isolated process handling (Linux) |
 | `codex` | The Codex CLI worker executable |
-| `bwrap`, Python 3 | Private-network worker and scoped model gateway |
+| `bwrap`, `prlimit`, Python 3 | Private-network worker, resource limits, and scoped model gateway |
+
+You also need two credentials in your environment before a live run (not for
+build or test):
+
+| Credential | Purpose | How to get it |
+|------------|---------|---------------|
+| `GH_TOKEN` | GitHub access for `gh` (read issues/PRs, and push/comment/merge when enabled) | Create a GitHub Personal Access Token with `repo` scope at GitHub → Settings → Developer settings → Fine-grained/Classic tokens |
+| `OPENAI_API_KEY` | The model provider key used by the Codex worker gateway (name is configurable via `codex.gateway.credential_environment_variable`) | Create an API key in your OpenAI account dashboard |
+
+On Debian/Ubuntu you can install the OS tools with:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y openjdk-21-jdk git jq util-linux bubblewrap python3
+# `flock`, `setsid`, and `prlimit` are part of the `util-linux` package.
+# Install the GitHub CLI (`gh`) and the Codex CLI (`codex`) from their own
+# official instructions — they are not in the default apt repositories.
+```
 
 No network access is required to build or test the project; the test suite is
 fully offline and does not contact GitHub or launch `codex`.
@@ -83,16 +145,37 @@ gh auth status
 ```
 
 Cron does not inherit interactive-shell exports. For cron, create a protected
-environment file outside the repository (mode `600` is required):
+environment file outside the repository (mode `600` is required). Put **both**
+credentials in it:
 
 ```bash
 mkdir -p "$HOME/.config/jcoding-automation"
-printf '%s\n' 'GH_TOKEN=your-token' > "$HOME/.config/jcoding-automation/env"
+cat > "$HOME/.config/jcoding-automation/env" <<'EOF'
+GH_TOKEN=ghp_your_github_token_here
+OPENAI_API_KEY=sk-your_openai_key_here
+EOF
 chmod 600 "$HOME/.config/jcoding-automation/env"
 ```
 
 The cron launcher loads this file automatically. Use
-`CODEX_AUTOMATION_ENV_FILE=/path/to/file` to select another protected file.
+`CODEX_AUTOMATION_ENV_FILE=/path/to/file` to select another protected file. The
+launcher only accepts the keys `GH_TOKEN`, `OPENAI_API_KEY`, and `CODEX_API_KEY`
+and refuses a file that is not mode `600`.
+
+### Model provider key (OPENAI_API_KEY)
+
+The Codex worker reaches the model only through a controller-side gateway, and
+that gateway needs the provider key. Supply it to the **controller** environment
+(the worker never receives it — it gets a short-lived scoped token instead):
+
+```bash
+export OPENAI_API_KEY="sk-your-openai-key"
+```
+
+The environment variable name is configurable with
+`codex.gateway.credential_environment_variable` in `config/config.json` (default
+`OPENAI_API_KEY`). A live run or `--readiness` check fails closed if this key is
+missing.
 
 ## Run
 
@@ -445,7 +528,19 @@ evidence, or corrected configuration can wake the story automatically.
 
 ## Cron
 
-Install or update the cron entry from the policy file:
+Before installing, open `config/cron-policy.json` and replace the example
+absolute paths with **your** install location. The file ships with placeholder
+paths under `/path/to/jcoding-automation/...`; the cron entries must point at
+the real `scripts/cron-launcher.sh` and `scripts/log-housekeeping.sh` on this
+machine. For example, if you cloned the project to
+`/home/alice/jcoding-automation`, the `cron_entry` should read:
+
+```
+*/1 * * * * /home/alice/jcoding-automation/scripts/cron-launcher.sh >> /home/alice/jcoding-automation/logs/cron-system.log 2>&1
+```
+
+Tip: print your absolute path with `pwd` from inside the project directory and
+paste it in. Then install or update the cron entry from the policy file:
 
 ```bash
 scripts/install-cron.sh
@@ -552,3 +647,28 @@ constructor injection:
 - `GitOperations` — branch, worktree, commit, push, and delivery verification.
 - `CodexRunner` — bounded `codex exec` execution and credential redaction.
 - `Controller` + `WorkflowOrchestrator` — top-level orchestration and phase dispatch.
+
+## Documentation
+
+Project documentation lives under `docs/` and `audit/`:
+
+- `docs/autonomy-implementation.md` — how the autonomy, canary, and release-gate
+  controls are implemented.
+- `docs/spec/` — spec-driven design (SDD) documents, one directory per spec.
+  Each spec directory contains `requirements.md`, `design.md`, and `tasks.md`
+  (read in that order) plus a short `README.md` index. The directory name is a
+  lowercase, hyphenated slug; draft status is recorded in each document's header,
+  not in the directory name. Current spec:
+  [`docs/spec/architecture-fundamentals-hardening/`](docs/spec/architecture-fundamentals-hardening/README.md).
+- `audit/` — point-in-time architecture and security assessment:
+  `01-current-architecture.md`, `02-gap-analysis.md`, `03-target-architecture.md`,
+  and `agent-security-notes.md`.
+
+The worker phase prompts under `prompts/` are runtime inputs, not documentation:
+the controller loads them (e.g. `verify.md`, `review-security.md`) during the
+workflow, and a missing prompt fails the corresponding phase closed.
+
+## License
+
+This project is free and open-source software released under the
+[MIT License](LICENSE).

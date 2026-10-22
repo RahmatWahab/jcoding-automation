@@ -1,7 +1,7 @@
 {
   "interval_minutes": 1,
-  "cron_entry": "*/1 * * * * /home/algo/jcoding-automation/scripts/cron-launcher.sh >> /home/algo/jcoding-automation/logs/cron-system.log 2>&1",
-  "housekeeping_cron_entry": "0 0 * * * /home/algo/jcoding-automation/scripts/log-housekeeping.sh >> /home/algo/jcoding-automation/logs/housekeeping.log 2>&1",
+  "cron_entry": "*/1 * * * * /path/to/jcoding-automation/scripts/cron-launcher.sh >> /path/to/jcoding-automation/logs/cron-system.log 2>&1",
+  "housekeeping_cron_entry": "0 0 * * * /path/to/jcoding-automation/scripts/log-housekeeping.sh >> /path/to/jcoding-automation/logs/housekeeping.log 2>&1",
   "job_control_file": "config/job-control.json",
   "skip_when_running": true,
   "stale_lock_seconds": 900,

@@ -1,5 +1,13 @@
 # Autonomous delivery hardening
 
+> Status: historical implementation log of the autonomy-hardening pass. The
+> ledger, baseline test counts, and "not run per user instruction" notes below
+> are a point-in-time record of that work, **not** the current build state. For
+> how to run the current suite see the "Build and test" section of the root
+> `README.md`; for current findings see `audit/02-gap-analysis.md`. The design
+> intent described here (evidence-driven completion, canary-gated autonomy,
+> fail-closed defaults) remains current.
+
 Scope: preserve the existing SQLite journal, checkpoints and bounded worker model;
 make completion evidence-driven and keep all mutations under controller policy.
 The pre-existing working-tree changes are part of the baseline. Live job settings
