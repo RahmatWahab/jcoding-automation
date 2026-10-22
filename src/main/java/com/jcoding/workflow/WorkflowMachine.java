@@ -58,6 +58,11 @@ public final class WorkflowMachine {
     private static Map<String, String> buildPromptMap() {
         Map<String, String> m = new LinkedHashMap<>();
         m.put("PLANNING", "prompts/plan.md");
+        m.put("IMPLEMENTING", "prompts/implement.md");
+        m.put("RECONCILING", "prompts/reconcile.md");
+        m.put("BLOCKED_EXTERNAL", "prompts/reconcile.md");
+        m.put("BLOCKED_CONFIGURATION", "prompts/reconcile.md");
+        m.put("CONFLICT_DETECTED", "prompts/reconcile.md");
         m.put("CHANGES_REQUESTED", "prompts/feedback.md");
         m.put("FIXING_FEEDBACK", "prompts/feedback.md");
         m.put("VERIFYING", "prompts/verify.md");
@@ -73,7 +78,9 @@ public final class WorkflowMachine {
 
     /** The prompt file a phase dispatches (default {@code prompts/implement.md}). */
     public static String promptFor(String phase) {
-        return PROMPT_BY_PHASE.getOrDefault(phase == null ? "" : phase, "prompts/implement.md");
+        String prompt = PROMPT_BY_PHASE.get(phase == null ? "" : phase);
+        if (prompt == null) throw new IllegalArgumentException("Phase cannot dispatch a worker: " + phase);
+        return prompt;
     }
 
     /**
@@ -97,7 +104,7 @@ public final class WorkflowMachine {
                 "BLOCKED_REPOSITORY", "BLOCKED_CONFIGURATION", "CONFLICT_DETECTED",
                 "FAILED_RECOVERABLE", "CODEX_FAILURE", "RECONCILING", "MERGED");
         for (String active : anyActive) {
-            m.put(active, union(anyActive, waitingOrTerminal));
+            m.put(active, union(anyActive, waitingOrTerminal, Set.of("IDLE", "PLANNING")));
         }
         // Reconciliation and blocked/recoverable phases resume any active phase
         // or move to a waiting/terminal phase.
@@ -105,17 +112,17 @@ public final class WorkflowMachine {
                 "BLOCKED_REPOSITORY", "BLOCKED_EXTERNAL", "BLOCKED_CONFIGURATION",
                 "FAILED_RECOVERABLE", "CODEX_FAILURE",
                 "CONFLICT_DETECTED")) {
-            m.put(recover, union(anyActive, waitingOrTerminal, Set.of("IDLE", "EPIC_COMPLETE")));
+            m.put(recover, union(anyActive, waitingOrTerminal, Set.of("IDLE", "EPIC_COMPLETE", "PLANNING")));
         }
         // Idle selects a story and begins implementation (or planning), or completes the EPIC.
-        m.put("IDLE", union(anyActive, Set.of("PLANNING", "EPIC_COMPLETE", "IDLE", "BLOCKED_REQUIREMENTS")));
+        m.put("IDLE", union(anyActive, waitingOrTerminal, Set.of("PLANNING", "EPIC_COMPLETE", "IDLE")));
         // Planning produces the plan then proceeds to implementation (or reconcile on ambiguity).
-        m.put("PLANNING", union(anyActive, Set.of("RECONCILING", "BLOCKED_REQUIREMENTS")));
+        m.put("PLANNING", union(anyActive, waitingOrTerminal, Set.of("IDLE")));
         // Waiting phases resolve forward to review/feedback/merge or a block.
         for (String wait : Set.of("WAITING_FOR_CI", "WAITING_FOR_CODEX_REVIEW",
                 "WAITING_FOR_HUMAN_REVIEW", "WAITING_FOR_MANUAL_MERGE", "READY_TO_MERGE",
                 "CHANGES_REQUESTED", "PAUSED_QUOTA")) {
-            m.put(wait, union(anyActive, waitingOrTerminal, Set.of("EPIC_COMPLETE", "IDLE")));
+            m.put(wait, union(anyActive, waitingOrTerminal, Set.of("EPIC_COMPLETE", "IDLE", "PLANNING")));
         }
         // Merged advances to the next story (IDLE) or completes the EPIC.
         m.put("MERGED", Set.of("IDLE", "EPIC_COMPLETE"));
@@ -134,7 +141,7 @@ public final class WorkflowMachine {
 
     /** Whether {@code to} is a declared legal successor of {@code from}. */
     public static boolean isLegalTransition(String from, String to) {
-        if (from == null || to == null) {
+        if (from == null || to == null || !KNOWN_PHASES.contains(from) || !KNOWN_PHASES.contains(to)) {
             return false;
         }
         if (from.equals(to)) {

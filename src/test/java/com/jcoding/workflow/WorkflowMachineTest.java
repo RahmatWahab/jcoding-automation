@@ -31,35 +31,25 @@ class WorkflowMachineTest {
         assertThat(WorkflowMachine.promptFor("PLANNING")).isEqualTo("prompts/plan.md");
         // Default / unknown / implementation phases -> implement.md.
         assertThat(WorkflowMachine.promptFor("IMPLEMENTING")).isEqualTo("prompts/implement.md");
-        assertThat(WorkflowMachine.promptFor("SOMETHING_UNKNOWN")).isEqualTo("prompts/implement.md");
-        assertThat(WorkflowMachine.promptFor(null)).isEqualTo("prompts/implement.md");
+        assertThatThrownBy(() -> WorkflowMachine.promptFor("SOMETHING_UNKNOWN")).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> WorkflowMachine.promptFor(null)).isInstanceOf(IllegalArgumentException.class);
+        assertThat(WorkflowMachine.isLegalTransition("UNKNOWN", "UNKNOWN")).isFalse();
     }
 
     @Test
-    void controllerDelegatesToTheMachine() {
-        // The live path (Controller.phasePromptFor) must resolve through the
-        // single authority.
-        for (String phase : new String[] {"IDLE", "VERIFYING", "READY_TO_MERGE", "IMPLEMENTING"}) {
-            assertThat(Controller.phasePromptFor(phase)).isEqualTo(WorkflowMachine.promptFor(phase));
-        }
-    }
-
-    @Test
-    void everyPhaseSetByTheControllerHasDeclaredSuccessors() {
-        // R1: guard against a table gap — every phase the controller can occupy
-        // as a source must have at least one declared legal successor, so the
-        // save()-time transition check never falsely flags a real transition.
+    void knownPhasesPermitRetryAndUnknownPhasesDoNot() {
+        // Same-phase retry is a supported recovery outcome; unknown phase names
+        // must not silently enter the workflow.
         for (String phase : new String[] {
                 "IDLE", "PLANNING", "IMPLEMENTING", "VERIFYING", "REVIEWING_CODE",
                 "FIXING_FEEDBACK", "RECONCILING", "WAITING_FOR_CI", "WAITING_FOR_CODEX_REVIEW",
                 "WAITING_FOR_MANUAL_MERGE", "READY_TO_MERGE", "BLOCKED_REQUIREMENTS",
                 "BLOCKED_EXTERNAL", "BLOCKED_REPOSITORY", "BLOCKED_CONFIGURATION",
                 "CONFLICT_DETECTED", "FAILED_RECOVERABLE", "CODEX_FAILURE", "MERGED"}) {
-            // A phase re-entering itself (retry) is always legal, so this only
-            // fails if the phase has NO declared forward transitions at all.
             assertThat(WorkflowMachine.isLegalTransition(phase, phase))
-                    .as("phase %s must be known", phase).isTrue();
+                    .as("phase %s must support retry", phase).isTrue();
         }
+        assertThat(WorkflowMachine.isLegalTransition("NOT_A_PHASE", "NOT_A_PHASE")).isFalse();
     }
 
     @Test

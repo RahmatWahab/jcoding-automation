@@ -35,6 +35,31 @@ public final class ParkPolicy {
                 Engine.asString(workflow.getOrDefault("terminal_policy", "hold")));
     }
 
+    /** Explicit serial delivery policy: an unfinished PR must not be abandoned. */
+    public static boolean finishOpenPrFirst(Map<String, Object> workflow) {
+        return Engine.asBool(workflow.get("finish_open_pr_before_next_story"), false);
+    }
+
+    public static boolean mayAdvance(Map<String, Object> workflow, Map<String, Object> state) {
+        return enabled(workflow) && !(finishOpenPrFirst(workflow) && state.get("current_pr") != null);
+    }
+
+    /** Resume an explicitly prioritized open PR even if an old run parked this head. */
+    public static void resumeForOpenPr(Map<String, Object> state, int story) {
+        Object value = records(state).get(String.valueOf(story));
+        if (!(value instanceof Map<?, ?> record)) return;
+        if (record.get("checkpoint") instanceof Map<?, ?> checkpoint) {
+            checkpoint.forEach((key, item) -> state.put(String.valueOf(key), item));
+        }
+        Map<String, Object> remaining = new LinkedHashMap<>(records(state));
+        remaining.remove(String.valueOf(story));
+        state.put(STATE_KEY, remaining);
+        state.remove("held_failure");
+        state.remove("stuck_head");
+        state.remove("stuck_head_reason");
+        state.put("recovery_next_prompt", "prompts/reconcile.md");
+    }
+
     @SuppressWarnings("unchecked")
     private static Map<String, Object> records(Map<String, Object> state) {
         Object existing = state.get(STATE_KEY);

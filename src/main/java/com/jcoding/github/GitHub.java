@@ -58,11 +58,12 @@ public class GitHub {
     private final java.util.function.Function<String, String> environment;
 
     public GitHub(String owner, String name) {
-        this(owner, name, "GH_TOKEN", "gh", 30, defaultRunner(), System::getenv);
+        this(owner, name, "GH_TOKEN", "gh", 30, defaultRunner("GH_TOKEN"), System::getenv);
     }
 
     public GitHub(String owner, String name, String tokenEnvironmentVariable, String cli, int timeoutSeconds) {
-        this(owner, name, tokenEnvironmentVariable, cli, timeoutSeconds, defaultRunner(), System::getenv);
+        this(owner, name, tokenEnvironmentVariable, cli, timeoutSeconds,
+                defaultRunner(tokenEnvironmentVariable), System::getenv);
     }
 
     public GitHub(String owner, String name, String tokenEnvironmentVariable, String cli,
@@ -76,6 +77,75 @@ public class GitHub {
         this.timeoutSeconds = timeoutSeconds;
         this.runner = runner;
         this.environment = environment;
+    }
+
+    private java.util.function.Consumer<String> mutationGuard = action -> { };
+    private Runnable cancellationCheck = () -> { };
+    private java.util.function.Supplier<String> intentIdentity = () -> "";
+
+    public void intentIdentity(java.util.function.Supplier<String> identity) {
+        this.intentIdentity = java.util.Objects.requireNonNull(identity);
+    }
+
+    public void cancellationCheck(Runnable check) {
+        this.cancellationCheck = java.util.Objects.requireNonNull(check);
+    }
+
+    public void mutationGuard(java.util.function.Consumer<String> guard) {
+        this.mutationGuard = java.util.Objects.requireNonNull(guard);
+    }
+
+    private com.jcoding.state.EffectJournal effects;
+    public void effectStore(com.jcoding.state.StateStore store) { effects = new com.jcoding.state.EffectJournal(store); }
+
+    private Object effect(String action, Map<String, Object> payload, boolean replaySafe,
+                          java.util.function.Function<String, Object> observe,
+                          java.util.function.Function<String, Object> mutation) {
+        Map<String, Object> bound = new java.util.LinkedHashMap<>(payload);
+        bound.put("repository", repo);
+        String intent = intentIdentity.get();
+        bound.put("intent_hash", intent);
+        if (effects == null) return mutation.apply(""); // Injectable standalone adapter, controller always binds a store.
+        return effects.execute(action, bound, replaySafe, observe, mutation, () -> {
+            if (!intent.equals(intentIdentity.get())) throw new GitHubError("Intent changed before external effect");
+            mutationGuard.accept(action);
+        });
+    }
+
+    private static String marker(String key) { return "<!-- jcoding-effect:" + key + " -->"; }
+    private static String marked(String body, String key) { return key.isBlank() ? body : body + "\n\n" + marker(key); }
+    private static String withoutMarker(String body) { return body.replaceAll("(?s)\\s*<!-- jcoding-effect:[a-f0-9]+ -->", "").strip(); }
+
+    private Object findComment(int issue, String key) {
+        Object raw = issueComments(issue);
+        if (!(raw instanceof List<?> pages)) throw new GitHubError("Incomplete comment read-back");
+        for (Object page : pages) {
+            if (!(page instanceof List<?> comments)) throw new GitHubError("Incomplete comment page");
+            for (Object item : comments) if (bodyOf(item).contains(marker(key))) return item;
+        }
+        return null;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object threadEvidence(String threadId, String key, boolean resolved) {
+        String query = "query($id:ID!,$after:String) { node(id:$id) { ... on PullRequestReviewThread { isResolved "
+                + "comments(first:100,after:$after) { nodes { id body } pageInfo { hasNextPage endCursor } } } } }";
+        String cursor = null;
+        java.util.Set<String> cursors = new java.util.HashSet<>();
+        for (int page = 0; page < 100; page++) {
+            Map<?, ?> data = (Map<?, ?>) run("api", "graphql", "-f", "query=" + query, "-F", "id=" + threadId,
+                    "-F", cursor == null ? "after=null" : "after=" + cursor);
+            Map<?, ?> node = (Map<?, ?>) ((Map<?, ?>) data.get("data")).get("node");
+            if (node == null) throw new GitHubError("Thread read-back is unavailable");
+            if (resolved) return Boolean.TRUE.equals(node.get("isResolved")) ? Map.of("thread", threadId, "resolved", true) : null;
+            Map<?, ?> comments = (Map<?, ?>) node.get("comments");
+            for (Object comment : (List<?>) comments.get("nodes")) if (bodyOf(comment).contains(marker(key))) return comment;
+            Map<?, ?> info = (Map<?, ?>) comments.get("pageInfo");
+            if (Boolean.FALSE.equals(info.get("hasNextPage"))) return null;
+            cursor = (String) info.get("endCursor");
+            if (cursor == null || !cursors.add(cursor)) throw new GitHubError("Incomplete thread read-back");
+        }
+        throw new GitHubError("Thread read-back exceeded its page budget");
     }
 
     public int timeoutSeconds() {
@@ -100,7 +170,31 @@ public class GitHub {
         long startNanos = System.nanoTime();
         String label = args.length >= 2 ? args[0] + " " + args[1] : (args.length == 1 ? args[0] : cli);
         try {
-            result = runner.run(command, timeoutSeconds);
+            java.util.concurrent.FutureTask<CommandResult> task = new java.util.concurrent.FutureTask<>(
+                    () -> runner.run(command, timeoutSeconds));
+            Thread.ofVirtual().name("jcoding-gh-call").start(task);
+            try {
+                while (true) {
+                    try {
+                        cancellationCheck.run();
+                        result = task.get(100, TimeUnit.MILLISECONDS);
+                        break;
+                    } catch (java.util.concurrent.TimeoutException waiting) {
+                        // Recheck cancellation without waiting for the CLI timeout.
+                    }
+                }
+            } catch (RuntimeException cancelled) {
+                task.cancel(true);
+                throw cancelled;
+            } catch (InterruptedException interrupted) {
+                task.cancel(true);
+                Thread.currentThread().interrupt();
+                throw new GitHubError("GitHub command interrupted", interrupted);
+            } catch (java.util.concurrent.ExecutionException failed) {
+                Throwable cause = failed.getCause();
+                if (cause instanceof RuntimeException runtime) throw runtime;
+                throw new GitHubError("GitHub command failed", cause);
+            }
         } catch (CommandTimeout exc) {
             long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
             log.error("GH CALL TIMEOUT: {} after {} ms (limit {} s)", label, elapsedMs, timeoutSeconds);
@@ -108,6 +202,9 @@ public class GitHub {
                     + " seconds: " + cli, exc);
         }
         long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
+        if (result.stdout.length() > 8 * 1024 * 1024 || result.stderr.length() > 8 * 1024 * 1024) {
+            throw new GitHubError("GitHub command output exceeded the 8 MiB limit");
+        }
         int outSize = result.stdout.length();
         if (elapsedMs >= 5000) {
             log.warn("GH CALL SLOW: {} took {} ms (exit {}, {} bytes)", label, elapsedMs,
@@ -119,13 +216,19 @@ public class GitHub {
         if (result.returnCode != 0) {
             String message = !result.stderr.strip().isEmpty()
                     ? result.stderr.strip() : result.stdout.strip();
-            throw new GitHubError(message);
+            throw new GitHubError(redact(message, token));
         }
         try {
             return MAPPER.readValue(result.stdout, Object.class);
         } catch (IOException notJson) {
             return result.stdout.strip();
         }
+    }
+
+    private static String redact(String value, String token) {
+        String clean = token == null || token.isBlank() ? value : value.replace(token, "[REDACTED]");
+        return clean.replaceAll("(?i)(authorization\\s*:\\s*bearer\\s+)[^\\s]+", "$1[REDACTED]")
+                .replaceAll("(?i)((?:gh_token|github_token|password|secret|api[_-]?key)\\s*[=:]\\s*)[^\\s]+", "$1[REDACTED]");
     }
 
     @SuppressWarnings("unchecked")
@@ -136,13 +239,63 @@ public class GitHub {
 
     public Object issue(int number) {
         return run("issue", "view", String.valueOf(number), "--repo", repo,
-                "--json", "number,title,state,body,labels,assignees,url");
+                "--json", "number,title,state,body,labels,assignees,url,author");
     }
 
+    /** Post a controller-authored clarification request to an issue. */
+    public void commentIssue(int number, String body) {
+        mutationGuard.accept("comment");
+        effect("comment", Map.of("issue", number, "body", body), false,
+                key -> findComment(number, key),
+                key -> run("issue", "comment", String.valueOf(number), "--repo", repo, "--body", marked(body, key)));
+    }
+
+    /** Fetch issue conversation comments for idempotent recovery after a crash. */
+    public Object issueComments(int number) {
+        return run("api", "--paginate", "--slurp", "repos/" + repo + "/issues/" + number + "/comments?per_page=100");
+    }
+
+    @SuppressWarnings("unchecked")
     public Object prs() {
-        return run("pr", "list", "--repo", repo, "--state", "all", "--limit", "100",
-                "--json", "number,title,state,isDraft,mergedAt,headRefName,url,body,"
-                        + "reviewDecision,statusCheckRollup");
+        String query = "query($owner:String!, $name:String!, $after:String) { repository(owner:$owner,name:$name) { "
+                + "pullRequests(first:100,after:$after,orderBy:{field:UPDATED_AT,direction:DESC}) { "
+                + "pageInfo { hasNextPage endCursor } nodes { number title state isDraft mergedAt headRefName headRefOid url body } } } }";
+        List<Object> result = new ArrayList<>();
+        java.util.Set<String> cursors = new java.util.HashSet<>();
+        String cursor = null;
+        for (int page = 0; page < 100; page++) {
+            Object raw = run("api", "graphql", "-f", "query=" + query, "-F", "owner=" + owner,
+                    "-F", "name=" + name, "-F", cursor == null ? "after=null" : "after=" + cursor);
+            try {
+                Map<?, ?> connection = (Map<?, ?>) ((Map<?, ?>) ((Map<?, ?>) ((Map<?, ?>) raw).get("data"))
+                        .get("repository")).get("pullRequests");
+                List<?> nodes = (List<?>) connection.get("nodes");
+                Map<?, ?> info = (Map<?, ?>) connection.get("pageInfo");
+                if (nodes == null || info == null || !(info.get("hasNextPage") instanceof Boolean)) throw new IllegalArgumentException();
+                result.addAll(nodes);
+                if (Boolean.FALSE.equals(info.get("hasNextPage"))) return result;
+                cursor = (String) info.get("endCursor");
+                if (cursor == null || cursor.isBlank() || !cursors.add(cursor)) throw new IllegalArgumentException();
+            } catch (RuntimeException exc) { throw new GitHubError("Incomplete PR discovery; refusing to select a story", exc); }
+        }
+        throw new GitHubError("PR discovery exceeded page limit");
+    }
+
+    /** Native child relationships are authoritative; incidental body links are not. */
+    public List<Integer> childStoryNumbers(int epic) {
+        Object raw = run("api", "--paginate", "--slurp", "repos/" + repo + "/issues/" + epic + "/sub_issues?per_page=100");
+        if (!(raw instanceof List<?> pages)) throw new GitHubError("Malformed sub-issue response");
+        List<Integer> result = new ArrayList<>();
+        for (Object page : pages) {
+            if (!(page instanceof List<?> issues)) throw new GitHubError("Malformed sub-issue page");
+            for (Object issue : issues) {
+                if (!(issue instanceof Map<?, ?> child) || !(child.get("number") instanceof Number n)) {
+                    throw new GitHubError("Malformed sub-issue identity");
+                }
+                result.add(n.intValue());
+            }
+        }
+        return result;
     }
 
     private static final String THREADS_QUERY =
@@ -228,7 +381,11 @@ public class GitHub {
     }
 
     public void comment(int number, String body) {
-        run("pr", "comment", String.valueOf(number), "--repo", repo, "--body", body);
+        mutationGuard.accept("comment");
+        Object head = effects == null ? "standalone" : pr(number).get("headRefOid");
+        effect("comment", Map.of("pr", number, "head", head, "body", body), false,
+                key -> findComment(number, key),
+                key -> run("pr", "comment", String.valueOf(number), "--repo", repo, "--body", marked(body, key)));
     }
 
     /**
@@ -238,30 +395,45 @@ public class GitHub {
      * the manual-merge gate and never calls this.
      */
     public void mergePr(int number, String method) {
+        throw new GitHubError("Merge requires an expected head SHA");
+    }
+
+    public void mergePr(int number, String method, String expectedHead) {
+        mutationGuard.accept("merge");
+        if (expectedHead == null || expectedHead.isBlank()) throw new GitHubError("Merge requires an expected head SHA");
         String strategy = switch (method == null ? "" : method) {
             case "squash" -> "--squash";
             case "rebase" -> "--rebase";
             default -> "--merge";
         };
-        run("pr", "merge", String.valueOf(number), "--repo", repo, strategy);
+        effect("merge", Map.of("pr", number, "head", expectedHead, "method", strategy), true,
+                key -> { Map<String, Object> current = pr(number);
+                    return "MERGED".equals(current.get("state")) || current.get("mergedAt") != null ? current : null; },
+                key -> run("pr", "merge", String.valueOf(number), "--repo", repo, strategy, "--match-head-commit", expectedHead));
     }
 
     public void resolveThread(String threadId) {
+        mutationGuard.accept("resolve");
         String mutation = "mutation($threadId:ID!) {\n"
                 + "          resolveReviewThread(input:{threadId:$threadId}) { thread { isResolved } }\n"
                 + "        }";
-        run("api", "graphql", "-f", "query=" + mutation, "-f", "threadId=" + threadId);
+        effect("resolve", Map.of("thread", threadId), true,
+                key -> threadEvidence(threadId, key, true),
+                key -> run("api", "graphql", "-f", "query=" + mutation, "-f", "threadId=" + threadId));
     }
 
     /** Reply to an existing review thread using GitHub's native mutation. */
     public void replyThread(String threadId, String body) {
+        mutationGuard.accept("reply");
         String mutation = "mutation($threadId:ID!, $body:String!) {\n"
                 + "          addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId, body:$body}) {\n"
                 + "            comment { id }\n"
                 + "          }\n"
                 + "        }";
-        run("api", "graphql", "-f", "query=" + mutation,
-                "-f", "threadId=" + threadId, "-f", "body=" + body);
+        effect("reply", Map.of("thread", threadId, "body", body), false,
+                key -> threadEvidence(threadId, key, false),
+                key -> run("api", "graphql", "-f", "query=" + mutation,
+                        "-f", "threadId=" + threadId, "-f", "body=" + marked(body, key)));
     }
 
     /**
@@ -281,7 +453,7 @@ public class GitHub {
 
     public boolean hasExactComment(Map<String, Object> pr, String body) {
         for (Object item : commentList(pr)) {
-            if (bodyOf(item).strip().equals(body)) {
+            if (withoutMarker(bodyOf(item)).equals(body)) {
                 return true;
             }
         }
@@ -296,7 +468,7 @@ public class GitHub {
             }
             String itemBody = bodyOf(item);
             String createdAt = comment.get("createdAt") == null ? "" : String.valueOf(comment.get("createdAt"));
-            if (itemBody.strip().equals(body) && createdAt.compareTo(timestamp) >= 0) {
+            if (withoutMarker(itemBody).equals(body) && createdAt.compareTo(timestamp) >= 0) {
                 return true;
             }
         }
@@ -312,6 +484,23 @@ public class GitHub {
      * avoids the "unknown flag: --json" failure on {@code gh pr create}.</p>
      */
     public Object createPr(String title, String body, String base, String head) {
+        mutationGuard.accept("create_pr");
+        return effect("create_pr", Map.of("title", title, "body", body, "base", base, "head", head), false,
+                key -> findCreatedPr(head, base, key), key -> createPrOnce(title, marked(body, key), base, head));
+    }
+
+    private Object findCreatedPr(String head, String base, String key) {
+        Object raw = run("pr", "list", "--repo", repo, "--state", "all", "--head", head, "--base", base,
+                "--limit", "100", "--json", "number,body");
+        if (!(raw instanceof List<?> prs)) throw new GitHubError("Cannot reconcile PR creation");
+        for (Object rawPr : prs) if (rawPr instanceof Map<?, ?> pr && bodyOf(pr).contains(marker(key))) {
+            return pr(((Number) pr.get("number")).intValue());
+        }
+        if (prs.size() >= 100) throw new GitHubError("PR creation read-back may be truncated");
+        return null;
+    }
+
+    private Object createPrOnce(String title, String body, String base, String head) {
         Object result = run("pr", "create", "--repo", repo, "--base", base, "--head", head,
                 "--title", title, "--body", body);
         String output = result instanceof Map ? String.valueOf(((Map<?, ?>) result).get("url"))
@@ -354,8 +543,22 @@ public class GitHub {
 
     /** Production runner: shells out to the configured CLI with a timeout. */
     static CommandRunner defaultRunner() {
+        return defaultRunner("GH_TOKEN");
+    }
+
+    static CommandRunner defaultRunner(String tokenName) {
         return (command, timeoutSeconds) -> {
             ProcessBuilder builder = new ProcessBuilder(command);
+            Map<String, String> env = builder.environment();
+            env.clear();
+            for (String key : List.of("PATH", "LANG", "LC_ALL", "GH_HOST")) {
+                String value = System.getenv(key);
+                if (value != null) env.put(key, value);
+            }
+            String token = System.getenv(tokenName);
+            if (token != null) env.put("GH_TOKEN", token);
+            env.put("HOME", "/nonexistent");
+            env.put("GH_PROMPT_DISABLED", "1");
             Process process;
             try {
                 process = builder.start();
@@ -368,14 +571,23 @@ public class GitHub {
             // waitFor() would deadlock. Reader threads consume in parallel.
             java.io.ByteArrayOutputStream outBuffer = new java.io.ByteArrayOutputStream();
             java.io.ByteArrayOutputStream errBuffer = new java.io.ByteArrayOutputStream();
-            Thread outReader = streamPump(process.getInputStream(), outBuffer);
-            Thread errReader = streamPump(process.getErrorStream(), errBuffer);
+            java.util.concurrent.atomic.AtomicBoolean overflow = new java.util.concurrent.atomic.AtomicBoolean();
+            Thread outReader = streamPump(process.getInputStream(), outBuffer, overflow);
+            Thread errReader = streamPump(process.getErrorStream(), errBuffer, overflow);
             outReader.start();
             errReader.start();
             try {
-                boolean finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS);
+                long deadline = System.nanoTime() + timeoutSeconds * 1_000_000_000L;
+                boolean finished = false;
+                while (System.nanoTime() < deadline && !overflow.get()) {
+                    if (process.waitFor(100, TimeUnit.MILLISECONDS)) { finished = true; break; }
+                }
+                if (overflow.get()) {
+                    killTree(process);
+                    throw new GitHubError("GitHub command output exceeded 8 MiB");
+                }
                 if (!finished) {
-                    process.destroyForcibly();
+                    killTree(process);
                     process.waitFor();
                     throw new CommandTimeout("command timed out");
                 }
@@ -386,21 +598,37 @@ public class GitHub {
                         outBuffer.toString(StandardCharsets.UTF_8),
                         errBuffer.toString(StandardCharsets.UTF_8));
             } catch (InterruptedException exc) {
-                process.destroyForcibly();
+                killTree(process);
                 Thread.currentThread().interrupt();
                 throw new GitHubError("interrupted while executing command", exc);
             }
         };
     }
 
+    private static void killTree(Process process) {
+        try (var descendants = process.descendants()) {
+            descendants.forEach(ProcessHandle::destroyForcibly);
+        }
+        process.destroyForcibly();
+    }
+
     /** A daemon thread that copies an input stream into a buffer until EOF. */
-    private static Thread streamPump(java.io.InputStream source, java.io.ByteArrayOutputStream sink) {
+    private static Thread streamPump(java.io.InputStream source, java.io.ByteArrayOutputStream sink,
+                                     java.util.concurrent.atomic.AtomicBoolean overflow) {
         Thread thread = new Thread(() -> {
             byte[] chunk = new byte[8192];
             int read;
             try {
                 while ((read = source.read(chunk)) != -1) {
-                    sink.write(chunk, 0, read);
+                    synchronized (sink) {
+                        int remaining = 8 * 1024 * 1024 - sink.size();
+                        if (read > remaining) {
+                            if (remaining > 0) sink.write(chunk, 0, remaining);
+                            overflow.set(true);
+                            return;
+                        }
+                        sink.write(chunk, 0, read);
+                    }
                 }
             } catch (IOException ignored) {
                 // Stream closed on process termination; stop draining.

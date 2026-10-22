@@ -17,6 +17,30 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class ParkPolicyTest {
 
+    @Test
+    void serialDeliveryKeepsUnfinishedOpenPrActive() {
+        Map<String, Object> workflow = map("terminal_policy", "park_and_advance",
+                "finish_open_pr_before_next_story", true);
+        assertThat(ParkPolicy.mayAdvance(workflow, map("current_pr", 219))).isFalse();
+        assertThat(ParkPolicy.mayAdvance(workflow, map())).isTrue();
+    }
+
+    @Test
+    void prioritizingLegacyParkedPrRestoresEvidenceWithoutInventingCompletion() {
+        Map<String, Object> state = map("current_pr", 219, "branch", "story/82-old",
+                "current_pr_head", "real-head", "held_failure", map("head", ""));
+        ParkPolicy.parkWithCheckpoint(state, 82, "", "review did not pass", "now");
+        state.clear();
+        Map<String, Object> checkpoint = map("current_pr", 219, "branch", "story/82-old",
+                "current_pr_head", "real-head", "held_failure", map("head", ""));
+        state.put("parked_stories", map("82", map("head", "", "checkpoint", checkpoint)));
+        ParkPolicy.resumeForOpenPr(state, 82);
+        assertThat(state).containsEntry("current_pr", 219).containsEntry("branch", "story/82-old");
+        assertThat(state).doesNotContainKeys("held_failure", "completed_stories");
+        assertThat(ParkPolicy.parkedStoryNumbers(state)).isEmpty();
+        assertThat(state).containsEntry("recovery_next_prompt", "prompts/reconcile.md");
+    }
+
     private static Map<String, Object> map(Object... kv) {
         Map<String, Object> m = new LinkedHashMap<>();
         for (int i = 0; i < kv.length; i += 2) {

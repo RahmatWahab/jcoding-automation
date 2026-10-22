@@ -32,7 +32,9 @@ public final class WorkflowStateCodec {
      * is the single definition previously duplicated inline in {@code advanceStory}.
      */
     public static final Set<String> STORY_SCOPED_KEYS = Set.of(
-            "worktree_recovery", "worktree_baseline", "base_branch",
+            "last_verified_delivery", "verification_mode", "verification_evidence", "goal_contract", "current_story_issue", "clarification", "clarification_answer", "requirements_changed", "plan_binding", "task_ledger", "task_ledger_history", "plan_replans_used", "replan_request",
+            "wait_observation", "recovery_strategy", "verification_failure",
+            "worktree_recovery", "worktree_baseline", "base_branch", "preflight_failure",
             "resume_guard_head", "resume_attempts",
             "resume_total_story", "resume_total_attempts",
             "resume_total_resolved_baseline",

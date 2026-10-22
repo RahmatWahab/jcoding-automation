@@ -130,14 +130,26 @@ public class CodexRunner {
         }
         String approvalPolicy = Engine.asString(codex.getOrDefault("approval_policy", "never"));
         boolean bypass = Engine.asBool(codex.get("dangerously_bypass_sandbox"), false);
-        if (approvalPolicy.equals("never") && !bypass) {
-            command.add("--approve-for-me");
+        boolean readOnly = Engine.asBool(codex.get("diagnostic_read_only"), false);
+        if (bypass && !readOnly) throw new IllegalArgumentException("Sandbox bypass is not supported for autonomous workers");
+        command.addAll(List.of("--sandbox", readOnly ? "read-only" : "workspace-write"));
+        // The outer bubblewrap shares networking only so the Codex process can
+        // reach its model endpoint. Tool subprocesses get an explicit no-network
+        // sandbox policy; do not inherit a permissive user-level Codex setting.
+        if (!readOnly) command.addAll(List.of("-c", "sandbox_workspace_write.network_access=false"));
+        command.addAll(List.of("--ask-for-approval", "never"));
+        if ("bubblewrap".equals(codex.get("isolation"))) {
+            command.addAll(List.of("-c", "model_provider=jcoding_scoped",
+                    "-c", "model_providers.jcoding_scoped.name=Jcoding",
+                    "-c", "model_providers.jcoding_scoped.base_url=http://127.0.0.1:18443/v1",
+                    "-c", "model_providers.jcoding_scoped.env_key=JCODING_RUN_TOKEN",
+                    "-c", "model_providers.jcoding_scoped.wire_api=responses",
+                    "-c", "model_providers.jcoding_scoped.requires_openai_auth=false",
+                    "-c", "model_providers.jcoding_scoped.request_max_retries=0",
+                    "-c", "model_providers.jcoding_scoped.supports_websockets=false"));
         }
         command.add("exec");
         command.add("--json");
-        if (bypass) {
-            command.add("--dangerously-bypass-approvals-and-sandbox");
-        }
         command.add("-");
         return command;
     }
@@ -200,12 +212,28 @@ public class CodexRunner {
 
         long deadline = monotonicMillis.get() + Math.max(0L, timeout) * 1000L;
         Process process;
+        WorkerIsolation isolation = null;
         try {
+            if ("bubblewrap".equals(codex.get("isolation"))) {
+                isolation = WorkerIsolation.create(true);
+                isolation.startGateway(codex, timeout);
+                command = isolation.wrap(command, repo, codex, true, Boolean.TRUE.equals(codex.get("diagnostic_read_only")));
+            }
             // A regular-file stdin cannot block this thread on a child that never reads.
-            process = new ProcessBuilder(command).directory(repo.toFile())
-                    .redirectInput(prompt.toFile())
-                    .redirectError(ProcessBuilder.Redirect.DISCARD).start();
-        } catch (IOException exc) {
+            ProcessBuilder builder = new ProcessBuilder(command).directory(repo.toFile()).redirectInput(prompt.toFile())
+                    .redirectError(ProcessBuilder.Redirect.DISCARD);
+            Map<String, String> cleanEnvironment = isolation == null
+                    ? WorkerIsolation.environment(System.getenv(), true) : isolation.modelEnvironment();
+            if (isolation == null) {
+                // Native sandbox is available for local development; production uses an isolated home.
+                cleanEnvironment.put("HOME", System.getProperty("user.home"));
+                if (System.getenv("CODEX_HOME") != null) cleanEnvironment.put("CODEX_HOME", System.getenv("CODEX_HOME"));
+            }
+            builder.environment().clear();
+            builder.environment().putAll(cleanEnvironment);
+            process = builder.start();
+        } catch (IOException | RuntimeException exc) {
+            if (isolation != null) isolation.close();
             log.info("CODEX END: unable to start executable={}", command.get(0));
             return new CodexResult(127, "", TokenUsage.unavailable(), redactSensitive(exc.getMessage()));
         }
@@ -240,12 +268,14 @@ public class CodexRunner {
             Thread.currentThread().interrupt();
             return events.result(130);
         } catch (RuntimeException failure) {
+            if (failure instanceof ActionPolicy.Cancelled cancelled) throw cancelled;
             log.warn("CODEX END: runner failed while supervising process", failure);
             CodexResult partial = events.result(125);
             return new CodexResult(125, partial.output(), partial.usage(),
                     redactSensitive("Codex runner supervision failed: " + failure.getMessage()));
         } finally {
             cleanup(process, owned);
+            if (isolation != null) isolation.close();
             // Never close a reader from the control thread: close can wait on its read lock.
             reader.interrupt();
         }

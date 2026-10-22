@@ -1,0 +1,114 @@
+#!/bin/sh
+# Offline business-suite guard. Git may inspect and mutate disposable fixtures,
+# but it must never touch the checkout containing this project or a real remote.
+set -eu
+
+REAL_GIT=/usr/bin/git
+cwd=$(pwd -P)
+target_cwd=$cwd
+expect_c_value=false
+expect_config_value=false
+expect_git_dir=false
+expect_work_tree=false
+target_git_dir=
+target_work_tree=
+command_name=
+
+for arg in "$@"; do
+  if [ "$expect_config_value" = true ]; then
+    case "$arg" in
+      remote.*.url=*)
+        printf '%s\n' "OFFLINE_TEST_GUARD: command-line remote override is forbidden" >&2
+        exit 125
+        ;;
+    esac
+    expect_config_value=false
+    continue
+  fi
+  if [ "$expect_git_dir" = true ]; then
+    case "$arg" in /*) target_git_dir=$(realpath -m "$arg");; *) target_git_dir=$(realpath -m "$cwd/$arg");; esac
+    expect_git_dir=false
+    continue
+  fi
+  if [ "$expect_work_tree" = true ]; then
+    case "$arg" in /*) target_work_tree=$(realpath -m "$arg");; *) target_work_tree=$(realpath -m "$cwd/$arg");; esac
+    expect_work_tree=false
+    continue
+  fi
+  if [ "$expect_c_value" = true ]; then
+    case "$arg" in
+      /*) target_cwd=$(realpath -m "$arg");;
+      *) target_cwd=$(realpath -m "$cwd/$arg");;
+    esac
+    expect_c_value=false
+    continue
+  fi
+  case "$arg" in
+    -C) expect_c_value=true; continue;;
+    -c|--config-env) expect_config_value=true; continue;;
+    --git-dir) expect_git_dir=true; continue;;
+    --git-dir=*) target_git_dir=$(realpath -m "${arg#--git-dir=}"); continue;;
+    --work-tree) expect_work_tree=true; continue;;
+    --work-tree=*) target_work_tree=$(realpath -m "${arg#--work-tree=}"); continue;;
+    --config-env=remote.*.url=*)
+      printf '%s\n' "OFFLINE_TEST_GUARD: redirected Git repository/config is forbidden" >&2
+      exit 125
+      ;;
+  esac
+  case "$arg" in
+    -*) ;;
+    *) if [ -z "$command_name" ]; then command_name=$arg; fi;;
+  esac
+done
+
+case "$target_cwd/" in
+  /tmp/*|/var/tmp/*) ;;
+  *)
+    printf '%s\n' "OFFLINE_TEST_GUARD: git outside temporary fixture directory: $target_cwd" >&2
+    exit 125
+    ;;
+esac
+
+for redirected in "$target_git_dir" "$target_work_tree"; do
+  [ -n "$redirected" ] || continue
+  case "$redirected/" in
+    /tmp/*|/var/tmp/*) ;;
+    *)
+      printf '%s\n' "OFFLINE_TEST_GUARD: redirected repository is outside temporary fixtures" >&2
+      exit 125
+      ;;
+  esac
+done
+
+for arg in "$@"; do
+  case "$arg" in
+    http://*|https://*|ssh://*|git://*|git@*:*)
+      printf '%s\n' "OFFLINE_TEST_GUARD: network Git URL is forbidden" >&2
+      exit 125
+      ;;
+  esac
+done
+
+case "$command_name" in
+  push|fetch|pull|ls-remote|clone)
+    origin=$($REAL_GIT -C "$target_cwd" remote get-url origin 2>/dev/null || true)
+    case "$origin" in
+      /*) remote=$(realpath -m "$origin");;
+      file://*) remote=$(realpath -m "${origin#file://}");;
+      "")
+        printf '%s\n' "OFFLINE_TEST_GUARD: remote operation without a local fixture origin" >&2
+        exit 125
+        ;;
+      *) remote=$(realpath -m "$cwd/$origin");;
+    esac
+    case "$remote/" in
+      /tmp/*|/var/tmp/*) ;;
+      *)
+        printf '%s\n' "OFFLINE_TEST_GUARD: non-temporary Git remote is forbidden" >&2
+        exit 125
+        ;;
+    esac
+    ;;
+esac
+
+exec "$REAL_GIT" "$@"

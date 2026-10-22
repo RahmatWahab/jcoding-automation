@@ -32,14 +32,112 @@ tasks.named("test") {
     useJUnitPlatform()
 }
 
+tasks.register("businessValueMockTest", Test) {
+    description = "Offline business-value and focused mock regression scenarios"
+    group = "verification"
+    useJUnitPlatform()
+    def offlineBin = file("scripts/tests/offline-bin").absolutePath
+    def isolatedGitConfig = file("${buildDir}/offline-business-test.gitconfig")
+    environment "PATH", offlineBin + File.pathSeparator + (System.getenv("PATH") ?: "")
+    ["GH_TOKEN", "GITHUB_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "OPENAI_API_KEY", "CODEX_API_KEY",
+     "ANTHROPIC_API_KEY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+     "AZURE_OPENAI_API_KEY", "GOOGLE_API_KEY", "GIT_ASKPASS", "SSH_ASKPASS"].each {
+        environment it, ""
+    }
+    environment "GIT_CONFIG_NOSYSTEM", "1"
+    environment "GIT_CONFIG_GLOBAL", isolatedGitConfig.absolutePath
+    environment "GIT_TERMINAL_PROMPT", "0"
+    environment "GIT_CEILING_DIRECTORIES", "/tmp:/var/tmp"
+    environment "GIT_ASKPASS", "/bin/false"
+    environment "SSH_ASKPASS", "/bin/false"
+    environment "HTTP_PROXY", "http://127.0.0.1:9"
+    environment "HTTPS_PROXY", "http://127.0.0.1:9"
+    environment "ALL_PROXY", "http://127.0.0.1:9"
+    environment "http_proxy", "http://127.0.0.1:9"
+    environment "https_proxy", "http://127.0.0.1:9"
+    environment "all_proxy", "http://127.0.0.1:9"
+    environment "NO_PROXY", ""
+    environment "no_proxy", ""
+    systemProperty "java.net.useSystemProxies", "false"
+    systemProperty "http.proxyHost", "127.0.0.1"
+    systemProperty "http.proxyPort", "9"
+    systemProperty "https.proxyHost", "127.0.0.1"
+    systemProperty "https.proxyPort", "9"
+    doFirst {
+        isolatedGitConfig.parentFile.mkdirs()
+        isolatedGitConfig.text = ""
+    }
+    filter {
+        includeTestsMatching "com.jcoding.workflow.LocalControllerAcceptanceTest"
+        includeTestsMatching "com.jcoding.workflow.AuditBusinessAcceptanceMockTest"
+        includeTestsMatching "com.jcoding.workflow.AutonomyBusinessValueMockTest"
+        includeTestsMatching "com.jcoding.workflow.WorkerToolBoundaryTest"
+        includeTestsMatching "com.jcoding.workflow.AuditFocusedRegressionMockTest"
+        includeTestsMatching "com.jcoding.workflow.AutonomyContractsTest"
+        includeTestsMatching "com.jcoding.workflow.RuntimeVerifierTest"
+        includeTestsMatching "com.jcoding.workflow.GitOperationsTest"
+        includeTestsMatching "com.jcoding.workflow.WorktreeRecoveryTest"
+        includeTestsMatching "com.jcoding.workflow.PreflightSupervisorIntegrationTest"
+        includeTestsMatching "com.jcoding.workflow.GitHubWorkerOrchestrationMockTest"
+        includeTestsMatching "com.jcoding.workflow.PreflightRecoveryTest"
+        includeTestsMatching "com.jcoding.github.GitHubTest"
+        includeTestsMatching "com.jcoding.state.StateStoreTest"
+    }
+}
+
+tasks.register("focusedMockRegressionTest", Test) {
+    description = "Compatibility alias for the complete offline mock regression suite"
+    group = "verification"
+    dependsOn "businessValueMockTest"
+}
+
 // R2 NFR: a method-length / complexity gate on the control path. Configured as
 // a reported quality signal (not a hard build break) so the documented
 // large-handler exceptions do not violate R8's "green on every step" while the
 // ~80-line ceiling is enforced and visible for new code.
 checkstyle {
     toolVersion = "10.20.1"
-    ignoreFailures = true
-    maxWarnings = Integer.MAX_VALUE
+    ignoreFailures = false
+    maxWarnings = 0
     configFile = file("config/checkstyle/checkstyle.xml")
 }
 tasks.named("checkstyleTest") { enabled = false }
+
+// All runtime scenarios use local fixtures/fakes; this task never contacts a model or GitHub.
+tasks.register("runtimeBusinessMockTest", Exec) {
+    commandLine "bash", "scripts/tests/run_once_test.sh"
+}
+tasks.register("autonomyReleaseGate") {
+    group = "verification"
+    description = "Run only the offline business-value mock test suite"
+    dependsOn "businessValueMockTest"
+    doLast {
+        def reports = fileTree("${buildDir}/test-results/businessValueMockTest") { include "TEST-*.xml" }
+        if (reports.isEmpty()) throw new GradleException("Missing business scenario evidence")
+        int total = 0
+        reports.each { report ->
+            def factory = javax.xml.parsers.DocumentBuilderFactory.newInstance()
+            factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+            def suite = factory.newDocumentBuilder().parse(report).documentElement
+            total += Integer.parseInt(suite.getAttribute("tests"))
+            ["failures", "errors", "skipped"].each { metric ->
+                def value = suite.getAttribute(metric)
+                if (value && Integer.parseInt(value) != 0) throw new GradleException("Scenario gate failed: ${metric} in ${report.name}")
+            }
+        }
+        if (total == 0) throw new GradleException("No business scenarios executed")
+        def businessReport = file("${buildDir}/test-results/businessValueMockTest/TEST-com.jcoding.workflow.AutonomyBusinessValueMockTest.xml")
+        if (!businessReport.exists()) throw new GradleException("Autonomy business-value scenarios were not executed")
+        def businessSuite = javax.xml.parsers.DocumentBuilderFactory.newInstance()
+                .newDocumentBuilder().parse(businessReport).documentElement
+        if (Integer.parseInt(businessSuite.getAttribute("tests")) < 8) {
+            throw new GradleException("Autonomy business-value scenario coverage is incomplete")
+        }
+        def receipt = file("${buildDir}/reports/autonomy-gate.json")
+        receipt.parentFile.mkdirs()
+        receipt.text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson([
+            status: "PASSED", tests: total, failures: 0, errors: 0, skipped: 0,
+            recorded_at: java.time.Instant.now().toString(), mode: "OFFLINE_MOCKS"
+        ]))
+    }
+}

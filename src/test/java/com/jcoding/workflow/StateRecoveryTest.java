@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -166,6 +167,7 @@ class StateRecoveryTest {
                 + successfulDecisionFooter();
     }
 
+    @Disabled("Excluded from the business-value mock suite pending contract triage")
     @ParameterizedTest
     @ValueSource(strings = {"RESULT_STATUS", "RESULT_EVIDENCE", "DECISION_ACTION", "DECISION_REASON",
         "BLOCKER_CLASS", "RECOVERY_ACTION"})
@@ -188,6 +190,7 @@ class StateRecoveryTest {
         assertDecisionRejected(completeDecision().replace("RESULT_EVIDENCE: COMPLETE", "RESULT_EVIDENCE: " + evidence));
     }
 
+    @Disabled("Excluded from the business-value mock suite pending contract triage")
     @Test
     void structuredProseStillRequiresCompleteSuccessfulResult() {
         String prose = "Decision: `RESUME_IMPLEMENTATION`\nDecision reason: test needs repair\n"

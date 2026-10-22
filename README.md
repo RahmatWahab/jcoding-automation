@@ -3,11 +3,12 @@
 A stateful, cron-driven controller for bounded Codex CLI coding workflows,
 implemented in Java 21. It drives a full software-delivery loop against a single
 GitHub EPIC: it selects a linked story, runs the Codex CLI as a bounded worker
-to implement, verify, and review it, opens a pull request, manages the review
-cycle, and gates the final merge behind a human.
+to implement, independently verify, and review it, opens a pull request, and
+manages the review cycle. Final merge is either held for a human or performed
+under the configured evidence and mutation gates.
 
 The controller owns all authority — scheduling, locking, durable state, GitHub
-reconciliation, and the manual-merge gate. Codex runs only as a constrained,
+reconciliation, and the merge gate. Codex runs only as a constrained,
 time-boxed worker.
 
 ## Requirements
@@ -20,6 +21,7 @@ time-boxed worker.
 | `jq` | JSON parsing in the cron/install scripts |
 | `flock`, `setsid` | Lock and isolated process handling (Linux) |
 | `codex` | The Codex CLI worker executable |
+| `bwrap`, Python 3 | Private-network worker and scoped model gateway |
 
 No network access is required to build or test the project; the test suite is
 fully offline and does not contact GitHub or launch `codex`.
@@ -55,8 +57,10 @@ All configuration is JSON.
    The merge policy is the single flag `workflow.auto_merge` (default `false`).
    When `false`, the controller never merges: it posts a `READY TO MERGE`
    comment on a ready PR and waits for a maintainer to merge. When `true`, the
-   controller merges a ready PR itself — clean Codex review, green CI, no
-   unresolved threads — and advances to the next story (fully autonomous).
+   controller may merge only after independent configured verification, required
+   CI, review, and unresolved-thread gates pass, and only if the PR head still
+   matches the verified delivery. This flag does not bypass repository branch
+   protection or any other gate.
 
 2. `config/job-control.json` — the execution gate:
 
@@ -111,7 +115,49 @@ build/install/jcoding-automation/bin/jcoding-automation \
   --config config/config.json --job-control config/job-control.json
 ```
 
-Command-line options: `--config`, `--job-control`, `--prompt`, `--force-run`.
+Command-line options: `--config`, `--job-control`, `--prompt`, `--force-run`,
+`--readiness`, `--provider-canary`, `--list-effects`, `--retry-effect`, and
+`--effect-reason`.
+
+For unattended operation, declare one registered intent on each story with an
+`intent:implement_story` or `intent:repair_story` label, or a `jcoding-intent`
+JSON block in the issue body. An absent or conflicting intent blocks the story
+for clarification. An explicit `intent.default_intent` is available for a
+repository whose stories all use the same contract. Acceptance criteria must
+have IDs and each configured executable verifier must list the IDs it covers.
+The controller executes each planned task in order, persists task checkpoints,
+and verifies its result before advancing. The final delivery gate reruns the
+full configured verification.
+
+The example configuration intentionally lacks repository-specific checks and
+CI names. Before a live run, provide `verification.checks` with executable
+commands and `criteria` mappings, plus `workflow.required_checks` with exact
+GitHub check names. Supply `OPENAI_API_KEY` (or the environment variable named
+by `codex.gateway.credential_environment_variable`) to the controller only.
+The isolated worker receives a short-lived gateway token, not that credential.
+
+Use `deployment.mode: canary` with `deployment.canary_story` set to one story
+number and `workflow.auto_merge: false` for the first controlled integration
+run. Inspect `--readiness`, run the explicit read-only `--provider-canary`,
+and require the offline `autonomyReleaseGate` before the
+canary. The canary records a receipt after executable verification, CI, and
+review gates pass. Only then change `deployment.mode` to `autonomous`; any
+change to the bound policy, runtime, model, or verifier invalidates the receipt.
+The provider canary makes two bounded model calls: one validates streaming and
+credential isolation in the private-network gateway, and one validates the
+actual Codex CLI provider configuration. It writes only controller state and
+expires after `deployment.provider_canary_valid_hours` (default 24).
+Repository branch protection must require the `Business value mocks and static
+policy` check. Run `scripts/check-release-protection.sh main` after configuring
+that rule in GitHub; the script is read-only and fails if the check is absent.
+
+An uncertain external mutation is listed with `--list-effects`. After checking
+the remote issue, PR, or thread and proving the effect absent, an operator may
+use `--retry-effect <sha256-key> --effect-reason '<evidence>'`. That one-shot
+grant is consumed before the retry; the controller still performs remote
+read-back before it acts. Issue clarification can also be answered by a full
+`jcoding-intent` JSON block in a maintainer comment containing the exact
+`jcoding-answer` marker printed in the controller's clarification request.
 
 ### First run (recommended: dry-run)
 
@@ -157,7 +203,7 @@ What each flag unlocks (all default to `false`):
 | `allow_comments` | posting the `@codex review` trigger and fix replies |
 | `allow_thread_resolution` | resolving review threads after a verified fix |
 | `automation.max_feedback_batch_size` | maximum number of compatible unresolved findings revalidated and fixed in one worker execution (default `3`) |
-| `auto_merge` | merge policy (single flag). `false` (default): the controller never merges — it posts `READY TO MERGE` and waits for a maintainer. `true`: fully autonomous — the controller merges a ready PR itself (clean Codex review + green CI + no unresolved threads) and advances to the next story. It never force-merges: a conflicting PR is routed to reconciliation to rebase/resolve, pending mergeability waits and retries, and branch-protection blocks are surfaced (never bypassed). Optional `merge_method` selects `squash` (default), `merge`, or `rebase` — the method must be enabled in the repo's merge settings. |
+| `auto_merge` | merge policy (single flag). `false` (default): the controller never merges — it posts `READY TO MERGE` and waits for a maintainer. `true`: the controller merges only after configured executable verification, required CI, clean review, no unresolved threads, and a verified PR head that still matches at merge time. Missing checks or verification configuration fail closed. It never force-merges or bypasses branch protection. Optional `merge_method` selects `squash` (default), `merge`, or `rebase` — the method must be enabled in the repo's merge settings. |
 | `internal_review` | pre-commit specialist review gate (default `false`). When `true`, after a worker `SUCCESS` on an implement/feedback phase the controller runs a sequential panel of specialist reviews (general, test, and — diff-gated — simplification, architecture, security, performance, database, deployment, resilience) against the **local, uncommitted diff** before committing/pushing. Each specialist runs review → bounded fix → re-review; issues are caught privately instead of surfacing as post-PR Codex review threads. Fully autonomous and bounded: a specialist that cannot be satisfied within `automation.internal_review_max_fix_attempts` (default `2`) is carried forward as advisory and delivery still proceeds — the post-PR Codex review remains the final authority. Requires `allow_push`/`allow_pr_creation` for the eventual delivery; under `dry_run` it makes no mutations. |
 
 and in `config/job-control.json`:
@@ -166,11 +212,20 @@ and in `config/job-control.json`:
 { "job_start": true }
 ```
 
-> **Commits only happen with `dry_run: false` and `allow_push: true`.** Under
-> `dry_run: true` (or with `allow_push: false`) the worker may edit files, but
-> the controller never commits or pushes them — the working tree changes are
-> intentionally left uncommitted. If you observe a fix that never lands on the
-> PR, verify these two flags first.
+> **Commits only happen with `dry_run: false` and `allow_push: true`.** A
+> mutating worker proposes typed file operations from a read-only sandbox. The
+> controller applies authorized operations in its isolated worktree, then checks
+> the configured verification commands. Dry runs cannot apply worker edits.
+
+For a local request, pass `--request-file /absolute/path/request.json`. The
+JSON needs a title and acceptance criteria (`[{"id":"AC-1","text":"..."}]`),
+and may include stable requirement IDs and `supersedes`. With `dry_run: false`,
+Bubblewrap isolation, and configured verifier checks, the controller writes
+`state/local-result-<story>.json` and a content bundle in `state/`. It never
+pushes a local request. An interrupted request resumes from SQLite; an ambiguous
+partially applied tool effect blocks for inspection. The configured repository
+is used only as the source of a persistent sibling worktree, so staged,
+unstaged, and untracked edits in the operator checkout remain untouched.
 
 ### Internal review gate (pre-commit specialist review)
 
@@ -201,6 +256,43 @@ Each specialist is a prompt pair under `prompts/` (`review-<name>.md` and
 per relevant specialist per story (plus fix passes when findings are raised), so
 it trades extra worker time for fewer post-PR review threads.
 
+### Intent, plans, and independent verification
+
+Each selected issue is captured as a versioned goal contract containing the
+repository, issue, full requirements, acceptance criteria, questions, controller
+permissions, allowed actions, and a requirements hash. The worker cannot expand
+that authority. A fenced `jcoding-intent` JSON block may declare an intent and
+criteria; supported intents are `implement_story` and `repair_story`. Unknown
+intents and missing required criteria enter `BLOCKED_REQUIREMENTS` with a
+clarification request rather than being guessed at. Requirement edits invalidate
+the saved plan and verification evidence.
+
+When planning is enabled, a schema-versioned `plan.json` must bind to the story,
+requirements hash, and base revision. Its dependency graph must be acyclic and
+its tasks must cover the acceptance criteria and configured check IDs. Planning
+success only authorizes implementation planning; it never authorizes delivery.
+
+Delivery requires independently executed commands listed in
+`verification.checks`, each with a stable ID and command. Configure meaningful
+checks and any required GitHub `workflow.required_checks` before enabling push or
+merge. Checks run with a bounded timeout and output, restricted filesystem view,
+and no network; evidence is tied to the source revision and policy hash. The
+verifier also enforces allowed/protected paths and a changed-file ceiling. With
+the template's empty check list, required verification intentionally blocks
+delivery until checks are configured. A worker's `SUCCESS` response is never a
+substitute for executable evidence.
+
+Worker isolation defaults to Bubblewrap in the example configuration. Install
+`bwrap` and ensure the host permits its user and network namespaces. If the
+isolation cannot be established, the worker fails closed. `native` isolation is
+available for controlled development only; use it only where the host boundary
+is already trusted. Worker processes do not receive GitHub delivery credentials.
+
+The intent contract and plan are durable in the existing story state, while
+verification evidence is revision-bound. The controller resumes from persisted
+wait deadlines and recovery budgets, honors job cancellation at action
+boundaries, and changes recovery strategy without relaxing permissions.
+
 ### Worker budgets and recovery
 
 Every model call, including supervisor and specialist calls, is counted against
@@ -218,6 +310,37 @@ diagnostics. Per-call duration, prompt size, exit code, token usage, redacted
 output, and diagnostics are stored in SQLite's `worker_usage` table. This makes
 token/time comparisons auditable and separates the model's final answer from
 tool chatter.
+
+### Worktree handoff and preflight recovery
+
+Parking a story preserves staged, unstaged, and untracked source changes in a
+local Git stash pinned by `refs/jcoding/checkpoints/story-<number>-<id>` before
+clearing its active state. `.codex/` metadata stays in place. The durable
+`worktree_checkpoints` journal records ownership, base commit, paths, backup ref,
+and capture/restore status. Existing parked runs are recovered the same way
+before branch checkout. Backups are never pushed or automatically dropped.
+
+On resuming the original story, its checkpoint is restored only on the recorded
+branch and base commit. Interrupted captures are recovered from the named stash;
+interrupted restores and changed bases require inspection when exact restoration
+cannot be established. Unowned changes are never carried to a different branch
+or silently hidden in an anonymous stash.
+
+If preparation is still blocked, a separate **read-only preflight supervisor**
+runs without first requiring a writable story worktree. It receives the actual
+and expected branch, persisted blocker, story/PR context, and previous diagnosis.
+It cannot authorize delivery or waive a guard. The controller records its root
+cause and next action in `preflight_failure`, then rechecks the prerequisite on
+the next tick. Known parked-work handoffs recover automatically; ambiguous work,
+changed-base restoration, and unavailable prerequisites remain protected.
+
+`automation.max_preflight_diagnoses` defaults to `2`, with
+`automation.preflight_diagnosis_seconds` defaulting to `120` per call, also subject
+to the cumulative story budget. Unchanged failures then enter
+`WAIT_FOR_PREFLIGHT_EVIDENCE` without further model calls. Changed branch, worktree,
+blocker, or configuration wakes diagnosis; operators can increment
+`automation.recovery_epoch` after repairing an external prerequisite. GitHub
+read success alone no longer erases the original blocker.
 
 ### Delivery recovery
 
@@ -304,8 +427,8 @@ within the phase budget. In that case the worker returns
 `RESULT_NEXT_PHASE: WAITING_FOR_CI`. The controller then commits and pushes the
 fix and waits for CI to complete the remaining lane, instead of looping on an
 unvalidated-but-uncommitted change. CI and review still gate the PR, and the
-manual-merge gate is preserved — the automation never merges. A worker must use
-`DEFERRED_TO_CI` only when the fix itself is proven by the strongest safe
+configured merge policy remains in force. A worker must use `DEFERRED_TO_CI`
+only when the fix itself is proven by the strongest safe
 in-budget substitute; an unproven fix must report `BLOCKED`.
 
 Recovery is bounded and evidence-gated. Repeated resume decisions never count

@@ -8,6 +8,9 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.security.SecureRandom;
 import java.time.Duration;
 import java.time.OffsetDateTime;
@@ -48,9 +51,11 @@ public final class WorkflowLock {
     private static final SecureRandom RANDOM = new SecureRandom();
 
     private final Path path;
+    private final String acquiredToken;
 
-    private WorkflowLock(Path path) {
+    private WorkflowLock(Path path, String acquiredToken) {
         this.path = path;
+        this.acquiredToken = acquiredToken;
     }
 
     public Path path() {
@@ -85,14 +90,21 @@ public final class WorkflowLock {
             throw new UncheckedIOException(exc);
         }
 
-        if (!tryMakeDir(path)) {
-            Optional<WorkflowLock> recovered = recoverIfStale(path, staleSeconds);
-            if (recovered.isEmpty()) {
-                return null;
+        Path guard = Path.of(path + ".recovery.guard");
+        try (FileChannel channel = FileChannel.open(guard, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+             FileLock ignored = channel.lock()) {
+            if (!tryMakeDir(path)) {
+                Optional<WorkflowLock> recovered = recoverIfStale(path, staleSeconds);
+                if (recovered.isEmpty()) return null;
             }
+            Map<String, Object> metadata = ownerMetadata();
+            writeOwner(path, metadata);
+            return new WorkflowLock(path, String.valueOf(metadata.get("owner_token")));
+        } catch (IOException exc) {
+            throw new UncheckedIOException(exc);
+        } catch (java.nio.channels.OverlappingFileLockException busy) {
+            return null;
         }
-        writeOwner(path, ownerMetadata());
-        return new WorkflowLock(path);
     }
 
     private static Map<String, Object> ownerMetadata() {
@@ -152,7 +164,7 @@ public final class WorkflowLock {
         } catch (IOException exc) {
             return Optional.empty();
         }
-        return Optional.of(new WorkflowLock(path));
+        return Optional.of(new WorkflowLock(path, ""));
     }
 
     /** Refresh ownership heartbeat without replacing the lock directory. */
@@ -175,7 +187,7 @@ public final class WorkflowLock {
         }
         Long ownerPid = asLong(owner.get("pid"));
         if (ownerPid == null || ownerPid != ProcessHandle.current().pid()
-                || owner.get("owner_token") == null) {
+                || !acquiredToken.equals(owner.get("owner_token"))) {
             throw new LockOwnershipLost("workflow lock ownership changed");
         }
         owner.put("heartbeat_at", now());
@@ -189,8 +201,8 @@ public final class WorkflowLock {
             Map<String, Object> owner = MAPPER.readValue(Files.readString(ownerFile), MAP_TYPE);
             Long ownerPid = asLong(owner.get("pid"));
             if (ownerPid == null || ownerPid != ProcessHandle.current().pid()
-                    || owner.get("owner_token") == null
-                    || (ownerToken != null && !ownerToken.equals(owner.get("owner_token")))) {
+                    || !acquiredToken.equals(owner.get("owner_token"))
+                    || (ownerToken != null && !ownerToken.equals(acquiredToken))) {
                 return;
             }
             Files.deleteIfExists(ownerFile);
@@ -206,13 +218,7 @@ public final class WorkflowLock {
 
     /** The current owner token, for verification and scoped release. */
     public String ownerToken() {
-        try {
-            Map<String, Object> owner = MAPPER.readValue(
-                    Files.readString(path.resolve("owner.json")), MAP_TYPE);
-            return String.valueOf(owner.get("owner_token"));
-        } catch (IOException exc) {
-            throw new UncheckedIOException(exc);
-        }
+        return acquiredToken;
     }
 
     // -- helpers -------------------------------------------------------------

@@ -27,6 +27,26 @@ class StateStoreTest {
     }
 
     @Test
+    void evaluationMetricsAggregateTrialsAndKeepMissingUsageUnknown(@TempDir Path tmp) {
+        StateStore store = new StateStore(tmp.resolve("metrics.json"));
+        store.recordEvaluationRun("trial-1", "offline-v1", "local-small", "PASSED",
+                "req-1", "src-1", 2, 1200, 100L, 30L, 1, "recovered once");
+        store.recordEvaluationRun("trial-2", "offline-v1", "local-small", "BLOCKED",
+                "req-1", "src-2", 1, 800, null, null, 0, "missing provider usage");
+        var summary = store.evaluationSummary("offline-v1");
+        assertThat(summary).hasSize(2);
+        assertThat(summary).anySatisfy(row -> assertThat(row).containsEntry("status", "PASSED")
+                .containsEntry("trials", 1).containsEntry("input_tokens", 100L));
+        assertThat(summary).anySatisfy(row -> assertThat(row).containsEntry("status", "BLOCKED")
+                .containsEntry("input_tokens", "unavailable"));
+        Map<String, Object> report = store.evaluationReport("offline-v1");
+        assertThat(report).containsEntry("trials", 2).containsEntry("passed", 1)
+                .containsEntry("blocked", 1).containsEntry("success_rate", 0.5)
+                .containsEntry("regression_rate", 0.0).containsEntry("token_usage", "unavailable")
+                .containsEntry("worker_calls", 3L).containsEntry("recovery_count", 1L);
+    }
+
+    @Test
     void stateStoreIsTransactionalAndKeepsJsonExport(@TempDir Path tmp) throws Exception {
         Path path = tmp.resolve("epic-1.json");
         StateStore store = new StateStore(path);
@@ -40,6 +60,13 @@ class StateStoreTest {
         assertThat(readJson(path).get("current_story")).isEqualTo(12);
         assertThat(Files.exists(store.dbPath())).isTrue();
         assertThat(Files.readString(store.eventPath())).contains("PHASE_CHANGED");
+        assertThat(Files.getPosixFilePermissions(tmp)).containsExactlyInAnyOrder(
+                java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,
+                java.nio.file.attribute.PosixFilePermission.OWNER_EXECUTE);
+        assertThat(Files.getPosixFilePermissions(store.dbPath())).containsExactlyInAnyOrder(
+                java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                java.nio.file.attribute.PosixFilePermission.OWNER_WRITE);
     }
 
     @Test

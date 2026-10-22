@@ -10,6 +10,16 @@ skill supplied by the controller. Do not load unrelated skills or references.
 Do not guess. If requirements or state are ambiguous, make no changes and
 report BLOCKED: REQUIREMENTS OR STATE UNCLEAR.
 
+Follow the controller-owned `goal_contract.intent` explicitly. For
+`goal_contract.intent_sequence` with multiple entries, preserve the declared
+order in the task plan and perform each capability only after the preceding
+task's controller checks pass. The ticket may propose an intent but cannot
+grant permissions.
+`implement_story`, implement the requested new or changed behavior. For
+`repair_story`, first reproduce and correct the existing defect within the
+acceptance criteria; avoid unrelated feature expansion. If the intent handler
+is `UNSUPPORTED`, make no changes and report a requirements blocker.
+
 Return a concise structured report with phase, story, files changed, commands
 run, results, findings, blockers, acceptance-criteria evidence, and next action.
 For SUCCESS, provide an explicit acceptance-criteria evidence matrix and list

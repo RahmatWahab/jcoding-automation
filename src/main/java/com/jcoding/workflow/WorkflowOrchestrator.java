@@ -47,12 +47,23 @@ final class WorkflowOrchestrator {
     private final Map<String, Object> workflow;
     private long phaseDeadlineNanos;
     private int callSequence;
+    private final ActionPolicy actionPolicy;
+    private final RuntimeVerifier verifier;
 
     WorkflowOrchestrator(Map<String, Object> config, Map<String, Object> state, StateStore store,
                          GitHub github, Path repo, Path root, Map<String, Object> epic, int epicNumber,
                          boolean dryRun, Controller.GitOperationsFactory gitFactory,
                          CodexRunner codexRunner, ReviewCoordinator review, WorkflowLock lock) {
+        this(config, state, store, github, repo, root, epic, epicNumber, dryRun, gitFactory,
+                codexRunner, review, lock, RuntimeVerifier.isolated(config));
+    }
+
+    WorkflowOrchestrator(Map<String, Object> config, Map<String, Object> state, StateStore store,
+                         GitHub github, Path repo, Path root, Map<String, Object> epic, int epicNumber,
+                         boolean dryRun, Controller.GitOperationsFactory gitFactory,
+                         CodexRunner codexRunner, ReviewCoordinator review, WorkflowLock lock, RuntimeVerifier verifier) {
         this.config = config;
+        this.verifier = verifier;
         this.state = state;
         this.store = store;
         this.github = github;
@@ -67,25 +78,78 @@ final class WorkflowOrchestrator {
         this.lock = lock;
         this.automation = Config.section(config, "automation");
         this.workflow = Config.section(config, "workflow");
+        this.actionPolicy = new ActionPolicy(config, dryRun);
+        if (!dryRun && Files.isDirectory(repo)) {
+            try {
+                IsolatedCheckout.recordLifecycle(repo, "ACTIVE");
+            } catch (RuntimeException exc) {
+                // The GitHub worker path is only valid inside its persisted, owned checkout.
+                if (state.get("worker_checkout_owner") instanceof Map<?, ?>) throw exc;
+            }
+        }
+        github.cancellationCheck(actionPolicy::checkActive);
+        github.intentIdentity(() -> GoalContract.requirementsHash(state));
+        github.effectStore(store);
+        github.mutationGuard(action -> {
+            validateTransition();
+            DeploymentPolicy.admit(config, state, state.get("current_story") == null ? null : Engine.asInt(state.get("current_story")));
+            actionPolicy.require(action);
+        });
+    }
+
+    private void validateTransition() {
+        String phase = Engine.asString(state.get("phase"));
+        String previous = Engine.asString(state.get("last_persisted_phase"));
+        if (!WorkflowMachine.KNOWN_PHASES.contains(phase)) throw new IllegalStateException("Unknown workflow phase: " + phase);
+        if (!previous.isBlank()) WorkflowMachine.requireLegalTransition(previous, phase);
+    }
+
+    private GitOperations git() {
+        Set<String> owned = new java.util.HashSet<>();
+        if (Engine.asString(state.get("worker_owned_story")).equals(Engine.asString(state.get("current_story")))
+                && Engine.asString(state.get("worker_owned_branch")).equals(Engine.asString(state.get("branch")))) {
+            for (Object path : Engine.asList(state.get("worker_owned_paths"))) owned.add(String.valueOf(path));
+        }
+        Map<String, Object> repository = Config.section(config, "repository");
+        Map<String, Object> github = Config.section(config, "github");
+        return gitFactory.create().effectStore(store).cancellationCheck(actionPolicy::checkActive)
+                .githubCredentials(Engine.asString(github.getOrDefault("token_environment_variable", "GH_TOKEN")),
+                        Engine.asString(github.getOrDefault("host", "github.com")),
+                        Engine.asString(repository.get("owner")) + "/" + Engine.asString(repository.get("name")))
+                .authorizedPaths(owned)
+                .protectedPaths(Engine.asList(Config.section(config, "verification")
+                        .getOrDefault("protected_paths", List.of(".github/**", "config/**", "prompts/**"))))
+                .intentIdentity(() -> GoalContract.requirementsHash(state)).mutationGuard(() -> {
+            validateTransition();
+            DeploymentPolicy.admit(config, state, state.get("current_story") == null ? null : Engine.asInt(state.get("current_story")));
+            actionPolicy.require("git");
+        });
     }
 
     private void save() {
-        // R1 transition enforcement: an undeclared phase transition is surfaced
-        // as a detectable event, not silent behavior. It is logged (not thrown)
-        // so a table gap can never destabilize the live control path; the
-        // WorkflowMachine table is the authority the WARN is checked against.
         String newPhase = Engine.asString(state.get("phase"));
         String lastPhase = Engine.asString(state.get("last_persisted_phase"));
-        if (!lastPhase.isEmpty() && !newPhase.isEmpty()
-                && !WorkflowMachine.isLegalTransition(lastPhase, newPhase)) {
-            log.warn("ILLEGAL_TRANSITION: undeclared phase transition {} -> {} "
-                    + "(not in the WorkflowMachine table)", lastPhase, newPhase);
-        }
+        if (!WorkflowMachine.KNOWN_PHASES.contains(newPhase)) throw new IllegalStateException("Unknown workflow phase: " + newPhase);
+        if (!lastPhase.isEmpty()) WorkflowMachine.requireLegalTransition(lastPhase, newPhase);
         state.put("last_persisted_phase", newPhase);
+        lock.refresh();
         store.save(state);
     }
 
     int reconcileAndExecute(List<Map<String, Object>> prs, String forcedPrompt) {
+        try {
+            return executeTick(prs, forcedPrompt);
+        } finally {
+            // A completed decision can select IMPLEMENTING for the next tick;
+            // that does not mean a worker is still running in this process.
+            lock.refresh();
+            state.put("worker_status", "IDLE");
+            state.put("run_finished_at", Controller.now());
+            save();
+        }
+    }
+
+    private int executeTick(List<Map<String, Object>> prs, String forcedPrompt) {
         // R3: read control-relevant state through the typed model rather than
         // ad-hoc string keys. The codec is the single typed view over the durable
         // map (backward compatible; unknown keys preserved on write).
@@ -102,6 +166,29 @@ final class WorkflowOrchestrator {
         }
         current = selection.current();
         currentPr = selection.currentPr();
+        if (!dryRun) {
+            try { DeploymentPolicy.admit(config, state, current); }
+            catch (IllegalStateException exc) {
+                state.put("phase", "BLOCKED_CONFIGURATION");
+                state.put("error", exc.getMessage());
+                save();
+                return 1;
+            }
+        }
+        // A dry run with no PR remains a selection-only observation. With an
+        // existing PR, continue through read-only reconciliation so durable
+        // blockers and review/CI gates are still classified accurately.
+        if (dryRun && currentPr == null) {
+            state.put("next_action", "DRY_RUN_OBSERVATION_ONLY");
+            save();
+            return 0;
+        }
+
+        // Retry deterministic preflight recovery before PR feedback, held-story gates,
+        // or another generic escalation can overwrite the original diagnosis.
+        if (state.get("preflight_failure") instanceof Map<?, ?>) {
+            return runWorkerPhase(current, currentPr, List.of(), "prompts/reconcile.md");
+        }
 
         // A delivery failure takes priority over PR feedback/wait classification.
         // Otherwise the next tick erases the blocker and repeats the same work.
@@ -110,9 +197,10 @@ final class WorkflowOrchestrator {
         }
         if (state.get("held_failure") instanceof Map<?, ?> held) {
             String head = currentPr == null ? "" : Engine.asString(currentPr.get("headRefOid"));
-            String evidence = gitFactory.create().recoveryFingerprint();
+            String evidence = git().recoveryFingerprint();
             if (head.equals(Engine.asString(held.get("head")))
-                    && evidence.equals(Engine.asString(held.get("evidence")))) {
+                    && evidence.equals(Engine.asString(held.get("evidence")))
+                    && Engine.asLongOrDefault(automation.get("recovery_epoch"), 0) <= Engine.asLongOrDefault(held.get("recovery_epoch"), 0)) {
                 return 1;
             }
             state.remove("held_failure");
@@ -134,6 +222,11 @@ final class WorkflowOrchestrator {
             return prScoped.exitCode();
         }
         currentPr = prScoped.currentPr();
+        if (dryRun) {
+            state.put("next_action", "DRY_RUN_OBSERVATION_ONLY");
+            save();
+            return 0;
+        }
 
         // Generic deviation supervisor (Requirement 2): detect any deviation/
         // stall and either recover deterministically (returning an exit code) or
@@ -143,6 +236,16 @@ final class WorkflowOrchestrator {
             return deviationResult.exitCode();
         }
         forcedPrompt = deviationResult.forcedPrompt();
+        String strategy = Engine.asString(state.get("recovery_strategy"));
+        if (feedbackToResolve.isEmpty() && (forcedPrompt == null || forcedPrompt.isBlank())
+                && ("TEST_ALTERNATIVE_HYPOTHESIS".equals(strategy) || "REPLAN_OR_ESCALATE".equals(strategy))) {
+            forcedPrompt = "REPLAN_OR_ESCALATE".equals(strategy) && currentPr == null
+                    && Engine.asBool(automation.get("enable_planning"), false)
+                    ? "prompts/plan.md" : "prompts/reconcile.md";
+            state.put("recovery_routing_reason", strategy);
+            state.remove("recovery_strategy"); // each adaptive decision is consumed once
+            save();
+        }
         return runWorkerPhase(current, currentPr, feedbackToResolve, forcedPrompt);
     }
 
@@ -162,7 +265,7 @@ final class WorkflowOrchestrator {
                 return 0;
             }
         }
-        GitOperations git = gitFactory.create();
+        GitOperations git = git();
         Map<String, Object> failure = DeliveryRecovery.failure(state);
         String evidence = git.recoveryFingerprint() + ":"
                 + (currentPr == null ? "" : Engine.asString(currentPr.get("headRefOid")));
@@ -231,6 +334,8 @@ final class WorkflowOrchestrator {
             } catch (GitHubError exc) {
                 return PrScopedResult.exit(blockedExternal("Unable to inspect PR: " + exc.getMessage()));
             }
+            currentPr.put("requiredChecks", workflow.getOrDefault("required_checks", List.of()));
+            currentPr.put("allowNoChecks", workflow.getOrDefault("allow_no_checks", false));
             state.put("current_pr_head", currentPr.get("headRefOid"));
             state.put("pr_state", currentPr.get("state"));
             state.put("pr_review_decision", currentPr.get("reviewDecision"));
@@ -258,7 +363,7 @@ final class WorkflowOrchestrator {
             // Crash recovery: if a previous run posted a fix reply on the
             // current head but crashed before resolving, complete only that
             // already-delivered resolution.
-            if (Engine.asBool(workflow.get("allow_thread_resolution"), false)
+            if (!dryRun && Engine.asBool(workflow.get("allow_thread_resolution"), false)
                     && "OPEN".equals(Engine.asString(currentPr.get("state")).toUpperCase())) {
                 for (Object threadObj : Engine.asList(currentPr.get("reviewThreads"))) {
                     if (!(threadObj instanceof Map<?, ?> t)) {
@@ -267,7 +372,10 @@ final class WorkflowOrchestrator {
                     Map<String, Object> thread = castMap(t);
                     String head = Engine.asString(currentPr.get("headRefOid"));
                     if (!Engine.asBool(thread.get("isResolved"), true)
-                            && ReviewCoordinator.fixReplyHeads(thread).contains(head)) {
+                            && ReviewCoordinator.fixReplyHeads(thread).contains(head)
+                            && Engine.asList(state.get("thread_updates")).stream().anyMatch(update ->
+                                update instanceof Map<?, ?> u && "REPLIED".equals(u.get("action"))
+                                && head.equals(u.get("head")) && thread.get("id").equals(u.get("thread_id")))) {
                         try {
                             github.resolveThread(Engine.asString(thread.get("id")));
                             recordThreadUpdate(Engine.asString(thread.get("id")), head,
@@ -366,19 +474,21 @@ final class WorkflowOrchestrator {
                 // (Requirement 10): ProgressGuard owns the key migration and the
                 // increment/reset semantics; state writes below preserve the
                 // exact prior persisted shape.
-                ProgressGuard.FeedbackOutcome fb = ProgressGuard.observeFeedback(
-                        head, findingKey, lastGuardKey,
-                        Engine.asString(state.get("feedback_guard_head")),
-                        (int) Engine.asLongOrDefault(state.get("feedback_attempts"), 0),
-                        maxAttempts);
-                state.put("feedback_guard_key", fb.guardKey());
-                int feedbackAttempts = fb.attempts();
-                state.put("feedback_attempts", feedbackAttempts);
-                if (fb.capExceeded()) {
-                    PrScopedResult cap = handleFeedbackCapExceeded(
-                            current, currentPr, head, feedbackAttempts, activeFeedback);
-                    if (cap != null) {
-                        return cap;
+                if (!dryRun) {
+                    ProgressGuard.FeedbackOutcome fb = ProgressGuard.observeFeedback(
+                            head, findingKey, lastGuardKey,
+                            Engine.asString(state.get("feedback_guard_head")),
+                            (int) Engine.asLongOrDefault(state.get("feedback_attempts"), 0),
+                            maxAttempts);
+                    state.put("feedback_guard_key", fb.guardKey());
+                    int feedbackAttempts = fb.attempts();
+                    state.put("feedback_attempts", feedbackAttempts);
+                    if (fb.capExceeded()) {
+                        PrScopedResult cap = handleFeedbackCapExceeded(
+                                current, currentPr, head, feedbackAttempts, activeFeedback);
+                        if (cap != null) {
+                            return cap;
+                        }
                     }
                 }
                 }
@@ -436,7 +546,7 @@ final class WorkflowOrchestrator {
                     save();
                     logStableState("WAIT_CODEX|" + current + "|" + shortSha(currentPr.get("headRefOid")),
                             "WAITING: story #{}, phase=WAITING_FOR_CODEX_REVIEW", current);
-                    return PrScopedResult.exit(0);
+                    return PrScopedResult.exit(observeWait(current, currentPr, "WAITING_FOR_CODEX_REVIEW"));
                 }
                 // No trigger present: mark the phase and fall through to the
                 // generic deviation supervisor (STALLED_REVIEW_TRIGGER) below,
@@ -538,7 +648,7 @@ final class WorkflowOrchestrator {
             //    re-enabled the reconcile/feedback loop.
             String stuckReason = Engine.asString(state.get("stuck_head_reason"));
             boolean unrecoverable = "UNRECOVERABLE".equals(stuckReason);
-            if (unrecoverable && ParkPolicy.enabled(workflow) && current != null) {
+            if (unrecoverable && ParkPolicy.mayAdvance(workflow, state) && current != null) {
                 // Park-and-advance (Requirement 5): instead of holding this story
                 // forever, record it as parked on the current head, notify once,
                 // reset its story-scoped state, and go IDLE so the next tick
@@ -547,6 +657,15 @@ final class WorkflowOrchestrator {
                 String parkHead = Engine.asString(state.get("stuck_head"));
                 boolean newlyParked = ParkPolicy.park(state, current, parkHead,
                         "UNRECOVERABLE", Controller.now());
+                ParkPolicy.parkWithCheckpoint(state, current, parkHead, "UNRECOVERABLE", Controller.now());
+                try {
+                    preserveBeforeParking(current);
+                } catch (RuntimeException exc) {
+                    state.put("phase", "BLOCKED_REPOSITORY");
+                    state.put("error", "Cannot advance safely after parking: " + exc.getMessage());
+                    save();
+                    return DeviationResult.exit(diagnosePreflight(git(), current, currentPr));
+                }
                 if (newlyParked && !dryRun && Engine.asBool(workflow.get("allow_comments"), false)
                         && currentPr != null) {
                     try {
@@ -584,7 +703,7 @@ final class WorkflowOrchestrator {
                 state.remove("stuck_head_reason");
             } else {
                 try {
-                    GitOperations probe = gitFactory.create();
+                    GitOperations probe = git();
                     if (probe.classifyWorktree(state) != GitOperations.WorktreeState.CLEAN) {
                         log.info("STUCK-HEAD CLEARED: deliverable changes present; allowing delivery "
                                 + "of the new fix for head {}", shortSha(state.get("stuck_head")));
@@ -629,34 +748,105 @@ final class WorkflowOrchestrator {
      */
     private int runWorkerPhase(Integer current, Map<String, Object> currentPr,
                                List<Map<String, Object>> feedbackToResolve, String forcedPrompt) {
+        // Recovery can dispatch before PR-scoped reconciliation. Never send a
+        // list-only snapshot (missing threads or head) to the supervisor/worker.
+        if (currentPr != null) {
+            try {
+                currentPr = github.pr(Engine.asInt(currentPr.get("number")));
+                if (currentPr == null || Engine.asString(currentPr.get("headRefOid")).isBlank()) {
+                    return blockedExternal("PR detail is missing its authoritative head");
+                }
+                state.put("current_pr_head", currentPr.get("headRefOid"));
+                state.put("branch", currentPr.get("headRefName"));
+                if (Boolean.FALSE.equals(currentPr.get("reviewThreadsAvailable"))) {
+                    return blockedExternal("Authoritative review threads unavailable before worker");
+                }
+                ReviewFindingQueue.synchronize(state, Engine.actionableFeedback(currentPr),
+                        (int) Engine.asLongOrDefault(automation.get("max_feedback_batch_size"), 3));
+                feedbackToResolve = ReviewFindingQueue.activeBatch(state);
+            } catch (GitHubError exc) {
+                return blockedExternal("Unable to refresh PR before worker: " + exc.getMessage());
+            }
+        }
         // Phase dispatch: render prompt and run the bounded worker.
         String phasePrompt = forcedPrompt != null ? forcedPrompt
                 : Controller.phasePromptFor(Engine.asString(state.get("phase")));
-        Path prompt = root.resolve(phasePrompt);
-        if (!Files.exists(prompt)) {
+        Path prompt = root.resolve(phasePrompt).toAbsolutePath().normalize();
+        Path promptRoot = root.resolve("prompts").toAbsolutePath().normalize();
+        if (!prompt.startsWith(promptRoot) || Files.isSymbolicLink(prompt)
+                || !Files.isRegularFile(prompt)) {
             state.put("phase", "BLOCKED_CONFIGURATION");
             state.put("error", "Prompt not found: " + prompt);
             save();
             log.error(String.valueOf(state.get("error")));
-            return 1;
+            return diagnosePreflight(git(), current, currentPr);
         }
 
-        GitOperations git = gitFactory.create();
+        GitOperations git = git();
 
         // Reconcile the worktree (recover/checkout the story branch, classify the
         // tree, enforce the allow_push gate, and cut a fresh branch when needed)
         // before dispatching the worker. Returns a non-null exit code when the
         // run must end here (blocked/reconcile), or null to proceed.
-        Integer prep = prepareWorktreeForPhase(git, current, currentPr);
+        Integer prep;
+        try {
+            prep = prepareWorktreeForPhase(git, current, currentPr);
+        } catch (RuntimeException exc) {
+            state.put("phase", "BLOCKED_REPOSITORY");
+            state.put("error", "Worktree preparation failed: " + exc.getMessage());
+            save();
+            prep = 1;
+        }
         if (prep != null) {
-            return prep;
+            return diagnosePreflight(git, current, currentPr);
+        }
+        state.remove("preflight_failure");
+        if (Engine.asBool(automation.get("enable_planning"), false)
+                && !TaskPlan.bound(repo, state, config) && !phasePrompt.endsWith("plan.md")) {
+            state.put("phase", "PLANNING");
+            save();
+            return runWorkerPhase(current, currentPr, feedbackToResolve, "prompts/plan.md");
+        }
+
+        Map<String, Object> activeTask = null;
+        if (Engine.asBool(automation.get("enable_planning"), false) && !phasePrompt.endsWith("plan.md")) {
+            TaskLedger.bind(state, TaskPlan.validate(repo, state, config));
+            if (TaskLedger.invalidateStale(state, git.recoveryFingerprint(),
+                    GoalContract.hashData(Config.section(config, "verification")))) save();
+            if (!phasePrompt.endsWith("reconcile.md")) {
+                activeTask = TaskLedger.next(state);
+                if (activeTask != null) {
+                    if ("AWAITING_VERIFICATION".equals(activeTask.get("status"))) {
+                        return verifyActiveTask(git, activeTask);
+                    }
+                    try { TaskLedger.start(activeTask, (int) Engine.asLongOrDefault(automation.get("max_task_attempts"), 3)); }
+                    catch (ExecutionBudget.Exhausted exc) {
+                        if (TaskLedger.requestReplan(state, activeTask,
+                                (int) Engine.asLongOrDefault(automation.get("max_plan_revisions"), 2))) {
+                            state.put("phase", "PLANNING");
+                            save();
+                            return runWorkerPhase(current, currentPr, feedbackToResolve, "prompts/plan.md");
+                        }
+                        return holdOrPark(current, currentPr, exc.getMessage(), "PROCESS");
+                    }
+                    phasePrompt = "prompts/implement.md";
+                    prompt = root.resolve(phasePrompt);
+                    save();
+                } else if (!TaskLedger.complete(state)) {
+                    return holdOrPark(current, currentPr, "Task graph has no runnable task", "PROCESS");
+                }
+            }
         }
 
         Map<String, Object> context = new LinkedHashMap<>();
         context.put("epic", epic);
         context.put("current_story", current);
+        context.put("story_issue", state.get("current_story_issue"));
+        context.put("goal_contract", state.get("goal_contract"));
+        context.put("active_task", activeTask);
         context.put("current_pr", currentPr);
         context.put("state", state);
+        context.put("recovery_observations_untrusted", RecoveryMemory.relevant(state));
         Path renderedPrompt = root.resolve("state").resolve("prompt-" + epicNumber + ".md");
         try {
             Files.writeString(renderedPrompt, PromptRenderer.render(root, phasePrompt, context));
@@ -694,6 +884,7 @@ final class WorkflowOrchestrator {
                 : (int) Engine.asLongOrDefault(Config.section(config, "codex").get("execution_timeout_seconds"), 3600);
         phaseDeadlineNanos = System.nanoTime() + totalSeconds * 1_000_000_000L;
         Runnable heartbeat = () -> {
+            actionPolicy.checkActive();
             lock.refresh();
             store.heartbeatJob(jobId, "codex pid active; phase=" + executionPhase);
             // Also refresh the durable state heartbeat so operators (and the
@@ -717,6 +908,20 @@ final class WorkflowOrchestrator {
         CodexRunner.CodexResult result;
         try {
             result = runMeteredWorker(executionPhase, renderedPrompt, heartbeat);
+        } catch (ActionPolicy.Cancelled cancelled) {
+            state.put("worker_status", "CANCELLED");
+            state.put("last_worker_outcome", "CANCELLED");
+            state.put("next_action", "RESUME_PRESERVED_WORK_AFTER_ENABLE");
+            state.put("error", cancelled.getMessage());
+            if (state.get("goal_contract") instanceof Map<?, ?> raw) {
+                Map<String, Object> goal = new LinkedHashMap<>(castMap(raw));
+                goal.put("status", actionPolicy.explicitlyCancelled() ? "CANCELLED" : "INTERRUPTED");
+                state.put("goal_contract", goal);
+            }
+            store.finishJob(jobId, "CANCELLED", 130, cancelled.getMessage());
+            save();
+            cleanup(renderedPrompt);
+            return 130;
         } catch (ExecutionBudget.Exhausted exhausted) {
             store.finishJob(jobId, "BLOCKED", 1, exhausted.getMessage());
             cleanup(renderedPrompt);
@@ -739,8 +944,65 @@ final class WorkflowOrchestrator {
         // controller may have created a PR without persisting its number.
         currentPr = adoptPrAfterCodex(current, currentPr);
 
+        if ("PLANNING".equals(executionPhase)) {
+            Map<String, String> fields = StateRecovery.parseResult(result.output());
+            boolean accepted = result.exitCode() == 0 && "SUCCESS".equals(fields.get("result_status"))
+                    && "COMPLETE".equals(fields.get("result_evidence"))
+                    && "NONE".equals(fields.get("result_blocker"))
+                    && "IMPLEMENTING".equals(fields.get("result_next_phase"));
+            if (accepted) {
+                try {
+                    TaskPlan.Validated plan = TaskPlan.validate(repo, state, config);
+                    if (state.get("replan_request") instanceof Map<?, ?> request
+                            && plan.hash().equals(request.get("previous_plan_hash"))) {
+                        throw new IllegalArgumentException("Replan must change the task strategy");
+                    }
+                    state.put("plan_binding", Map.of("artifact_hash", plan.hash(),
+                            "requirements_hash", GoalContract.requirementsHash(state), "tasks", plan.tasks(),
+                            "accepted_at", Controller.now()));
+                    TaskLedger.bind(state, plan);
+                    state.remove("replan_request");
+                    state.remove("requirements_changed");
+                } catch (IllegalArgumentException exc) {
+                    accepted = false;
+                    state.put("error", exc.getMessage());
+                }
+            }
+            state.put("phase", accepted ? "IMPLEMENTING" : "BLOCKED_REQUIREMENTS");
+            state.put("result_status", accepted ? "PLAN_ACCEPTED" : "BLOCKED");
+            state.put("result_evidence", accepted ? "PLAN_VALIDATED" : "BLOCKED");
+            if (!accepted) state.putIfAbsent("error", "Planning did not produce a valid plan and result");
+            store.finishJob(jobId, accepted ? "SUCCEEDED" : "BLOCKED", result.exitCode(), "Planning outcome");
+            save();
+            cleanup(renderedPrompt);
+            return accepted ? 0 : 1;
+        }
+
         state.putAll(Engine.applyCodexResult(state, result.exitCode(), result.output(),
                 (int) Engine.asLongOrDefault(automation.get("quota_retry_seconds"), 1800)));
+
+        if (activeTask != null) {
+            boolean taskSucceeded = result.exitCode() == 0 && Engine.deliveryAccepted(state);
+            TaskLedger.result(activeTask, taskSucceeded);
+            if (!taskSucceeded && TaskLedger.observeFailure(activeTask, taskFailureSignature(activeTask))) {
+                activeTask.put("status", "BLOCKED");
+                activeTask.put("stalled_at", Controller.now());
+                state.put("task_stall", Map.of("task", activeTask.get("id"),
+                        "attempts", activeTask.get("attempts"), "failure_signature", activeTask.get("failure_signature")));
+                state.put("phase", "BLOCKED_REQUIREMENTS");
+                state.put("next_action", "ESCALATE_UNMET_CRITERIA");
+                save();
+                store.finishJob(jobId, "BLOCKED", result.exitCode(), "Repeated task failure without criterion progress");
+                cleanup(renderedPrompt);
+                return 1;
+            }
+            save();
+            if (taskSucceeded) {
+                store.finishJob(jobId, "SUCCEEDED", 0, "Task worker finished; executable verification required");
+                cleanup(renderedPrompt);
+                return verifyActiveTask(git, activeTask);
+            }
+        }
 
         if ("FIXING_FEEDBACK".equals(executionPhase)) {
             ReviewFindingQueue.recordWorkerResult(state, result.exitCode(),
@@ -770,8 +1032,23 @@ final class WorkflowOrchestrator {
         store.finishJob(jobId, journalStatus, result.exitCode(),
                 codexRunner.redactSensitive(tail(result.output(), 1000)));
 
+        if (result.exitCode() != 0 && state.get("last_tool_result") instanceof Map<?, ?> toolResult
+                && "PROTECTED_PATH".equals(toolResult.get("failure_class"))) {
+            state.put("phase", "BLOCKED_REPOSITORY");
+            state.put("blocker_class", "PROTECTED_PATH");
+            state.put("next_action", "WAIT_FOR_PATH_POLICY_REPAIR");
+            state.put("error", codexRunner.redactSensitive(Engine.asString(toolResult.get("detail"))));
+            save();
+            cleanup(renderedPrompt);
+            return 1;
+        }
+
+        // A structured BLOCKED result is a worker/business verdict (for example,
+        // an unresolved review finding), not a failed delivery operation. Sending
+        // it through delivery recovery skips the feedback retry and escalation
+        // guards, so only process failures enter delivery recovery here.
         if (!prompt.getFileName().toString().equals("reconcile.md")
-                && (result.exitCode() != 0 || !Engine.deliveryAccepted(state))) {
+                && result.exitCode() != 0) {
             DeliveryRecovery.recordWorkerFailure(state, executionPhase, result.exitCode(),
                     codexRunner.redactSensitive(tail(result.output(), 12000)),
                     codexRunner.redactSensitive(tail(result.diagnostics(), 8000)));
@@ -821,11 +1098,19 @@ final class WorkflowOrchestrator {
             // authority. Only runs for phases that produce a committable diff.
             if (Engine.asBool(workflow.get("internal_review"), false)
                     && ("IMPLEMENTING".equals(executionPhase)
-                        || "FIXING_FEEDBACK".equals(executionPhase))) {
+                        || "FIXING_FEEDBACK".equals(executionPhase)
+                        || "VERIFYING".equals(executionPhase) && TaskLedger.complete(state))) {
                 if (!runInternalReviewGate(git, current, context, heartbeat)) {
                     cleanup(renderedPrompt);
-                    return holdOrPark(current, currentPr,
-                            "Internal review could not verify or clear all findings", "VALIDATION");
+                    DeliveryRecovery.recordWorkerFailure(state, executionPhase, 1,
+                            "Internal review did not pass. Inspect internal_review_findings and last_worker_evidence.",
+                            String.valueOf(state.get("internal_review_findings")));
+                    state.put("blocker_class", "VALIDATION");
+                    state.put("error", "Internal review could not verify or clear all findings");
+                    save();
+                    log.warn("INTERNAL REVIEW RECOVERY: story #{} PR #{} retained for supervisor diagnosis",
+                            current, state.get("current_pr"));
+                    return 1;
                 }
             }
             int deliveryResult = runDeliveryPipeline(git, current, currentPr, result.output(), feedbackToResolve);
@@ -851,6 +1136,48 @@ final class WorkflowOrchestrator {
         return result.exitCode();
     }
 
+    private int verifyActiveTask(GitOperations git, Map<String, Object> task) {
+        state.put("phase", "VERIFYING");
+        save();
+        boolean verified = verifier.verifyTask(repo, git, state, config, task,
+                () -> { actionPolicy.checkActive(); lock.refresh(); }, this::save);
+        state.remove("validation_checkpoint"); // Task evidence alone cannot authorize delivery.
+        boolean stalled = !verified && TaskLedger.observeFailure(task, taskFailureSignature(task));
+        if (!verified) task.put("status", "BLOCKED");
+        if (stalled) {
+            task.put("stalled_at", Controller.now());
+            state.put("task_stall", Map.of("task", task.get("id"), "attempts", task.get("attempts"),
+                    "failure_signature", task.get("failure_signature")));
+            state.put("phase", "BLOCKED_REQUIREMENTS");
+            state.put("next_action", "ESCALATE_UNMET_CRITERIA");
+            save();
+            return 1;
+        }
+        state.put("phase", verified && TaskLedger.complete(state) ? "VERIFYING" : "IMPLEMENTING");
+        state.put("recovery_next_prompt", verified && TaskLedger.complete(state) ? "prompts/verify.md" : "prompts/implement.md");
+        state.put("next_action", verified ? "CONTINUE_VERIFIED_TASK_PLAN" : "REPAIR_TASK_FROM_CHECK_EVIDENCE");
+        save();
+        return verified ? 0 : 1;
+    }
+
+    private String taskFailureSignature(Map<String, Object> task) {
+        Map<String, Object> tool = state.get("last_tool_result") instanceof Map<?, ?> raw ? castMap(raw) : Map.of();
+        List<Map<String, Object>> checks = new ArrayList<>();
+        for (Object raw : Engine.asList(state.get("verification_evidence"))) {
+            if (raw instanceof Map<?, ?> row) checks.add(Map.of(
+                    "id", Engine.asString(row.get("id")),
+                    "exit_code", row.containsKey("exit_code") ? row.get("exit_code") : -1,
+                    "output", Engine.asString(row.get("output"))));
+        }
+        return GoalContract.hashData(Map.of("task", Engine.asString(task.get("id")),
+                "criteria", Engine.asList(task.get("criteria")),
+                "verification_failure", Engine.asString(state.get("verification_failure")),
+                "verification_evidence", checks,
+                "worker_status", Engine.asString(state.get("result_status")),
+                "tool_failure", Engine.asString(tool.get("failure_class")),
+                "tool_detail", Engine.asString(tool.get("detail"))));
+    }
+
     /**
      * Post-SUCCESS delivery: commit/push, verify local==origin==PR head, reply
      * to and resolve fixed threads (gated by workflow flags), and create a PR
@@ -860,8 +1187,39 @@ final class WorkflowOrchestrator {
     @SuppressWarnings("unchecked")
     private int runDeliveryPipeline(GitOperations git, Integer current, Map<String, Object> currentPr,
                                     String output, List<Map<String, Object>> feedbackToResolve) {
+        if (current != null && state.get("current_story_issue") instanceof Map<?, ?> observed) {
+            Map<String, Object> live;
+            try { live = castMap(github.issue(current)); }
+            catch (GitHubError exc) { return blockedExternal("Cannot refresh story before delivery: " + exc.getMessage()); }
+            if (!java.util.Objects.equals(live.get("title"), observed.get("title"))
+                    || !java.util.Objects.equals(live.get("body"), observed.get("body"))) {
+                state.put("phase", "BLOCKED_REQUIREMENTS");
+                state.put("error", "Story requirements changed during worker execution; recapture intent before delivery");
+                state.remove("validation_checkpoint");
+                save();
+                return 1;
+            }
+        }
+        if (Engine.asBool(automation.get("enable_planning"), false)
+                && TaskLedger.invalidateStale(state, git.recoveryFingerprint(),
+                        GoalContract.hashData(Config.section(config, "verification")))) save();
+        if (Engine.asBool(automation.get("enable_planning"), false) && !TaskLedger.complete(state)) {
+            return holdOrPark(current, currentPr, "Delivery requires every planned task to be verified", "VALIDATION");
+        }
         if (!Engine.deliveryAccepted(state)) {
             return holdOrPark(current, currentPr, "Delivery rejected: validation evidence is incomplete", "VALIDATION");
+        }
+        if (!verifier.verify(repo, git, state, config,
+                () -> { actionPolicy.checkActive(); lock.refresh(); }, this::save)) {
+            DeliveryRecovery.recordWorkerFailure(state, "VERIFYING", 1,
+                    Engine.asString(state.get("verification_failure")), "Controller executable verification failed");
+            state.put("phase", "BLOCKED_REQUIREMENTS");
+            state.put("blocker_class", "VALIDATION");
+            save();
+            return 1;
+        }
+        if ("EXECUTABLE".equals(state.get("verification_mode"))) {
+            RecoveryMemory.observe(state, "VERIFYING", "CHECKS_PASSED", git.recoveryFingerprint(), true);
         }
         return deliverVerifiedWork(git, current, currentPr, output, feedbackToResolve);
     }
@@ -877,6 +1235,10 @@ final class WorkflowOrchestrator {
         String deliveryOperation = "COMMIT_PUSH";
         if (!dryRun && Engine.asBool(workflow.get("allow_push"), false)) {
             try {
+                if (state.get("validation_checkpoint") instanceof Map<?, ?> proof
+                        && !git.recoveryFingerprint().equals(proof.get("snapshot"))) {
+                    throw new IllegalStateException("Source changed after verification");
+                }
                 String branch = git.gitBranch();
                 String committed = git.commitAndPush(branch, current);
                 if (committed == null && DeliveryRecovery.failure(state) != null) {
@@ -924,6 +1286,11 @@ final class WorkflowOrchestrator {
                         throw new IllegalStateException(
                                 "local, origin, and PR heads do not match after delivery");
                     }
+                    if (!deliveredCommit.equals(state.get("last_verified_delivery"))) {
+                        state.put("phase_attempt", 0);
+                        state.put("last_verified_delivery", deliveredCommit);
+                    }
+                    recordDeliveredValidation(deliveredCommit);
                     deliveryOperation = "REVIEW_TRIGGER";
                     review.ensureCodexReviewTrigger(github, currentPr, state, workflow, dryRun, this::save);
                 }
@@ -942,7 +1309,8 @@ final class WorkflowOrchestrator {
         // SKIP the unmappable ids (log + record for audit) and proceed to
         // resolve the mappable ones. Anything left genuinely unresolved stays a
         // pending finding and is bounded by the feedback attempt cap (Rule 2),
-        // which force-closes it rather than looping.
+        // which holds the work for new evidence rather than looping or claiming
+        // an unverified fix.
         ReviewCoordinator.ThreadIdMapping mapping = ReviewCoordinator.canonicalFixedThreadIds(
                 currentPr != null ? currentPr : new LinkedHashMap<>(), declaredFixedIds);
         if (!mapping.unknown().isEmpty()) {
@@ -1046,6 +1414,7 @@ final class WorkflowOrchestrator {
                 try {
                     Map<String, Object> created = castMap(
                             review.createStoryPr(git, github, config, current, epicNumber));
+                    recordDeliveredValidation(Engine.asString(created.get("headRefOid")));
                     state.put("current_pr", created.get("number"));
                     state.put("current_pr_url", created.get("url"));
                     state.put("branch", created.get("headRefName"));
@@ -1081,10 +1450,30 @@ final class WorkflowOrchestrator {
         return Integer.MIN_VALUE;
     }
 
+    @SuppressWarnings("unchecked")
+    private void recordDeliveredValidation(String head) {
+        if (head != null && !head.isBlank() && state.get("validation_checkpoint") instanceof Map<?, ?> checkpoint) {
+            Map<String, Object> proof = new LinkedHashMap<>((Map<String, Object>) checkpoint);
+            proof.put("delivered_head", head);
+            state.put("validation_checkpoint", proof);
+            save();
+        }
+    }
+
+    private boolean mergeProofMatches(String head) {
+        return state.get("validation_checkpoint") instanceof Map<?, ?> proof
+                && !head.isBlank() && head.equals(proof.get("delivered_head"))
+                && GoalContract.requirementsHash(state).equals(proof.get("requirements_hash"))
+                && GoalContract.hashData(Config.section(config, "verification")).equals(proof.get("policy_hash"));
+    }
+
     private void recordDeliveryFailure(RuntimeException exc, String operation) {
         String message = codexRunner.redactSensitive("Unable to deliver Codex changes ("
                 + operation + "): " + exc.getMessage());
         DeliveryRecovery.record(state, exc, operation, message);
+        if (exc instanceof GitOperations.ProtectedPathsException || message.contains("Source changed after verification")) {
+            state.put("autonomy_demoted", true);
+        }
         save();
         log.error("DELIVERY FAILED: {}", message);
     }
@@ -1092,8 +1481,12 @@ final class WorkflowOrchestrator {
     /** Stop spending on unfinished work without claiming completion or closing findings. */
     private int holdOrPark(Integer current, Map<String, Object> currentPr, String reason, String blockerClass) {
         String head = currentPr == null ? "" : Engine.asString(currentPr.get("headRefOid"));
-        state.put("held_failure", Map.of("head", head, "evidence", gitFactory.create().recoveryFingerprint(),
-                "reason", reason, "blocker_class", blockerClass));
+        if (head.isEmpty() && state.get("current_pr") != null) {
+            head = Engine.asString(state.get("current_pr_head"));
+        }
+        state.put("held_failure", Map.of("head", head, "evidence", git().recoveryFingerprint(),
+                "reason", reason, "blocker_class", blockerClass,
+                "recovery_epoch", Engine.asLongOrDefault(automation.get("recovery_epoch"), 0)));
         state.put("error", reason);
         state.put("blocker_class", blockerClass);
         state.put("result_status", "BLOCKED");
@@ -1101,8 +1494,15 @@ final class WorkflowOrchestrator {
         state.put("phase", "BLOCKED_REQUIREMENTS");
         state.put("exit_code", 1);
         state.put("run_finished_at", Controller.now());
-        if (current != null && ParkPolicy.enabled(workflow)) {
+        if (current != null && ParkPolicy.mayAdvance(workflow, state)) {
             ParkPolicy.parkWithCheckpoint(state, current, head, reason, Controller.now());
+            try {
+                preserveBeforeParking(current);
+            } catch (RuntimeException exc) {
+                state.put("error", "Cannot advance safely after parking: " + exc.getMessage());
+                save();
+                return diagnosePreflight(git(), current, currentPr);
+            }
             clearActiveStory();
             state.put("phase", "IDLE");
             log.warn("PARKED UNFINISHED: story #{} — {}", current, reason);
@@ -1111,6 +1511,14 @@ final class WorkflowOrchestrator {
         }
         save();
         return 1;
+    }
+
+    private void preserveBeforeParking(int story) {
+        if (dryRun) return;
+        GitOperations git = git();
+        if (git.classifyWorktree(state) != GitOperations.WorktreeState.CLEAN) {
+            WorktreeRecovery.preserve(state, git, Engine.asString(state.get("branch")), story, this::save);
+        }
     }
 
 
@@ -1223,6 +1631,30 @@ final class WorkflowOrchestrator {
      */
     private SelectionResult selectAndAdoptStory(List<Map<String, Object>> prs,
                                                 Integer current, Map<String, Object> currentPr) {
+        if (ParkPolicy.finishOpenPrFirst(workflow)) {
+            List<Integer> openStories = Engine.linkedStoryNumbers(epic).stream()
+                    .filter(story -> !openPrsForStory(prs, story).isEmpty()).toList();
+            state.put("open_story_prs", prs.stream()
+                    .filter(p -> "OPEN".equals(p.get("state")))
+                    .map(p -> Map.of("number", p.get("number"), "branch", Engine.asString(p.get("headRefName")),
+                            "head", Engine.asString(p.get("headRefOid")), "url", Engine.asString(p.get("url"))))
+                    .toList());
+            if (current != null && state.get("current_pr") == null
+                    && !openStories.isEmpty() && !openStories.contains(current)) {
+                if (openStories.size() != 1) return SelectionResult.exit(conflict("Multiple open story PRs"));
+                if (dryRun) return SelectionResult.exit(conflict("Open PR must finish before switching stories (dry-run)"));
+                try {
+                    StoryHandoff.suspend(state, git(), this::save);
+                    log.info("STORY SUSPENDED: #{} preserved; prioritizing open PR for story #{}", current, openStories.getFirst());
+                    current = null;
+                } catch (RuntimeException exc) {
+                    state.put("phase", "BLOCKED_REPOSITORY");
+                    state.put("error", "Unable to suspend work for open PR: " + exc.getMessage());
+                    save();
+                    return SelectionResult.exit(1);
+                }
+            }
+        }
         // Story selection when none is active.
         if (current == null) {
             List<Object[]> candidates = new ArrayList<>();
@@ -1231,7 +1663,8 @@ final class WorkflowOrchestrator {
                 List<Map<String, Object>> open = new ArrayList<>();
                 for (Map<String, Object> p : matches) {
                     if ("OPEN".equals(p.get("state"))) {
-                        if (ParkPolicy.enabled(workflow) && ParkPolicy.parkedStoryNumbers(state).contains(story)
+                        if (ParkPolicy.enabled(workflow) && !ParkPolicy.finishOpenPrFirst(workflow)
+                                && ParkPolicy.parkedStoryNumbers(state).contains(story)
                                 && ParkPolicy.parkedHead(state, story).equals(Engine.asString(p.get("headRefOid")))) {
                             continue;
                         }
@@ -1251,7 +1684,8 @@ final class WorkflowOrchestrator {
             if (!candidates.isEmpty()) {
                 current = (Integer) candidates.get(0)[0];
                 currentPr = castMap(candidates.get(0)[1]);
-                ParkPolicy.restoreCheckpoint(state, current, Engine.asString(currentPr.get("headRefOid")));
+                if (ParkPolicy.finishOpenPrFirst(workflow)) ParkPolicy.resumeForOpenPr(state, current);
+                else ParkPolicy.restoreCheckpoint(state, current, Engine.asString(currentPr.get("headRefOid")));
                 state.put("current_story", current);
                 state.put("current_pr", currentPr.get("number"));
                 state.put("current_pr_url", currentPr.get("url"));
@@ -1285,6 +1719,7 @@ final class WorkflowOrchestrator {
                     return SelectionResult.exit(unfinished ? 1 : 0);
                 }
                 current = Engine.asInt(selected.get("number"));
+                boolean resumed = StoryHandoff.resume(state, current);
                 state.put("current_story", current);
                 state.put("current_story_url", selected.get("url"));
                 state.put("current_story_title", selected.getOrDefault("title", ""));
@@ -1293,7 +1728,9 @@ final class WorkflowOrchestrator {
                 // first; otherwise (default, or a plan already present on resume)
                 // go straight to IMPLEMENTING — preserving the current path.
                 boolean planningEnabled = Engine.asBool(automation.get("enable_planning"), false);
-                if (planningEnabled && !PlanLedgerReader.hasValidPlan(repo)) {
+                if (resumed) {
+                    log.info("STORY RESUMED: #{} restored from suspended checkpoint", current);
+                } else if (planningEnabled) {
                     state.put("phase", "PLANNING");
                 } else {
                     state.put("phase", "IMPLEMENTING");
@@ -1338,6 +1775,56 @@ final class WorkflowOrchestrator {
                 state.put("error", "Current story #" + current + " is no longer an eligible linked open story");
                 save();
                 log.error("BLOCKED: " + state.get("error"));
+                return SelectionResult.exit(1);
+            }
+            state.put("current_story_issue", currentIssue);
+            try {
+                Map<String, Object> goal = GoalContract.capture(currentIssue, epic, config);
+                String sourceHash = Engine.asString(goal.get("requirements_hash"));
+                if (!Engine.asList(goal.get("questions")).isEmpty()) {
+                    Map<String, Object> reply = Map.of();
+                    if (state.get("clarification_answer") instanceof Map<?, ?> saved
+                            && sourceHash.equals(saved.get("source_hash")) && saved.get("reply") instanceof Map<?, ?> existing) {
+                        reply = castMap(existing);
+                    } else if (state.get("clarification_delivery") instanceof Map<?, ?> pending
+                            && sourceHash.equals(pending.get("requirements_hash"))) {
+                        String requester = currentIssue.get("author") instanceof Map<?, ?> author
+                                ? Engine.asString(author.get("login")) : "";
+                        java.util.Set<String> delegated = new java.util.HashSet<>(Engine.asList(
+                                Config.section(config, "intent").get("delegated_responders"))
+                                .stream().map(String::valueOf).toList());
+                        reply = ClarificationReply.latest(github.issueComments(current), sourceHash, requester, delegated);
+                    }
+                    if (!reply.isEmpty()) {
+                        goal = GoalContract.capture(currentIssue, epic, config, reply);
+                        state.put("clarification_answer", Map.of("source_hash", sourceHash, "reply", reply));
+                    }
+                }
+                boolean changed = GoalContract.observe(state, goal);
+                if (Set.of("CANCELLED", "SUPERSEDED", "ABANDONED", "FAILED", "VERIFIED")
+                        .contains(Engine.asString(goal.get("status")))) {
+                    state.put("phase", "BLOCKED_REQUIREMENTS");
+                    state.put("error", "Story intent is terminal: " + goal.get("status"));
+                    state.put("next_action", "CREATE_REVISED_AUTHORIZED_REQUEST");
+                    save();
+                    return SelectionResult.exit(1);
+                }
+                if (!Engine.asList(goal.get("questions")).isEmpty()) {
+                    state.put("phase", "BLOCKED_REQUIREMENTS");
+                    state.put("next_action", "WAIT_FOR_CLARIFICATION");
+                    state.put("error", "Story needs clarification: " + goal.get("questions"));
+                    deliverClarification(current, goal);
+                    save();
+                    return SelectionResult.exit(1);
+                }
+                if (changed) {
+                    state.put("recovery_next_prompt", Engine.asBool(automation.get("enable_planning"), false)
+                            ? "prompts/plan.md" : "prompts/verify.md");
+                }
+            } catch (IllegalArgumentException exc) {
+                state.put("phase", "BLOCKED_REQUIREMENTS");
+                state.put("error", exc.getMessage());
+                save();
                 return SelectionResult.exit(1);
             }
             state.put("current_story_url", currentIssue.get("url"));
@@ -1387,13 +1874,71 @@ final class WorkflowOrchestrator {
         return SelectionResult.proceed(current, currentPr);
     }
 
+    private void deliverClarification(int story, Map<String, Object> goal) {
+        String hash = Engine.asString(goal.get("requirements_hash"));
+        if (!Engine.asBool(workflow.get("allow_comments"), false) || dryRun) {
+            state.put("clarification_delivery", Map.of("requirements_hash", hash,
+                    "status", "DISABLED_BY_POLICY", "updated_at", Controller.now()));
+            return;
+        }
+        String marker = "<!-- jcoding-clarification:" + story + ":" + hash.substring(0, Math.min(16, hash.length())) + " -->";
+        try {
+            Object raw = github.issueComments(story);
+            List<?> pages = raw instanceof List<?> list ? list : List.of();
+            boolean found = pages.stream().flatMap(page -> page instanceof List<?> list
+                    ? list.stream() : java.util.stream.Stream.of(page)).anyMatch(item -> item instanceof Map<?, ?> c
+                    && Engine.asString(c.get("body")).contains(marker));
+            if (found) {
+                state.put("clarification_delivery", Map.of("requirements_hash", hash,
+                        "status", "ALREADY_DELIVERED", "marker", marker, "updated_at", Controller.now()));
+                return;
+            }
+            List<String> questions = Engine.asList(goal.get("questions")).stream().map(String::valueOf).toList();
+            String body = marker + "\n\nAutomation is waiting for clarification before making changes:\n"
+                    + questions.stream().map(q -> "- " + q).collect(java.util.stream.Collectors.joining("\n"))
+                    + "\n\nUpdate the issue description, or reply with a full ```jcoding-intent JSON block and "
+                    + "<!-- jcoding-answer:" + hash.substring(0, Math.min(16, hash.length())) + " -->. "
+                    + "Only repository owners, members or collaborators may answer by comment.";
+            github.commentIssue(story, body);
+            state.put("clarification_delivery", Map.of("requirements_hash", hash,
+                    "status", "DELIVERED", "marker", marker, "updated_at", Controller.now()));
+        } catch (RuntimeException failure) {
+            state.put("clarification_delivery", Map.of("requirements_hash", hash,
+                    "status", "DELIVERY_FAILED", "error", failure.getMessage() == null ? "unknown" : failure.getMessage(),
+                    "updated_at", Controller.now()));
+            log.warn("CLARIFICATION DELIVERY FAILED for story #{}; workflow remains blocked", story, failure);
+        }
+    }
+
     /**
      * Handle the terminal wait / merge-gate phases for the current PR. Returns
      * a non-null exit code when the run should end here, or {@code null} to fall
      * through to the deviation supervisor. Behavior-identical to the former
      * inline block (extracted for Requirement 2).
      */
+    private int observeWait(Integer current, Map<String, Object> pr, String phase) {
+        WaitPolicy.Decision decision = WaitPolicy.observe(state, phase, pr, automation, java.time.Instant.now());
+        save();
+        if (decision == WaitPolicy.Decision.WAIT) return 0;
+        if (decision == WaitPolicy.Decision.HOLD) {
+            state.put("phase", "BLOCKED_EXTERNAL");
+            state.put("next_action", "WAIT_FOR_EXTERNAL_EVIDENCE");
+            state.put("error", "Passive wait exceeded its diagnosis budget; external evidence must change");
+            save();
+            return 1;
+        }
+        state.put("deviation_code", "WAIT_DEADLINE_EXCEEDED");
+        state.put("deviation_detail", "Wait timed out: " + phase + "; inspect external evidence before retrying");
+        save();
+        return runWorkerPhase(current, pr, List.of(), "prompts/reconcile.md");
+    }
+
     private Integer handleWaitAndMergeGate(Integer current, Map<String, Object> currentPr, String phase) {
+        if ("READY_TO_MERGE".equals(phase) && currentPr != null) {
+            DeploymentPolicy.recordCanary(config, state, currentPr);
+            save();
+        }
+
         Map<String, Object> workflow = Config.section(config, "workflow");
         if (phase.equals("READY_TO_MERGE") && !dryRun
                 && Engine.asBool(workflow.get("allow_comments"), false)) {
@@ -1436,7 +1981,23 @@ final class WorkflowOrchestrator {
                         + "reconciliation to rebase/resolve", currentPr.get("number"));
                 return 1;
             }
-            if ("UNKNOWN".equals(mergeable) || "BEHIND".equals(mergeStateStatus)
+            if ("BEHIND".equals(mergeStateStatus)) {
+                try {
+                    GitOperations git = git();
+                    git.checkoutStoryBranch(Engine.asString(currentPr.get("headRefName")));
+                    git.updateFromBase(Engine.asString(Config.section(config, "repository").getOrDefault("base_branch", "main")));
+                    state.remove("validation_checkpoint");
+                    state.put("recovery_next_prompt", "prompts/verify.md");
+                    state.put("phase", "VERIFYING");
+                } catch (RuntimeException exc) {
+                    state.put("error", "Base update requires reconciliation: " + exc.getMessage());
+                    state.put("recovery_next_prompt", "prompts/reconcile.md");
+                    state.put("phase", "BLOCKED_REPOSITORY");
+                }
+                save();
+                return 0;
+            }
+            if ("UNKNOWN".equals(mergeable)
                     || "UNSTABLE".equals(mergeStateStatus)) {
                 state.put("phase", "WAITING_FOR_CI");
                 save();
@@ -1454,12 +2015,18 @@ final class WorkflowOrchestrator {
                 log.error("BLOCKED: " + state.get("error"));
                 return 1;
             }
+            if (!mergeProofMatches(Engine.asString(currentPr.get("headRefOid")))) {
+                state.put("phase", "VERIFYING");
+                state.put("recovery_next_prompt", "prompts/verify.md");
+                save();
+                return 0;
+            }
             try {
                 String mergeMethod = Engine.asString(
                         workflow.getOrDefault("merge_method", "squash"));
                 int prNumber = Engine.asInt(currentPr.get("number"));
                 String expectedHead = Engine.asString(currentPr.get("headRefOid"));
-                github.mergePr(prNumber, mergeMethod);
+                github.mergePr(prNumber, mergeMethod, expectedHead);
                 Map<String, Object> mergedPr = github.pr(prNumber);
                 if (!isMerged(mergedPr)) {
                     state.put("phase", "WAITING_FOR_CI");
@@ -1505,7 +2072,7 @@ final class WorkflowOrchestrator {
                 Engine.asString(currentPr.get("reviewDecision")),
                 Engine.asList(currentPr.get("statusCheckRollup")).size(),
                 shortSha(currentPr.get("headRefOid")));
-        return 0;
+        return observeWait(current, currentPr, Engine.asString(state.get("phase")));
     }
 
     /**
@@ -1582,7 +2149,7 @@ final class WorkflowOrchestrator {
                 // selects a different eligible story. It auto-unparks when the
                 // head advances. This mirrors runDeviationSupervisor and honours
                 // the "no dead-end, no human in the delivery loop" guarantee.
-                if (ParkPolicy.enabled(workflow) && parkStory != null) {
+                if (ParkPolicy.mayAdvance(workflow, state) && parkStory != null) {
                     boolean newlyParked = ParkPolicy.park(state, parkStory, head,
                             "UNRECOVERABLE", Controller.now());
                     if (newlyParked && !dryRun
@@ -1632,7 +2199,7 @@ final class WorkflowOrchestrator {
         } else {
             boolean newFix = false;
             try {
-                newFix = gitFactory.create().classifyWorktree(state)
+                newFix = git().classifyWorktree(state)
                         != GitOperations.WorktreeState.CLEAN;
             } catch (RuntimeException ignored) {
                 newFix = false;
@@ -1857,13 +2424,6 @@ final class WorkflowOrchestrator {
             state.put("phase_attempt", 0);
             state.remove("deviation_code");
             state.remove("deviation_detail");
-            Map<String, Object> queuedFinding = ReviewFindingQueue.active(state);
-            if (queuedFinding != null
-                    && Engine.asLongOrDefault(queuedFinding.get("attempts"), 0) == 0) {
-                state.remove("feedback_guard_head");
-                state.remove("feedback_guard_key");
-                state.remove("feedback_attempts");
-            }
             save();
         }
         return 0;
@@ -1905,8 +2465,15 @@ final class WorkflowOrchestrator {
     }
 
     private CodexRunner.CodexResult runMeteredWorker(String phase, Path prompt, Runnable heartbeat) {
+        return runMeteredWorker(phase, prompt, heartbeat, false);
+    }
+
+    private CodexRunner.CodexResult runMeteredWorker(String phase, Path prompt, Runnable heartbeat,
+                                                    boolean readOnly) {
         int remaining = (int) Math.min(Integer.MAX_VALUE,
                 Math.max(0, (phaseDeadlineNanos - System.nanoTime()) / 1_000_000_000L));
+        validateTransition();
+        actionPolicy.checkActive();
         int timeout = ExecutionBudget.reserve(state, automation, remaining);
         save();
         String callId = Engine.asString(state.get("execution_id")) + ":call:" + System.nanoTime() + ":" + (++callSequence);
@@ -1914,7 +2481,106 @@ final class WorkflowOrchestrator {
         long started = System.nanoTime();
         long bytes;
         try { bytes = Files.size(prompt); } catch (java.io.IOException exc) { bytes = 0; }
-        CodexRunner.CodexResult result = codexRunner.run(configForPhase(phase), prompt, repo, dryRun, heartbeat, timeout);
+        Map<String, Object> workerConfig = configForPhase(phase);
+        boolean structuredTools = !dryRun && !readOnly && !"RECONCILING".equals(phase);
+        WorkerToolBoundary.Request toolRequest = null;
+        if (structuredTools) {
+            List<String> criterionIds = Engine.asList(state.get("goal_contract") instanceof Map<?, ?> goal
+                    ? goal.get("criteria") : List.of()).stream()
+                    .filter(Map.class::isInstance).map(value -> Engine.asString(((Map<?, ?>) value).get("id")))
+                    .filter(id -> !id.isBlank()).toList();
+            List<String> reviewThreadIds = ReviewFindingQueue.activeBatch(state).stream()
+                    .map(finding -> Engine.asString(finding.get("thread_id")))
+                    .filter(id -> !id.isBlank()).distinct().toList();
+            toolRequest = new WorkerToolBoundary.Request(callId, GoalContract.requirementsHash(state),
+                    git().recoveryFingerprint(), phase, repo, timeout, criterionIds, reviewThreadIds);
+            try { Files.writeString(prompt, WorkerToolBoundary.instruction(toolRequest),
+                    java.nio.file.StandardOpenOption.APPEND); }
+            catch (java.io.IOException exc) { throw new IllegalStateException("Cannot write controller tool protocol", exc); }
+        }
+        if (readOnly || structuredTools) {
+            workerConfig = new LinkedHashMap<>(workerConfig);
+            Map<String, Object> codex = new LinkedHashMap<>(Config.section(workerConfig, "codex"));
+            codex.put("diagnostic_read_only", true);
+            workerConfig.put("codex", codex);
+        }
+        CodexRunner.CodexResult result;
+        try {
+            result = codexRunner.run(workerConfig, prompt, repo, dryRun, heartbeat, timeout);
+        } catch (ActionPolicy.Cancelled cancelled) {
+            ExecutionBudget.finish(state, Math.max(0, (System.nanoTime() - started) / 1_000_000L), Map.of());
+            state.put("last_worker_outcome", "CANCELLED");
+            save();
+            throw cancelled;
+        }
+        if (structuredTools && result.exitCode() == 0) {
+            try {
+                WorkerToolBoundary.Proposal proposal = WorkerToolBoundary.parse(toolRequest, result.output());
+                state.put("tool_effect_pending", Map.of("execution_id", callId,
+                        "requirements_hash", toolRequest.requirementsHash(),
+                        "source", toolRequest.sourceFingerprint(), "phase", phase,
+                        "proposal_hash", GoalContract.hash(result.output())));
+                save();
+                GitOperations toolGit = git();
+                List<String> proposedPaths = new ArrayList<>();
+                for (WorkerToolBoundary.Change change : proposal.changes()) {
+                    proposedPaths.add(change.path());
+                    if ("rename".equals(change.operation())) proposedPaths.add(change.from());
+                }
+                toolGit.authorizeToolPaths(proposedPaths);
+                WorkerToolBoundary.Result applied = WorkerToolBoundary.apply(toolRequest, proposal, toolGit, config,
+                        actionPolicy::checkActive);
+                if ("APPLIED".equals(applied.status())) {
+                    Set<String> all = new java.util.TreeSet<>();
+                    if (Engine.asString(state.get("worker_owned_story")).equals(Engine.asString(state.get("current_story")))
+                            && Engine.asString(state.get("worker_owned_branch")).equals(Engine.asString(state.get("branch")))) {
+                        for (Object path : Engine.asList(state.get("worker_owned_paths"))) all.add(String.valueOf(path));
+                    }
+                    all.addAll(proposedPaths);
+                    state.put("worker_owned_paths", new ArrayList<>(all));
+                    state.put("worker_owned_story", state.get("current_story"));
+                    state.put("worker_owned_branch", state.get("branch"));
+                    Map<String, Object> attribution = state.get("change_requirement_attribution") instanceof Map<?, ?> old
+                            ? new LinkedHashMap<>(castMap(old)) : new LinkedHashMap<>();
+                    for (WorkerToolBoundary.Change change : proposal.changes()) {
+                        Map<String, Object> proof = Map.of("criteria", change.criterionIds(),
+                                "requirements_hash", toolRequest.requirementsHash(),
+                                "execution_id", callId, "source_before", toolRequest.sourceFingerprint(),
+                                "source_after", applied.sourceAfter());
+                        attribution.put(change.path(), proof);
+                        if ("rename".equals(change.operation())) attribution.put(change.from(), proof);
+                    }
+                    state.put("change_requirement_attribution", attribution);
+                }
+                state.put("last_tool_result", Map.of("execution_id", callId, "status", applied.status(),
+                        "failure_class", applied.failureClass(), "detail", applied.detail(),
+                        "paths", applied.paths(), "source_after", applied.sourceAfter()));
+                state.remove("tool_effect_pending");
+                save();
+                if (!"APPLIED".equals(applied.status())) {
+                    result = new CodexRunner.CodexResult(1, "", result.usage(), applied.failureClass() + ": " + applied.detail());
+                } else {
+                    String next = "PLANNING".equals(phase) ? "IMPLEMENTING" : "VERIFYING";
+                    StringBuilder footer = new StringBuilder("RESULT_STATUS: SUCCESS\nRESULT_NEXT_PHASE: ")
+                            .append(next).append("\nRESULT_BLOCKER: NONE\nRESULT_EVIDENCE: COMPLETE\n");
+                    proposal.fixedThreadIds().forEach(id -> footer.append("FIXED_THREAD: ").append(id).append('\n'));
+                    proposal.supersededThreadIds().forEach(id -> footer.append("SUPERSEDED_THREAD: ").append(id).append('\n'));
+                    result = new CodexRunner.CodexResult(0, footer.toString(), result.usage(), result.diagnostics());
+                }
+            } catch (ActionPolicy.Cancelled cancelled) {
+                throw cancelled;
+            } catch (RuntimeException exc) {
+                state.remove("tool_effect_pending");
+                String failureClass = exc instanceof GitOperations.ProtectedPathsException
+                        ? "PROTECTED_PATH" : "INVALID_WORKER_RESULT";
+                state.put("last_tool_result", Map.of("execution_id", callId,
+                        "status", "REJECTED", "failure_class", failureClass,
+                        "detail", codexRunner.redactSensitive(Engine.asString(exc.getMessage()))));
+                save();
+                result = new CodexRunner.CodexResult(1, "", result.usage(),
+                        codexRunner.redactSensitive(Engine.asString(exc.getMessage())));
+            }
+        }
         long elapsed = Math.max(0, (System.nanoTime() - started) / 1_000_000L);
         Map<String, Long> usage = new LinkedHashMap<>();
         if (result.usage().inputTokens() != null) usage.put("input_tokens", result.usage().inputTokens());
@@ -1923,13 +2589,28 @@ final class WorkflowOrchestrator {
         ExecutionBudget.finish(state, elapsed, usage);
         String output = codexRunner.redactSensitive(result.output());
         String diagnostics = codexRunner.redactSensitive(result.diagnostics());
+        if (result.exitCode() != 0 || !"SUCCESS".equals(StateRecovery.parseResult(output).get("result_status"))) {
+            RecoveryMemory.observe(state, phase, Engine.asString(state.get("decision_action")),
+                    diagnostics.isBlank() ? output : diagnostics, false);
+        } else {
+            state.remove("recovery_strategy");
+        }
         state.put("last_worker_evidence", Map.of("job_id", callId, "phase", phase,
-                "exit_code", result.exitCode(), "output", tail(output, 12000), "failed_commands", diagnostics));
+                "exit_code", result.exitCode(), "output", tail(output, 12000), "failed_commands", diagnostics,
+                "policy_hash", GoalContract.hashData(workflow), "requirements_hash", GoalContract.requirementsHash(state)));
         store.recordWorkerUsage(callId, Engine.asInt(state.get("current_story")), phase, model,
                 elapsed, bytes, result.exitCode(), result.usage().inputTokens(),
-                result.usage().cachedInputTokens(), result.usage().outputTokens(), output, diagnostics);
+                result.usage().cachedInputTokens(), result.usage().outputTokens(), output, diagnostics,
+                promptHash(prompt), GoalContract.hashData(Config.section(workerConfig, "codex")),
+                GoalContract.hashData(Map.of("workflow", workflow, "verification", Config.section(config, "verification"),
+                        "isolation", Config.section(config, "codex").getOrDefault("isolation", "native"))));
         save();
         return result;
+    }
+
+    private static String promptHash(Path prompt) {
+        try { return GoalContract.hash(java.nio.file.Files.readString(prompt)); }
+        catch (java.io.IOException exc) { return "unavailable"; }
     }
 
     /** Review the exact local diff; any missing or failed evidence stops delivery. */
@@ -2020,7 +2701,7 @@ final class WorkflowOrchestrator {
                 return new ReviewEvidence(-1, "unable to render " + promptFile + ": " + exc.getMessage());
             }
             try {
-                CodexRunner.CodexResult result = runMeteredWorker("REVIEWING_CODE", rendered, heartbeat);
+                CodexRunner.CodexResult result = runMeteredWorker("REVIEWING_CODE", rendered, heartbeat, !request.fix());
                 return new ReviewEvidence(result.exitCode(), result.output());
             } catch (RuntimeException exc) {
                 return new ReviewEvidence(-1, "review worker failed: " + exc.getMessage());
@@ -2034,6 +2715,7 @@ final class WorkflowOrchestrator {
 
     private Integer prepareWorktreeForPhase(GitOperations git, Integer current,
                                             Map<String, Object> currentPr) {
+        if (!dryRun) WorktreeRecovery.isolateParkedWork(state, git, this::save);
         // A crash can occur after a story branch is created but before its name
         // is persisted. Recover only an unambiguous branch generated for the
         // selected story; arbitrary dirty branches must remain blocked.
@@ -2049,12 +2731,13 @@ final class WorkflowOrchestrator {
         if (!activeBranch.isEmpty()) {
             try {
                 git.checkoutStoryBranch(activeBranch);
+                if (!dryRun) WorktreeRecovery.restoreActiveWork(state, git, this::save);
             } catch (RuntimeException exc) {
                 state.put("phase", "BLOCKED_REQUIREMENTS");
                 state.put("error", "Unable to check out story branch " + activeBranch
                         + ": " + exc.getMessage());
                 save();
-                log.error("RECONCILE: " + state.get("error"));
+                log.debug("RECONCILE: " + state.get("error"));
                 return 1;
             }
         }
@@ -2070,7 +2753,7 @@ final class WorkflowOrchestrator {
                     state.put("phase", "BLOCKED_REQUIREMENTS");
                     state.put("error", "Unsafe working tree: " + exc.getMessage());
                     save();
-                    log.error("RECONCILE: Unsafe working tree: " + exc.getMessage());
+                    log.debug("RECONCILE: Unsafe working tree: " + exc.getMessage());
                     return 1;
                 }
             }
@@ -2080,7 +2763,7 @@ final class WorkflowOrchestrator {
                         + "reconcile before proceeding. Commit or relocate these changes onto a "
                         + "story branch, or remove them, then rerun.");
                 save();
-                log.error("RECONCILE: uncommitted changes on the default branch require reconciliation");
+                log.debug("RECONCILE: uncommitted changes on the default branch require reconciliation");
                 return 1;
             }
             case DIRTY_UNKNOWN_BRANCH -> {
@@ -2088,7 +2771,7 @@ final class WorkflowOrchestrator {
                 state.put("error", "Working tree has changes on a branch that is not the active "
                         + "story branch; reconcile before proceeding.");
                 save();
-                log.error("RECONCILE: changes outside the active story branch require reconciliation");
+                log.debug("RECONCILE: changes outside the active story branch require reconciliation");
                 return 1;
             }
             default -> { }
@@ -2116,11 +2799,83 @@ final class WorkflowOrchestrator {
                 state.put("phase", "BLOCKED_REPOSITORY");
                 state.put("error", "Unable to prepare synchronized story branch: " + exc.getMessage());
                 save();
-                log.error("BLOCKED: " + state.get("error"));
+                log.debug("BLOCKED: " + state.get("error"));
                 return 1;
             }
         }
         return null;
+    }
+
+    /** Diagnosis bypasses preparation, never its safety gates or delivery checks. */
+    private int diagnosePreflight(GitOperations git, Integer current, Map<String, Object> currentPr) {
+        String detail = Engine.asString(state.get("error"));
+        String branch;
+        try { branch = git.currentBranchName(); } catch (RuntimeException exc) { branch = "unavailable"; }
+        String evidence = current + ":" + branch + ":" + Engine.asString(state.get("branch"))
+                + ":" + git.recoveryFingerprint() + ":" + detail + ":" + config.hashCode();
+        Map<String, Object> failure = PreflightRecovery.observe(state, evidence, detail);
+        failure.put("actual_branch", branch);
+        failure.put("expected_branch", Engine.asString(state.get("branch")));
+        state.put("blocker_class", "PROCESS");
+        state.put("next_action", "DIAGNOSE_PREFLIGHT");
+        int cap = (int) Engine.asLongOrDefault(automation.get("max_preflight_diagnoses"), 2);
+        if (!PreflightRecovery.reserve(failure, cap)) {
+            state.put("next_action", "WAIT_FOR_PREFLIGHT_EVIDENCE");
+            save();
+            logStableState("PREFLIGHT_HELD|" + evidence,
+                    "PREFLIGHT HELD: {}. See preflight_failure for supervisor diagnosis; "
+                            + "retry when repository evidence or configuration changes", detail);
+            return 1;
+        }
+        save(); // Count even a crashed invocation; no infinite restart loop.
+        Path prompt = root.resolve("state/preflight-" + epicNumber + ".md");
+        try {
+            Map<String, Object> context = new LinkedHashMap<>();
+            context.put("epic", epic);
+            context.put("current_story", current);
+            context.put("current_pr", currentPr);
+            context.put("state", state);
+            String instructions = """
+                    PREFLIGHT SUPERVISOR: read-only diagnosis of a controller blocker.
+                    Inspect current evidence and identify root cause, ownership, missing condition,
+                    and exactly one safe next action. Do not edit, stash, checkout, commit, push,
+                    call mutating external tools, or bypass a guard. Do not change another story.
+                    A decision is not proof of recovery. Repeated identical advice is not progress.
+                    Distinguish controller defects, repository repairs, requirements, access,
+                    conflicts, and external outages. Identify the exact file/rule or prerequisite.
+                    Report DECISION_REASON, BLOCKER_CLASS, RECOVERY_ACTION, and the evidence
+                    that will demonstrate recovery. The controller will recheck preflight before
+                    any implementation or delivery and hold unchanged failures after its budget.
+                    """;
+            // The emergency path remains usable when a normal phase prompt is missing.
+            Files.writeString(prompt, instructions + "\nCONTEXT:\n"
+                    + new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(context));
+            int seconds = (int) Engine.asLongOrDefault(automation.get("preflight_diagnosis_seconds"), 120);
+            phaseDeadlineNanos = System.nanoTime() + Math.max(1, seconds) * 1_000_000_000L;
+            state.put("worker_status", "RUNNING");
+            save();
+            log.info("PREFLIGHT SUPERVISOR START: story=#{} attempt={} read-only=true", current, failure.get("attempts"));
+            CodexRunner.CodexResult result = runMeteredWorker("RECONCILING", prompt, lock::refresh, true);
+            String output = codexRunner.redactSensitive(tail(result.output(), 12000));
+            failure.put("diagnosis", output);
+            failure.put("exit_code", result.exitCode());
+            Map<String, String> decision = StateRecovery.parseDiagnosis(output);
+            failure.put("decision", decision);
+            failure.put("stage", "DIAGNOSED");
+            log.info("PREFLIGHT SUPERVISOR EXIT: exit_code={} recovery={}", result.exitCode(),
+                    decision.getOrDefault("RECOVERY_ACTION", "Inspect preflight_failure.diagnosis"));
+        } catch (java.io.IOException | RuntimeException exc) {
+            failure.put("diagnosis_error", codexRunner.redactSensitive(exc.getMessage()));
+            failure.put("stage", "FAILED");
+        } finally {
+            state.put("worker_status", "IDLE");
+            state.put("exit_code", 1);
+            state.put("run_finished_at", Controller.now());
+            state.put("error", detail);
+            save();
+            cleanup(prompt);
+        }
+        return 1;
     }
 
     private void advanceStory(int current) {

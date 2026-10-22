@@ -43,6 +43,7 @@ public final class StateRecovery {
                 .matcher(output == null ? "" : output);
         String last = null;
         while (matcher.find()) {
+            if (last != null) return null;
             last = matcher.group(1).strip();
         }
         return last;
@@ -56,6 +57,15 @@ public final class StateRecovery {
             if (match != null) {
                 values.put(key.toLowerCase(), match);
             }
+        }
+        return values;
+    }
+
+    public static Map<String, String> parseDiagnosis(String output) {
+        Map<String, String> values = new java.util.LinkedHashMap<>();
+        for (String key : List.of("DECISION_REASON", "BLOCKER_CLASS", "RECOVERY_ACTION")) {
+            String value = lastMatch(key, output);
+            if (value != null) values.put(key, value);
         }
         return values;
     }

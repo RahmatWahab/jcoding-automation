@@ -10,11 +10,12 @@
   },
   "github": {
     "token_environment_variable": "GH_TOKEN",
+    "host": "github.com",
     "cli": "gh",
     "timeout_seconds": 30
   },
   "automation": {
-    "dry_run": false,
+    "dry_run": true,
     "stale_lock_seconds": 900,
     "quota_retry_seconds": 1800,
     "watchdog_observations": 3,
@@ -22,7 +23,11 @@
     "delivery_verification_attempts": 5,
     "delivery_verification_delay_seconds": 2,
     "max_delivery_recovery_attempts": 4,
+    "max_preflight_diagnoses": 2,
+    "preflight_diagnosis_seconds": 120,
     "max_story_worker_calls": 24,
+    "max_task_attempts": 3,
+    "max_plan_revisions": 2,
     "max_story_active_seconds": 7200,
     "max_story_tokens": 0,
     "recovery_epoch": 0,
@@ -33,30 +38,85 @@
     "internal_review_max_fix_attempts": 2,
     "wait_poll_seconds": 0,
     "max_phase_attempts": 5,
-    "enable_planning": true
+    "enable_planning": true,
+    "wait_timeout_seconds": 3600,
+    "max_wait_diagnoses": 2
   },
   "codex": {
     "executable": "codex",
     "model": "gpt-5.6-luna",
     "reasoning_effort": "medium",
-    "approval_policy": "true",
-    "dangerously_bypass_sandbox": true,
+    "approval_policy": "never",
+    "dangerously_bypass_sandbox": false,
     "execution_timeout_seconds": 3600,
     "progress_interval_seconds": 30,
     "phase_overrides": {
-      "IDLE": { "model": "gpt-5.6-luna", "reasoning_effort": "low" },
-      "PLANNING": { "model": "gpt-5.6-luna", "reasoning_effort": "high" },
-      "IMPLEMENTING": { "model": "gpt-5.6-luna", "reasoning_effort": "low" },
-      "VERIFYING": { "model": "gpt-5.6-luna", "reasoning_effort": "low" },
-      "REVIEWING_CODE": { "model": "gpt-5.6-luna", "reasoning_effort": "low" },
-      "FIXING_FEEDBACK": { "model": "gpt-5.6-luna", "reasoning_effort": "low" },
-      "CHANGES_REQUESTED": { "model": "gpt-5.6-luna", "reasoning_effort": "low" },
-      "READY_TO_MERGE": { "model": "gpt-5.6-luna", "reasoning_effort": "low" },
-      "RECONCILING": { "model": "gpt-5.6-luna", "reasoning_effort": "medium" },
-      "BLOCKED_REQUIREMENTS": { "model": "gpt-5.6-luna", "reasoning_effort": "low" },
-      "BLOCKED_REPOSITORY": { "model": "gpt-5.6-luna", "reasoning_effort": "low" },
-      "FAILED_RECOVERABLE": { "model": "gpt-5.6-luna", "reasoning_effort": "low" },
-      "CODEX_FAILURE": { "model": "gpt-5.6-luna", "reasoning_effort": "medium" }
+      "IDLE": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "low"
+      },
+      "PLANNING": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "high"
+      },
+      "IMPLEMENTING": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "low"
+      },
+      "VERIFYING": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "low"
+      },
+      "REVIEWING_CODE": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "low"
+      },
+      "FIXING_FEEDBACK": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "low"
+      },
+      "CHANGES_REQUESTED": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "low"
+      },
+      "READY_TO_MERGE": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "low"
+      },
+      "RECONCILING": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "medium"
+      },
+      "BLOCKED_REQUIREMENTS": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "low"
+      },
+      "BLOCKED_REPOSITORY": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "low"
+      },
+      "FAILED_RECOVERABLE": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "low"
+      },
+      "CODEX_FAILURE": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "medium"
+      }
+    },
+    "isolation": "bubblewrap",
+    "resource_limits": {
+      "address_space_bytes": 8589934592,
+      "cpu_seconds": 14400,
+      "file_size_bytes": 2147483648
+    },
+    "runtime_read_paths": [],
+    "gateway": {
+      "base_url": "https://api.openai.com/v1",
+      "allowed_hosts": ["api.openai.com"],
+      "credential_environment_variable": "OPENAI_API_KEY",
+      "max_requests": 200,
+      "max_output_tokens": 16384
     }
   },
   "budgets": {
@@ -64,16 +124,49 @@
     "verifying": 1800,
     "reviewing_code": 1200,
     "fixing_feedback": 1200,
-    "reconciling": 600
+    "reconciling": 600,
+    "planning": 600
   },
   "workflow": {
-    "allow_push": true,
-    "allow_pr_creation": true,
-    "allow_comments": true,
-    "allow_thread_resolution": true,
-    "auto_merge": true,
+    "allow_push": false,
+    "allow_pr_creation": false,
+    "allow_comments": false,
+    "allow_thread_resolution": false,
+    "auto_merge": false,
     "merge_method": "squash",
     "terminal_policy": "park_and_advance",
-    "internal_review": true
+    "internal_review": true,
+    "required_checks": [],
+    "allow_no_checks": false
+  },
+  "intent": {
+    "require_acceptance_criteria": true
+  },
+  "deployment": {
+    "mode": "development",
+    "canary_valid_hours": 168,
+    "provider_canary_valid_hours": 24
+  },
+  "local_delivery": {
+    "mode": "artifact",
+    "cleanup_verified_worktree": false
+  },
+  "verification": {
+    "required": true,
+    "checks": [],
+    "allowed_paths": [
+      "**"
+    ],
+    "protected_paths": [
+      ".github/**",
+      "verification/**",
+      "src/test/**",
+      "tests/**",
+      "build.gradle",
+      "settings.gradle",
+      "gradlew"
+    ],
+    "max_changed_files": 100,
+    "runtime_read_paths": []
   }
 }

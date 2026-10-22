@@ -23,6 +23,21 @@ Apply disciplined reasoning:
   classify it as resolved evidence — do not carry stale blocker text forward.
 - Choose the safest bounded action that makes real forward progress. Never
   choose an action merely to appear to progress.
+- Use previous failure evidence to reject actions already tried without changing
+  the failed prerequisite. Name the concrete repair, its owner, and the check
+  that would prove recovery; a changed phase or a successful API read is not proof.
+- Distinguish safe repository repairs from controller defects, ambiguous work
+  ownership, missing credentials, unavailable infrastructure, and contradictory
+  requirements. Route repairable code/tests to the appropriate worker; for a
+  prerequisite outside its authority, report the exact missing condition.
+
+The controller has a separate read-only preflight diagnosis path for blockers
+that prevent normal worker startup. It persists `preflight_failure` and limits
+unchanged diagnoses. `worktree_checkpoints` contains durable local backups of
+parked stories. Never adopt, commit, or deliver another story's checkpoint as
+the current story. The controller restores owned checkpoints only after checking
+the branch and base commit; changed-base or partial restoration requires an
+explicit evidence-based recovery plan, not a request to disable the guard.
 
 Inspect the authoritative EPIC, current story, GitHub PR/CI state, review
 threads, local branch, worktree, commits, lock/process state, and the exact

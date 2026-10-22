@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<!DOCTYPE suppressions PUBLIC "-//Checkstyle//DTD SuppressionXpathFilter Experimental Configuration 1.2//EN" "https://checkstyle.org/dtds/suppressions_1_2_xpath_experimental.dtd">
+<!-- Explicit pre-existing complexity debt. New methods remain subject to strict thresholds. -->
+<suppressions>
+  <suppress-xpath files="[/\\]BoundedProcess.java" checks="MethodLength|CyclomaticComplexity" query="//METHOD_DEF[IDENT[@text='run']]"/>
+  <suppress-xpath files="[/\\]CiGate.java" checks="MethodLength|CyclomaticComplexity" query="//METHOD_DEF[IDENT[@text='evaluate']]"/>
+  <suppress-xpath files="[/\\]CodexRunner.java" checks="MethodLength|CyclomaticComplexity" query="//METHOD_DEF[IDENT[@text='run']]"/>
+  <suppress-xpath files="[/\\]Config.java" checks="MethodLength|CyclomaticComplexity" query="//METHOD_DEF[IDENT[@text='validate']]"/>
+  <suppress-xpath files="[/\\]Controller.java" checks="MethodLength|CyclomaticComplexity" query="//METHOD_DEF[IDENT[@text='run']]"/>
+  <suppress-xpath files="[/\\]Engine.java" checks="MethodLength|CyclomaticComplexity" query="//METHOD_DEF[IDENT[@text='actionableFeedback']]"/>
+  <suppress-xpath files="[/\\]Engine.java" checks="MethodLength|CyclomaticComplexity" query="//METHOD_DEF[IDENT[@text='detectDeviation']]"/>
+  <suppress-xpath files="[/\\]Engine.java" checks="MethodLength|CyclomaticComplexity" query="//METHOD_DEF[IDENT[@text='reviewEvents']]"/>
+  <suppress-xpath files="[/\\]GitOperations.java" checks="MethodLength|CyclomaticComplexity" query="//METHOD_DEF[IDENT[@text='validateStagingPaths']]"/>
+  <suppress-xpath files="[/\\]GoalContract.java" checks="MethodLength|CyclomaticComplexity" query="//METHOD_DEF[IDENT[@text='capture']]"/>
+  <suppress-xpath files="[/\\]InternalReviewGate.java" checks="MethodLength|CyclomaticComplexity" query="//METHOD_DEF[IDENT[@text='run']]"/>
+  <suppress-xpath files="[/\\]RuntimeVerifier.java" checks="MethodLength|CyclomaticComplexity" query="//METHOD_DEF[IDENT[@text='verify']]"/>
+  <suppress-xpath files="[/\\]StateRecovery.java" checks="MethodLength|CyclomaticComplexity" query="//METHOD_DEF[IDENT[@text='applyReconciliationDecision']]"/>
+  <suppress-xpath files="[/\\]TaskPlan.java" checks="MethodLength|CyclomaticComplexity" query="//METHOD_DEF[IDENT[@text='validate']]"/>
+  <suppress-xpath files="[/\\]WorkflowOrchestrator.java" checks="MethodLength|CyclomaticComplexity" query="//METHOD_DEF[IDENT[@text='deliverVerifiedWork']]"/>
+  <suppress-xpath files="[/\\]WorkflowOrchestrator.java" checks="MethodLength|CyclomaticComplexity" query="//METHOD_DEF[IDENT[@text='executeTick']]"/>
+  <suppress-xpath files="[/\\]WorkflowOrchestrator.java" checks="MethodLength|CyclomaticComplexity" query="//METHOD_DEF[IDENT[@text='handleReconcileDecision']]"/>
+  <suppress-xpath files="[/\\]WorkflowOrchestrator.java" checks="MethodLength|CyclomaticComplexity" query="//METHOD_DEF[IDENT[@text='handleStuckHeadForFeedback']]"/>
+  <suppress-xpath files="[/\\]WorkflowOrchestrator.java" checks="MethodLength|CyclomaticComplexity" query="//METHOD_DEF[IDENT[@text='handleWaitAndMergeGate']]"/>
+  <suppress-xpath files="[/\\]WorkflowOrchestrator.java" checks="MethodLength|CyclomaticComplexity" query="//METHOD_DEF[IDENT[@text='reconcilePrScoped']]"/>
+  <suppress-xpath files="[/\\]WorkflowOrchestrator.java" checks="MethodLength|CyclomaticComplexity" query="//METHOD_DEF[IDENT[@text='runDeviationSupervisor']]"/>
+  <suppress-xpath files="[/\\]WorkflowOrchestrator.java" checks="MethodLength|CyclomaticComplexity" query="//METHOD_DEF[IDENT[@text='runInternalReviewGate']]"/>
+  <suppress-xpath files="[/\\]WorkflowOrchestrator.java" checks="MethodLength|CyclomaticComplexity" query="//METHOD_DEF[IDENT[@text='runWorkerPhase']]"/>
+  <suppress-xpath files="[/\\]WorkflowOrchestrator.java" checks="MethodLength|CyclomaticComplexity" query="//METHOD_DEF[IDENT[@text='selectAndAdoptStory']]"/>
+</suppressions>

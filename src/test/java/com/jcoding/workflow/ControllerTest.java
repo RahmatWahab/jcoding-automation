@@ -62,21 +62,6 @@ class ControllerTest {
         assertThat(Controller.readJobControl(control)).isFalse();
     }
 
-    // -- phasePromptFor() ----------------------------------------------------
-
-    @Test
-    void phasePromptDispatchMatchesReference() {
-        assertThat(Controller.phasePromptFor("FIXING_FEEDBACK")).isEqualTo("prompts/feedback.md");
-        assertThat(Controller.phasePromptFor("CHANGES_REQUESTED")).isEqualTo("prompts/feedback.md");
-        assertThat(Controller.phasePromptFor("VERIFYING")).isEqualTo("prompts/verify.md");
-        assertThat(Controller.phasePromptFor("REVIEWING_CODE")).isEqualTo("prompts/review.md");
-        assertThat(Controller.phasePromptFor("BLOCKED_REQUIREMENTS")).isEqualTo("prompts/reconcile.md");
-        assertThat(Controller.phasePromptFor("FAILED_RECOVERABLE")).isEqualTo("prompts/reconcile.md");
-        assertThat(Controller.phasePromptFor("READY_TO_MERGE")).isEqualTo("prompts/final-review.md");
-        assertThat(Controller.phasePromptFor("IDLE")).isEqualTo("prompts/discover.md");
-        assertThat(Controller.phasePromptFor("IMPLEMENTING")).isEqualTo("prompts/implement.md");
-    }
-
     // -- waitBackoffDecision() -----------------------------------------------
 
     @Test

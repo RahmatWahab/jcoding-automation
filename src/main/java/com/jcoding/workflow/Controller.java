@@ -173,6 +173,18 @@ public final class Controller {
         return new Options(config, jobControl, prompt, forceRun);
     }
 
+    private static String argument(String[] args, String name) {
+        for (int i = 0; i < args.length; i++) {
+            if (name.equals(args[i])) {
+                if (i + 1 >= args.length || args[i + 1].startsWith("--")) {
+                    throw new IllegalArgumentException("Missing value for " + name);
+                }
+                return args[i + 1];
+            }
+        }
+        return null;
+    }
+
     /**
      * Entry point. Returns a process exit code. This is the JSON/JVM analogue of
      * the process entry flow; it performs configuration validation, the job
@@ -180,21 +192,64 @@ public final class Controller {
      * Codex execution, and durable state persistence.
      */
     public static int run(String[] args) {
+        return run(args, null, null);
+    }
+
+    /** Test seam for nondeterministic local worker/verifier boundaries; production supplies real adapters. */
+    static int run(String[] args, LocalRequestWorkflow.Worker localWorker, RuntimeVerifier localVerifier) {
         Options options = parseArgs(args);
         Path root = repositoryRoot();
+        boolean inspectEffects = java.util.Arrays.asList(args).contains("--list-effects");
+        boolean providerCanary = java.util.Arrays.asList(args).contains("--provider-canary");
+        String localRequest;
+        String retryEffect;
+        String retryReason;
+        try {
+            retryEffect = argument(args, "--retry-effect");
+            retryReason = argument(args, "--effect-reason");
+            localRequest = argument(args, "--request-file");
+        } catch (IllegalArgumentException exc) {
+            log.error("BLOCKED_CONFIGURATION: {}", exc.getMessage());
+            return 1;
+        }
+        boolean effectOperation = inspectEffects || retryEffect != null;
 
         Map<String, Object> config;
         try {
             config = Config.load(root.resolve(options.configPath()));
             Config.validate(config);
+            config.put("_controller_root", root.toAbsolutePath().normalize().toString());
+            if (java.util.Arrays.asList(args).contains("--readiness")) {
+                List<String> gaps = DeploymentPolicy.readiness(config);
+                if (gaps.isEmpty()) gaps.addAll(HostReadiness.diagnose(config));
+                log.info("DEPLOYMENT READINESS: {}", gaps.isEmpty() ? "HOST_READY_PROVIDER_UNVERIFIED" : gaps);
+                return gaps.isEmpty() ? 0 : 1;
+            }
+            if (providerCanary) {
+                List<String> gaps = DeploymentPolicy.readiness(config);
+                if (gaps.isEmpty()) gaps.addAll(HostReadiness.diagnose(config));
+                if (!gaps.isEmpty()) throw new IllegalArgumentException(String.join("; ", gaps));
+            }
+            if (!effectOperation && !providerCanary && localRequest == null
+                    && !Engine.asBool(Config.section(config, "automation").get("dry_run"), true)) {
+                List<String> gaps = DeploymentPolicy.readiness(config);
+                if (gaps.isEmpty()) gaps.addAll(HostReadiness.diagnose(config));
+                if (!gaps.isEmpty()) throw new IllegalArgumentException(String.join("; ", gaps));
+            }
+            config.put("_job_control_path", root.resolve(options.jobControlPath()).toString());
+            config.put("_force_run", options.forceRun());
         } catch (IOException | RuntimeException exc) {
             log.error("BLOCKED_CONFIGURATION: " + exc.getMessage());
             return 1;
         }
 
         int epicNumber = Engine.asInt(Config.section(config, "epic").get("number"));
+        if (localRequest != null && epicNumber <= 0) {
+            log.error("BLOCKED_CONFIGURATION: local requests require a positive epic number");
+            return 1;
+        }
 
-        if (!options.forceRun() && !readJobControl(root.resolve(options.jobControlPath()))) {
+        if (!effectOperation && !providerCanary && !options.forceRun() && !readJobControl(root.resolve(options.jobControlPath()))) {
             log.info("SKIPPED: job_start is not true");
             return 0;
         }
@@ -249,6 +304,29 @@ public final class Controller {
         clearMarker(Path.of(lockPath + ".lastskip"));
         StateStore store = new StateStore(statePath);
         try {
+            if (providerCanary) {
+                boolean passed = ProviderCanary.run(config);
+                if (passed) {
+                    Map<String, Object> canaryState = store.load();
+                    canaryState.put("provider_canary", Map.of("configuration_hash", DeploymentPolicy.fingerprint(config),
+                            "verified_at", now()));
+                    store.save(canaryState);
+                }
+                log.info("PROVIDER CANARY: {}", passed ? "PASSED_READ_ONLY" : "FAILED");
+                return passed ? 0 : 1;
+            }
+            if (effectOperation) {
+                if (inspectEffects) {
+                    for (Map<String, Object> effect : store.uncertainEffects()) {
+                        log.info("UNCERTAIN EFFECT: key={} kind={} created_at={}", effect.get("key"),
+                                effect.get("kind"), effect.get("created_at"));
+                    }
+                    return 0;
+                }
+                store.authorizeEffectRetry(retryEffect, retryReason);
+                log.info("ONE-SHOT EFFECT RETRY AUTHORIZED: key={}", retryEffect);
+                return 0;
+            }
             Map<String, Object> state = store.load();
 
             if (StateRecovery.repairLegacyQuotaState(state)) {
@@ -321,22 +399,74 @@ public final class Controller {
                 store.save(state);
             }
 
-            Path repo = Path.of(Engine.asString(Config.section(config, "repository").get("local_path")));
-            if (!Files.exists(repo.resolve(".git"))) {
+            Path configuredRepo = Path.of(Engine.asString(Config.section(config, "repository").get("local_path")));
+            if (!Files.exists(configuredRepo.resolve(".git"))) {
                 state.put("phase", "BLOCKED_REPOSITORY");
-                state.put("error", "Git repository not found: " + repo);
+                state.put("error", "Git repository not found: " + configuredRepo);
                 store.save(state);
                 log.error(String.valueOf(state.get("error")));
                 return 1;
             }
+            Path repo = dryRun ? configuredRepo : IsolatedCheckout.open(configuredRepo, epicNumber);
+            String priorCheckout = Engine.asString(state.get("worker_checkout"));
+            if (!priorCheckout.isBlank() && !priorCheckout.equals(repo.toAbsolutePath().normalize().toString())) {
+                throw new IllegalStateException("Persisted worker checkout differs from configured repository identity");
+            }
+            if (!dryRun && priorCheckout.isBlank()) {
+                state.put("worker_checkout", repo.toAbsolutePath().normalize().toString());
+                state.put("worker_checkout_lifecycle", "ACTIVE");
+                state.put("worker_checkout_owner", Map.of("epic", epicNumber,
+                        "repository", Engine.asString(Config.section(config, "repository").get("local_path")),
+                        "checkout", repo.toAbsolutePath().normalize().toString(), "created_at", now()));
+                store.save(state);
+            }
+            if (!dryRun && "DONE".equals(state.get("local_outcome"))
+                    && state.get("worker_checkout_lifecycle") instanceof String lifecycle
+                    && !"CLEANED".equals(lifecycle)) {
+                String sourceFingerprint = state.get("local_delivery_result") instanceof Map<?, ?> delivery
+                        ? Engine.asString(delivery.get("source_fingerprint")) : "";
+                IsolatedCheckout.CleanupResult cleanup = IsolatedCheckout.cleanupDetailed(
+                        Path.of(Engine.asString(Config.section(config, "repository").get("local_path"))),
+                        Engine.asInt(state.get("current_story")), repo, true, sourceFingerprint);
+                if (cleanup.removed()) {
+                    state.put("worker_checkout_lifecycle", "CLEANED");
+                    store.save(state);
+                } else if (cleanup.reason().contains("changed after verified artifact")) {
+                    state.put("worker_checkout_lifecycle", "VERIFIED_ARTIFACT_SOURCE_CHANGED_RETAINED");
+                    store.save(state);
+                }
+            }
+            if (localRequest == null && state.get("tool_effect_pending") instanceof Map<?, ?> pending) {
+                state.put("phase", "BLOCKED_REPOSITORY");
+                state.put("error", "Interrupted worker tool effect requires source inspection: "
+                        + pending.get("execution_id"));
+                store.save(state);
+                return 1;
+            }
+            if (localRequest != null) {
+                CodexRunner localRunner = new CodexRunner();
+                LocalRequestWorkflow.Worker selectedWorker = localWorker == null
+                        ? (workerConfig, prompt, checkout, heartbeat, timeout) ->
+                                localRunner.run(workerConfig, prompt, checkout, dryRun, heartbeat, timeout)
+                        : localWorker;
+                long trialStarted = System.nanoTime();
+                long workerCallsBefore = Engine.asLongOrDefault(state.get("local_worker_calls"), 0);
+                int outcome = new LocalRequestWorkflow(config, state, store, lock, repo, root,
+                        selectedWorker, localVerifier == null ? RuntimeVerifier.isolated(config) : localVerifier, dryRun)
+                        .run(root.resolve(localRequest), epicNumber);
+                recordLocalEvaluation(store, state, repo, trialStarted, workerCallsBefore, outcome);
+                return outcome;
+            }
 
             Map<String, Object> githubConfig = Config.section(config, "github");
-            GitHub github = new GitHub(
+            GitHub github = localRequest == null ? new GitHub(
                     Engine.asString(Config.section(config, "repository").get("owner")),
                     Engine.asString(Config.section(config, "repository").get("name")),
                     Engine.asString(githubConfig.getOrDefault("token_environment_variable", "GH_TOKEN")),
                     Engine.asString(githubConfig.getOrDefault("cli", "gh")),
-                    (int) Engine.asLongOrDefault(githubConfig.get("timeout_seconds"), 30));
+                    (int) Engine.asLongOrDefault(githubConfig.get("timeout_seconds"), 30))
+                    : new LocalRequestGitHub(root.resolve(localRequest), epicNumber);
+            github.cancellationCheck(() -> new ActionPolicy(config, dryRun).checkActive());
 
             Map<String, Object> epic;
             List<Map<String, Object>> prs;
@@ -344,9 +474,15 @@ public final class Controller {
                 lock.refresh();
                 log.info("PHASE: GitHub issue read #" + epicNumber);
                 epic = asMap(github.issue(epicNumber));
+                Map<String, Object> epicConfig = Config.section(config, "epic");
+                if (epicConfig.containsKey("story_numbers")) {
+                    epic.put("story_numbers", epicConfig.get("story_numbers"));
+                } else if (!Boolean.TRUE.equals(epicConfig.get("legacy_body_links"))) {
+                    epic.put("story_numbers", github.childStoryNumbers(epicNumber));
+                }
                 log.info("PHASE: GitHub PR list");
                 prs = asMapList(github.prs());
-                state.remove("error");
+                // A successful API read does not resolve a persisted workflow blocker.
             } catch (GitHubError exc) {
                 state.put("phase", "BLOCKED_EXTERNAL");
                 state.put("error", exc.getMessage());
@@ -360,7 +496,11 @@ public final class Controller {
                     config, state, store, github, repo, root, epic, epicNumber, dryRun,
                     new GitOperationsFactory(repo), new CodexRunner(),
                     new ReviewCoordinator(), lock);
-            return orchestrator.reconcileAndExecute(prs, options.prompt());
+            long trialStarted = System.nanoTime();
+            long workerCallsBefore = totalWorkerCalls(state);
+            int outcome = orchestrator.reconcileAndExecute(prs, options.prompt());
+            recordGithubEvaluation(store, state, repo, trialStarted, workerCallsBefore, outcome);
+            return outcome;
         } catch (WorkflowLock.LockOwnershipLost lost) {
             // Another controller recovered this lock as stale and took over mid
             // run. This is an expected, benign hand-off (not a fault): stop this
@@ -375,6 +515,59 @@ public final class Controller {
         } finally {
             lock.release(lockToken);
         }
+    }
+
+    /** Persist privacy-minimal outcome and cost evidence for this local controller trial. */
+    private static void recordLocalEvaluation(StateStore store, Map<String, Object> state, Path checkout,
+                                              long startedNanos, long workerCallsBefore, int exitCode) {
+        String status = exitCode == 0 && "DONE".equals(Engine.asString(state.get("local_outcome")))
+                ? "PASSED" : ("BLOCKED".equals(Engine.asString(state.get("local_outcome")))
+                        || "CANCELLED".equals(Engine.asString(state.get("local_outcome"))) ? "BLOCKED" : "INCOMPLETE");
+        Map<String, Object> goal = state.get("goal_contract") instanceof Map<?, ?> raw ? asMap(raw) : Map.of();
+        String sourceHash;
+        try { sourceHash = GitOperations.forRepo(checkout).recoveryFingerprint(); }
+        catch (RuntimeException unavailable) { sourceHash = ""; }
+        Map<?, ?> stories = state.get("story_budgets") instanceof Map<?, ?> raw ? raw : Map.of();
+        Map<?, ?> budget = stories.get(String.valueOf(state.get("current_story"))) instanceof Map<?, ?> raw
+                ? raw : Map.of();
+        boolean usageKnown = Engine.asLongOrDefault(budget.get("calls_without_usage"), 0) == 0
+                && (budget.containsKey("input_tokens") || budget.containsKey("output_tokens"));
+        Long inputTokens = usageKnown && budget.containsKey("input_tokens")
+                ? Engine.asLongOrDefault(budget.get("input_tokens"), 0) : null;
+        Long outputTokens = usageKnown && budget.containsKey("output_tokens")
+                ? Engine.asLongOrDefault(budget.get("output_tokens"), 0) : null;
+        int calls = (int) Math.max(0, Engine.asLongOrDefault(state.get("local_worker_calls"), 0) - workerCallsBefore);
+        int recoveries = (int) Math.max(0, Engine.asLongOrDefault(state.get("local_recovery_count"), 0));
+        store.recordEvaluationRun(Engine.asString(state.get("execution_id")), "controller-local-v1",
+                "local-request", status, Engine.asString(goal.get("requirements_hash")), sourceHash,
+                calls, Math.max(0, (System.nanoTime() - startedNanos) / 1_000_000L),
+                inputTokens, outputTokens, recoveries, Engine.asString(state.get("phase")));
+    }
+
+    private static void recordGithubEvaluation(StateStore store, Map<String, Object> state, Path checkout,
+                                               long startedNanos, long workerCallsBefore, int exitCode) {
+        String phase = Engine.asString(state.get("phase"));
+        String status = exitCode == 0 && "EPIC_COMPLETE".equals(phase) ? "PASSED"
+                : phase.startsWith("BLOCKED") || "FAILED".equals(Engine.asString(state.get("worker_status")))
+                        ? "BLOCKED" : "INCOMPLETE";
+        Map<String, Object> goal = state.get("goal_contract") instanceof Map<?, ?> raw ? asMap(raw) : Map.of();
+        String sourceHash;
+        try { sourceHash = GitOperations.forRepo(checkout).recoveryFingerprint(); }
+        catch (RuntimeException unavailable) { sourceHash = ""; }
+        long callsNow = totalWorkerCalls(state);
+        store.recordEvaluationRun(Engine.asString(state.get("execution_id")), "controller-github-v1",
+                "github-story-workflow", status, Engine.asString(goal.get("requirements_hash")), sourceHash,
+                (int) Math.max(0, callsNow - workerCallsBefore),
+                Math.max(0, (System.nanoTime() - startedNanos) / 1_000_000L), null, null,
+                (int) Math.max(0, Engine.asLongOrDefault(state.get("recovery_count"), 0)), phase);
+    }
+
+    private static long totalWorkerCalls(Map<String, Object> state) {
+        if (!(state.get("story_budgets") instanceof Map<?, ?> stories)) return 0;
+        long total = 0;
+        for (Object value : stories.values()) if (value instanceof Map<?, ?> budget)
+            total += Math.max(0, Engine.asLongOrDefault(budget.get("calls"), 0));
+        return total;
     }
 
     /** Repository root: two levels up from the compiled classes / working dir. */

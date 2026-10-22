@@ -152,6 +152,7 @@ class ConfigTest {
         // auto_merge=true enables fully autonomous merge; config is valid.
         Map<String, Object> config = valid();
         Config.section(config, "workflow").put("auto_merge", true);
+        Config.section(config, "codex").put("isolation", "bubblewrap");
         assertThatCode(() -> Config.validate(config)).doesNotThrowAnyException();
     }
 

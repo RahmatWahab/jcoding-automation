@@ -77,6 +77,10 @@ public final class Engine {
      * {@code #123} or Markdown links ending in {@code /issues/123}.
      */
     public static List<Integer> linkedStoryNumbers(Map<String, Object> epic) {
+        if (epic.containsKey("story_numbers")) {
+            return asList(epic.get("story_numbers")).stream().map(Engine::asInt)
+                    .filter(n -> n > 0 && n != asInt(epic.get("number"))).distinct().toList();
+        }
         String body = asString(epic.get("body"));
         int epicNumber = asInt(epic.get("number"));
         Matcher matcher = STORY_REFERENCE.matcher(body);
@@ -108,7 +112,7 @@ public final class Engine {
      */
     public static List<Map<String, Object>> prForStory(List<Map<String, Object>> prs, int story) {
         Pattern marker = Pattern.compile("(?<![A-Za-z0-9_])#" + story + "(?![0-9])");
-        Pattern branch = Pattern.compile("^story/" + story + "(?:-|$)");
+        Pattern branch = Pattern.compile("^story/" + story + "(?:-.+)?$");
         Pattern bodyOwnership = Pattern.compile(
                 "(?i)\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\s+#"
                         + story + "\\b|\\bimplements\\s+story\\s+#" + story + "\\b");
@@ -135,6 +139,11 @@ public final class Engine {
     public static Set<Integer> storyDependencies(Map<String, Object> story) {
         String body = asString(story.get("body"));
         Set<Integer> result = new LinkedHashSet<>();
+        for (Object dep : asList(story.get("dependencies"))) {
+            int number = asInt(dep);
+            if (number <= 0) throw new IllegalArgumentException("Invalid dependency identity");
+            result.add(number);
+        }
         Matcher matcher = DEPENDENCY.matcher(body);
         while (matcher.find()) {
             result.add(Integer.parseInt(matcher.group(1)));
@@ -210,28 +219,17 @@ public final class Engine {
         if (Boolean.FALSE.equals(pr.get("reviewThreadsAvailable"))) {
             return "BLOCKED_EXTERNAL";
         }
-        List<Object> checks = asList(pr.get("statusCheckRollup"));
-        for (Object c : checks) {
-            if (c instanceof Map<?, ?> check) {
-                Object conclusion = check.get("conclusion");
-                if (conclusion != null && FAILED_CONCLUSIONS.contains(conclusion)) {
-                    return "CHANGES_REQUESTED";
-                }
-            }
-        }
-        for (Object c : checks) {
-            if (c instanceof Map<?, ?> check) {
-                Object status = check.get("status");
-                if (status != null && PENDING_STATUSES.contains(status)) {
-                    return "WAITING_FOR_CI";
-                }
-            }
-        }
+        List<String> required = asList(pr.get("requiredChecks")).stream().map(String::valueOf).toList();
+        CiGate.Verdict ci = CiGate.evaluate(pr.get("statusCheckRollup"), required,
+                Boolean.TRUE.equals(pr.get("allowNoChecks")));
+        if (ci == CiGate.Verdict.FAILED) return "CHANGES_REQUESTED";
+        if (Boolean.TRUE.equals(pr.get("isDraft"))) return "BLOCKED_REQUIREMENTS";
         for (Object t : asList(pr.get("reviewThreads"))) {
             if (t instanceof Map<?, ?> thread && !asBool(thread.get("isResolved"), true)) {
                 return "CHANGES_REQUESTED";
             }
         }
+        if (ci == CiGate.Verdict.WAITING) return "WAITING_FOR_CI";
         if (codexReviewPending(pr)) {
             return "WAITING_FOR_CODEX_REVIEW";
         }
@@ -710,6 +708,7 @@ public final class Engine {
         Matcher matcher = pattern.matcher(output == null ? "" : output);
         String last = null;
         while (matcher.find()) {
+            if (last != null) return "INVALID";
             last = matcher.group(1).strip();
         }
         return last;
@@ -861,6 +860,7 @@ public final class Engine {
                 Matcher matcher = entry.getValue().matcher(output);
                 String last = null;
                 while (matcher.find()) {
+                    if (last != null) { last = "INVALID"; break; }
                     last = matcher.group(1).strip();
                 }
                 if (last != null) {

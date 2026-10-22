@@ -15,6 +15,15 @@ import org.junit.jupiter.api.Test;
  */
 class CodexRunnerTest {
 
+    @Test
+    void preflightDiagnosisCannotInheritSandboxBypass() {
+        List<String> command = CodexRunner.buildCommand(Map.of(
+                "diagnostic_read_only", true, "dangerously_bypass_sandbox", true,
+                "approval_policy", "never"), Path.of("/repo"));
+        assertThat(command).containsSubsequence("--sandbox", "read-only", "--ask-for-approval", "never");
+        assertThat(command).doesNotContain("--dangerously-bypass-approvals-and-sandbox", "--approve-for-me");
+    }
+
     @SafeVarargs
     private static Map<String, Object> map(Object... kv) {
         Map<String, Object> m = new LinkedHashMap<>();
@@ -34,17 +43,14 @@ class CodexRunnerTest {
                 Path.of("/repo"));
         assertThat(command).containsSubsequence("codex", "--cd", "/repo",
                 "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=medium",
-                "--approve-for-me", "exec", "--json", "-");
+                "--sandbox", "workspace-write", "--ask-for-approval", "never", "exec", "--json", "-");
     }
 
     @Test
-    void buildCommandUsesSandboxBypassInsteadOfApproval() {
-        List<String> command = CodexRunner.buildCommand(
-                map("executable", "codex", "approval_policy", "never",
-                        "dangerously_bypass_sandbox", true),
-                Path.of("/repo"));
-        assertThat(command).contains("--dangerously-bypass-approvals-and-sandbox");
-        assertThat(command).doesNotContain("--approve-for-me");
+    void buildCommandRejectsSandboxBypass() {
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> CodexRunner.buildCommand(
+                map("executable", "codex", "dangerously_bypass_sandbox", true), Path.of("/repo")))
+                .hasMessageContaining("Sandbox bypass");
     }
 
     // -- redactSensitive -----------------------------------------------------
@@ -141,8 +147,8 @@ class CodexRunnerTest {
                 map("executable", "codex", "model", "m", "reasoning_effort", "low",
                         "approval_policy", "never"),
                 Path.of("/repo"));
-        assertThat(command).contains("--approve-for-me");
-        assertThat(command).doesNotContain("--ask-for-approval");
+        assertThat(command).containsSubsequence("--ask-for-approval", "never");
+        assertThat(command).doesNotContain("--approve-for-me");
     }
 
     // -- per-phase override resolution --------------------------------------

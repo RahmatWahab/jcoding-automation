@@ -7,6 +7,10 @@ controller — not you — performs all commit/push/PR/merge operations, and onl
 when its configuration permits.
 
 Implement every explicit acceptance criterion for the supplied story:
+- When `active_task` is present in the context, complete that task and its
+  dependencies' assumptions only. The controller resumes the next task after
+  its own executable checks verify this task. Do not claim the whole plan is
+  complete from one worker call.
 - Inspect the existing architecture (AGENTS.md first) before editing; follow the
   repository's conventions and patterns rather than introducing new ones.
 - Fully use the internal skills - you have many internal skills make use of it.

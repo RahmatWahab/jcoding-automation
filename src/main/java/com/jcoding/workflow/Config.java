@@ -29,7 +29,7 @@ public final class Config {
 
     private static final Set<String> VALID_EFFORT = Set.of("low", "medium", "high", "xhigh", "none");
     private static final Set<String> KNOWN_BUDGET_PHASES =
-            Set.of("implementing", "verifying", "reviewing_code", "fixing_feedback", "reconciling");
+            Set.of("planning", "implementing", "verifying", "reviewing_code", "fixing_feedback", "reconciling");
     private static final List<String> MUTATION_FLAGS = List.of(
             "allow_push", "allow_pr_creation", "allow_comments",
             "allow_thread_resolution", "auto_merge");
@@ -153,6 +153,17 @@ public final class Config {
                 && !(codex.get("dangerously_bypass_sandbox") instanceof Boolean)) {
             missing.add("codex.dangerously_bypass_sandbox(boolean)");
         }
+        if (codex.containsKey("resource_limits")) {
+            if (!(codex.get("resource_limits") instanceof Map<?, ?> limits)) {
+                missing.add("codex.resource_limits(object)");
+            } else {
+                for (String key : List.of("address_space_bytes", "cpu_seconds", "file_size_bytes")) {
+                    if (limits.containsKey(key) && !isPositiveInt(limits.get(key))) {
+                        missing.add("codex.resource_limits." + key + "(positive integer)");
+                    }
+                }
+            }
+        }
 
         for (String key : MUTATION_FLAGS) {
             if (workflow.containsKey(key) && !(workflow.get(key) instanceof Boolean)) {
@@ -166,9 +177,90 @@ public final class Config {
         // boolean type is validated with the other mutation flags above; no
         // further merge-policy checks are needed.
 
+        if (Boolean.TRUE.equals(codex.get("dangerously_bypass_sandbox"))) missing.add("codex.dangerously_bypass_sandbox(must be false)");
+        if (!Set.of("native", "bubblewrap").contains(codex.getOrDefault("isolation", "native"))) missing.add("codex.isolation(native|bubblewrap)");
+        if (codex.containsKey("approval_policy") && !"never".equals(codex.get("approval_policy"))) missing.add("codex.approval_policy(never)");
+        for (String key : List.of("max_story_worker_calls", "max_story_active_seconds", "max_wait_diagnoses", "wait_timeout_seconds",
+                "max_preflight_diagnoses", "preflight_diagnosis_seconds", "max_delivery_recovery_attempts")) {
+            if (automation.containsKey(key) && !isPositiveInt(automation.get(key))) missing.add("automation." + key + "(positive integer)");
+        }
+        for (String key : List.of("max_story_tokens", "recovery_epoch")) {
+            if (automation.containsKey(key) && !isNonNegativeInt(automation.get(key))) missing.add("automation." + key + "(non-negative integer)");
+        }
+        Map<String, Object> verification = section(config, "verification");
+        Map<String, Object> localDelivery = section(config, "local_delivery");
+        if (!"artifact".equals(localDelivery.getOrDefault("mode", "artifact")))
+            missing.add("local_delivery.mode(artifact)");
+        if (verification.containsKey("required") && !(verification.get("required") instanceof Boolean)) missing.add("verification.required(boolean)");
+        if (verification.containsKey("max_changed_files") && !isPositiveInt(verification.get("max_changed_files"))) missing.add("verification.max_changed_files(positive integer)");
+        Set<String> checkIds = new java.util.HashSet<>();
+        for (Object value : Engine.asList(verification.get("checks"))) {
+            if (!(value instanceof Map<?, ?> check)) { missing.add("verification.checks(object array)"); continue; }
+            String id = Engine.asString(check.get("id"));
+            if (id.isBlank() || !checkIds.add(id)) missing.add("verification.checks(unique nonempty id)");
+            List<Object> command = Engine.asList(check.get("command"));
+            if (command.isEmpty() || command.stream().anyMatch(arg -> !(arg instanceof String str) || str.isBlank())) missing.add("verification.checks.command(nonempty string array)");
+            if (check.containsKey("timeout_seconds") && !isPositiveInt(check.get("timeout_seconds"))) missing.add("verification.checks.timeout_seconds(positive integer)");
+        }
+        for (String key : List.of("allowed_paths", "protected_paths")) {
+            for (Object value : Engine.asList(verification.get(key))) {
+                try {
+                    String glob = String.valueOf(value);
+                    if (glob.startsWith("/") || glob.contains("..")) throw new IllegalArgumentException();
+                    java.nio.file.FileSystems.getDefault().getPathMatcher("glob:" + glob);
+                } catch (RuntimeException exc) { missing.add("verification." + key + "(relative glob)"); }
+            }
+        }
+        if (Boolean.TRUE.equals(workflow.get("auto_merge")) && !"bubblewrap".equals(codex.get("isolation"))) {
+            missing.add("codex.isolation(bubblewrap required for automatic merge)");
+        }
+
+        Map<String, Object> intent = section(config, "intent");
+        if (intent.containsKey("default_intent") && IntentRegistry.find(Engine.asString(intent.get("default_intent"))) == null) {
+            missing.add("intent.default_intent(registered capability)");
+        }
+        if (intent.containsKey("require_acceptance_criteria") && !(intent.get("require_acceptance_criteria") instanceof Boolean)) {
+            missing.add("intent.require_acceptance_criteria(boolean)");
+        }
+        if (intent.containsKey("delegated_responders") && (!(intent.get("delegated_responders") instanceof List<?> delegates)
+                || delegates.size() > 20 || delegates.stream().anyMatch(value -> !(value instanceof String login)
+                || !login.matches("[A-Za-z0-9-]{1,39}")))) {
+            missing.add("intent.delegated_responders(GitHub login array)");
+        }
+        if (automation.containsKey("max_task_attempts") && !isPositiveInt(automation.get("max_task_attempts"))) missing.add("automation.max_task_attempts(positive integer)");
+        if (automation.containsKey("max_plan_revisions") && !isPositiveInt(automation.get("max_plan_revisions"))) missing.add("automation.max_plan_revisions(positive integer)");
+        validateDeployment(config, missing);
+
         if (!missing.isEmpty()) {
             throw new IllegalArgumentException("invalid configuration: " + String.join(", ", missing));
         }
+    }
+
+    private static void validateDeployment(Map<String, Object> config, List<String> missing) {
+        Map<String, Object> deployment = section(config, "deployment");
+        if (!Set.of("development", "canary", "autonomous").contains(deployment.getOrDefault("mode", "development"))) missing.add("deployment.mode(development|canary|autonomous)");
+        for (String key : List.of("canary_story", "canary_valid_hours", "provider_canary_valid_hours")) {
+            if (deployment.containsKey(key) && !isPositiveInt(deployment.get(key))) missing.add("deployment." + key + "(positive integer)");
+        }
+        Map<String, Object> gateway = section(section(config, "codex"), "gateway");
+        for (String key : List.of("max_requests", "max_output_tokens")) {
+            if (gateway.containsKey(key) && !isPositiveInt(gateway.get(key))) missing.add("codex.gateway." + key + "(positive integer)");
+        }
+        validateGatewayOrigin(gateway, missing);
+        String credential = Engine.asString(gateway.getOrDefault("credential_environment_variable", "OPENAI_API_KEY"));
+        if (!credential.matches("[A-Z_][A-Z0-9_]*")) missing.add("codex.gateway.credential_environment_variable(environment name)");
+    }
+
+    private static void validateGatewayOrigin(Map<String, Object> gateway, List<String> missing) {
+        try {
+            java.net.URI uri = java.net.URI.create(Engine.asString(gateway.getOrDefault("base_url", "https://api.openai.com/v1")));
+            List<Object> hosts = Engine.asList(gateway.getOrDefault("allowed_hosts", List.of("api.openai.com")));
+            if (!"https".equals(uri.getScheme()) || uri.getHost() == null || !hosts.contains(uri.getHost())
+                    || uri.getUserInfo() != null || uri.getQuery() != null || uri.getFragment() != null
+                    || hosts.stream().anyMatch(h -> !(h instanceof String str) || str.contains("*") || str.isBlank())) {
+                missing.add("codex.gateway(HTTPS origin with exact allowed host required)");
+            }
+        } catch (RuntimeException exc) { missing.add("codex.gateway.base_url(valid HTTPS URL)"); }
     }
 
     @SuppressWarnings("unchecked")

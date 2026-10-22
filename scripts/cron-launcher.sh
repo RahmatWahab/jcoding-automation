@@ -16,23 +16,19 @@ if [[ -f "$ENV_FILE" ]]; then
     echo "BLOCKED: environment file must have mode 600: $ENV_FILE" >&2
     exit 1
   fi
-  set -a
-  # shellcheck disable=SC1090
-  source "$ENV_FILE"
-  set +a
-fi
-
-# Support operators who intentionally export GH_TOKEN from .bashrc, without
-# sourcing all of .bashrc (interactive guards and arbitrary commands are unsafe).
-if [[ -z "${GH_TOKEN:-}" && -f "$HOME/.bashrc" ]]; then
-  set +u
-  while IFS= read -r line; do
-    if [[ "$line" =~ ^[[:space:]]*export[[:space:]]+GH_TOKEN= ]]; then
-      eval "$line"
-      break
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ ! "$line" =~ ^(GH_TOKEN|OPENAI_API_KEY|CODEX_API_KEY)=(.*)$ ]]; then
+      echo "BLOCKED: unsupported environment assignment in $ENV_FILE" >&2
+      exit 1
     fi
-  done < "$HOME/.bashrc"
-  set -u
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
+    if [[ "$value" == \'*\' && "$value" == *\' ]]; then value="${value:1:${#value}-2}"; fi
+    printf -v "$key" '%s' "$value"
+    export "$key"
+  done < "$ENV_FILE"
 fi
 
 exec "$ROOT/scripts/run_once.sh"

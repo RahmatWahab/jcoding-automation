@@ -17,6 +17,30 @@ import org.junit.jupiter.api.Test;
  */
 class GitHubTest {
 
+    @Test
+    void prListingPaginatesAndIncludesOwnership() {
+        List<List<String>> calls = new ArrayList<>();
+        GitHub github = withRunner((command, timeout) -> {
+            calls.add(command);
+            boolean next = command.contains("after=next");
+            return new GitHub.CommandResult(0, "{\"data\":{\"repository\":{\"pullRequests\":{"
+                    + "\"nodes\":[{\"number\":" + (next ? 2 : 1) + "}],\"pageInfo\":{\"hasNextPage\":"
+                    + !next + ",\"endCursor\":\"next\"}}}}}", "");
+        });
+        assertThat((List<?>) github.prs()).hasSize(2);
+        assertThat(calls).hasSize(2);
+        assertThat(calls.getFirst().toString()).contains("headRefOid", "headRefName");
+    }
+
+    @Test
+    void mergeAtomicallyRequiresExpectedHead() {
+        List<List<String>> calls = new ArrayList<>();
+        GitHub gh = withRunner((command, timeout) -> { calls.add(command); return new GitHub.CommandResult(0,"",""); });
+        gh.mergePr(42, "squash", "abc123");
+        assertThat(calls.getFirst()).containsSubsequence("--match-head-commit", "abc123");
+        assertThatThrownBy(() -> gh.mergePr(42,"squash", "")).hasMessageContaining("expected head");
+    }
+
     @SafeVarargs
     private static Map<String, Object> map(Object... kv) {
         Map<String, Object> m = new LinkedHashMap<>();
@@ -214,6 +238,32 @@ class GitHubTest {
         Object out = shell.run("-c", script);
         assertThat(out).isInstanceOf(String.class);
         assertThat(((String) out).length()).isGreaterThan(500000);
+    }
+
+    @Test
+    void oversizedLocalCliOutputIsBoundedAndCancelledCallsStop() {
+        GitHub shell = new GitHub("owner", "repo", "GH_TOKEN", "/bin/sh", 10,
+                GitHub.defaultRunner(), name -> "token");
+        assertThatThrownBy(() -> shell.run("-c", "yes x | head -c 9000000"))
+                .isInstanceOf(GitHubError.class).hasMessageContaining("exceeded 8 MiB");
+        java.util.concurrent.atomic.AtomicBoolean interruptObserved = new java.util.concurrent.atomic.AtomicBoolean();
+        GitHub pending = withRunner((command, timeout) -> {
+            try { Thread.sleep(10_000); }
+            catch (InterruptedException cancelled) {
+                interruptObserved.set(true);
+                Thread.currentThread().interrupt();
+            }
+            return new GitHub.CommandResult(0, "{}", "");
+        });
+        java.util.concurrent.atomic.AtomicInteger checks = new java.util.concurrent.atomic.AtomicInteger();
+        pending.cancellationCheck(() -> {
+            if (checks.incrementAndGet() > 1) throw new IllegalStateException("cancelled");
+        });
+        assertThatThrownBy(() -> pending.run("api", "test")).hasMessageContaining("cancelled");
+        for (int i = 0; i < 50 && !interruptObserved.get(); i++) {
+            try { Thread.sleep(10); } catch (InterruptedException exc) { Thread.currentThread().interrupt(); break; }
+        }
+        assertThat(interruptObserved).isTrue();
     }
 
     // -- pr() review-thread aggregation and fail-closed behavior -------------

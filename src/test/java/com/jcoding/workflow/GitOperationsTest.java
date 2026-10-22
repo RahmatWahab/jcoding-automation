@@ -33,6 +33,7 @@ class GitOperationsTest {
     private static final class FakeGit implements GitOperations.GitRunner {
         final List<List<String>> calls = new ArrayList<>();
         final Map<String, String> outputs = new LinkedHashMap<>();
+        String staged = "";
 
         FakeGit output(String key, String value) {
             outputs.put(key, value);
@@ -43,12 +44,22 @@ class GitOperationsTest {
         public GitOperations.GitResult run(Path repo, List<String> args) {
             calls.add(args);
             String stdout = "";
-            if (args.size() >= 2) {
+            if (!args.isEmpty() && args.getFirst().equals("add")) {
+                int separator = args.indexOf("--");
+                if (separator >= 0 && separator + 1 < args.size())
+                    staged = String.join("\0", args.subList(separator + 1, args.size())) + "\0";
+            } else if (args.size() >= 3 && args.getFirst().equals("diff") && args.contains("--cached")) {
+                stdout = staged;
+            } else if (!args.isEmpty() && args.getFirst().equals("status")) {
+                stdout = outputs.getOrDefault("status --porcelain=v1 -z --untracked-files=all",
+                        outputs.getOrDefault("status --porcelain", "")).replace('\n', '\0');
+            } else if (args.size() >= 2) {
                 stdout = outputs.getOrDefault(args.get(0) + " " + args.get(1),
                         outputs.getOrDefault(args.get(0), ""));
             } else if (!args.isEmpty()) {
                 stdout = outputs.getOrDefault(args.get(0), "");
             }
+            if (args.equals(List.of("branch", "--show-current")) && stdout.isEmpty()) stdout = "story/test\n";
             return new GitOperations.GitResult(0, stdout, "");
         }
 
@@ -89,13 +100,13 @@ class GitOperationsTest {
         FakeGit git = new FakeGit();
         // First status returns a source change; rev-parse returns a sha.
         git.outputs.put("status --porcelain", " M src/file.txt\n");
+        git.outputs.put("branch --show-current", "feature\n");
         git.outputs.put("rev-parse HEAD", "abc\n");
         git.outputs.put("rev-parse", "abc\n");
         GitOperations ops = new GitOperations(Path.of("/repo"), git);
         ops.commitAndPush("feature", 1);
-        boolean found = git.calls.stream().anyMatch(c ->
-                c.size() >= 3 && c.get(0).equals("add") && c.get(1).equals("-A")
-                        && c.contains(":(exclude).codex"));
+        boolean found = git.calls.stream().anyMatch(c -> c.size() >= 4 && c.get(0).equals("add")
+                && c.get(1).equals("-A") && c.contains("src/file.txt") && !c.contains(".codex"));
         assertThat(found).isTrue();
     }
 
@@ -122,6 +133,7 @@ class GitOperationsTest {
                 "src/main/java/auth/TokenProvider.java", "src/auth/passwordReset.ts",
                 "scripts/provision_credentials.py")) {
             FakeGit git = new FakeGit().output("status --porcelain", "?? " + path + "\n");
+            git.output("branch --show-current", "story/81-test\n");
             new GitOperations(Path.of("/repo"), git).commitAndPush("story/81-test", 81);
             assertThat(git.hasCall("commit")).as(path).isTrue();
             assertThat(git.hasCall("push")).as(path).isTrue();
@@ -162,6 +174,51 @@ class GitOperationsTest {
         assertThat(ops.recoveryFingerprint()).hasSize(64).isNotEqualTo(before);
     }
 
+    @Test
+    void productionGitRunnerDisablesRepositoryHooksInRemoteFreeFixture(@TempDir Path repo) throws Exception {
+        Path canary = repo.resolveSibling("hook-canary.txt");
+        runFixtureGit(repo, "init", "-q", "-b", "story/9-safe");
+        runFixtureGit(repo, "config", "user.name", "Fixture");
+        runFixtureGit(repo, "config", "user.email", "fixture@example.invalid");
+        Files.createDirectories(repo.resolve("src"));
+        Files.writeString(repo.resolve("src/Fix.java"), "class Fix {}\n");
+        runFixtureGit(repo, "add", "src/Fix.java");
+        runFixtureGit(repo, "commit", "-q", "-m", "base");
+        Files.createDirectories(repo.resolve(".git/hooks"));
+        Path hook = repo.resolve(".git/hooks/pre-commit");
+        Files.writeString(hook, "#!/bin/sh\nprintf executed > '" + canary + "'\n");
+        hook.toFile().setExecutable(true);
+        Files.writeString(repo.resolve("src/Fix.java"), "class Fix { int value = 1; }\n");
+
+        assertThatThrownBy(() -> GitOperations.forRepo(repo).commitAndPush("story/9-safe", 9))
+                .isInstanceOf(IllegalStateException.class);
+        assertThat(canary).doesNotExist();
+        assertThat(runFixtureGit(repo, "show", "HEAD:src/Fix.java")).contains("value = 1");
+    }
+
+    @Test
+    void productionGitRunnerRejectsUnscopedNonHttpsOriginBeforeAnyNetworkEffect(@TempDir Path repo) throws Exception {
+        runFixtureGit(repo, "init", "-q", "-b", "story/10-safe");
+        runFixtureGit(repo, "config", "user.name", "Fixture");
+        runFixtureGit(repo, "config", "user.email", "fixture@example.invalid");
+        runFixtureGit(repo, "remote", "add", "origin", "../untrusted.git");
+        GitOperations git = GitOperations.forRepo(repo)
+                .githubCredentials("GH_TOKEN", "github.com", "owner/repository");
+        assertThatThrownBy(() -> git.pushBranch("story/10-safe"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("configured GitHub repository");
+        assertThat(Files.exists(repo.resolveSibling("untrusted.git"))).isFalse();
+    }
+
+    private static String runFixtureGit(Path repo, String... arguments) throws Exception {
+        List<String> command = new ArrayList<>(List.of("git"));
+        command.addAll(List.of(arguments));
+        Process process = new ProcessBuilder(command).directory(repo.toFile()).redirectErrorStream(true).start();
+        String output = new String(process.getInputStream().readAllBytes());
+        if (process.waitFor() != 0) throw new IllegalStateException("Disposable git fixture failed: " + output);
+        return output.strip();
+    }
+
     // -- prepare_story_branch ------------------------------------------------
 
     @Test
@@ -178,7 +235,6 @@ class GitOperationsTest {
         assertThat(result.branch()).isEqualTo("story/46-next-story");
         assertThat(result.baseHead()).isEqualTo("abc");
         assertThat(git.hasCall("fetch", "origin", "main")).isTrue();
-        assertThat(git.hasCall("pull", "--ff-only", "origin", "main")).isTrue();
         assertThat(git.hasCall("switch", "-c", "story/46-next-story")).isTrue();
     }
 
@@ -232,7 +288,7 @@ class GitOperationsTest {
         git.outputs.put("branch --list", "story/47-net\n");
         GitOperations ops = new GitOperations(Path.of("/repo"), git);
         assertThat(ops.checkoutStoryBranch("story/47-net")).isTrue();
-        assertThat(git.hasCall("fetch", "origin", "story/47-net")).isTrue();
+        assertThat(git.hasCall("fetch", "origin", "story/47-net")).isFalse();
         assertThat(git.hasCall("switch", "story/47-net")).isTrue();
     }
 
@@ -274,9 +330,8 @@ class GitOperationsTest {
     }
 
     @Test
-    void checkoutStoryBranchStashesBlockingChangesAndRetries() {
-        // A checkout blocked by "changes would be overwritten" must be recovered
-        // by a non-destructive stash + retry, not a hard failure.
+    void checkoutFailureDoesNotStashUnownedChanges() {
+        // A raced checkout failure must preserve ownership instead of hiding changes in an anonymous stash.
         List<List<String>> calls = new ArrayList<>();
         GitOperations.GitRunner runner = (repo, args) -> {
             calls.add(args);
@@ -304,12 +359,12 @@ class GitOperationsTest {
             return new GitOperations.GitResult(0, "", "");
         };
         GitOperations ops = new GitOperations(Path.of("/repo"), runner);
-        assertThat(ops.checkoutStoryBranch("story/47-x")).isTrue();
-        // It stashed and retried the switch.
-        assertThat(calls.stream().anyMatch(c -> String.join(" ", c).startsWith("stash push"))).isTrue();
+        assertThatThrownBy(() -> ops.checkoutStoryBranch("story/47-x"))
+                .hasMessageContaining("would be overwritten");
+        assertThat(calls.stream().anyMatch(c -> String.join(" ", c).startsWith("stash push"))).isFalse();
         long switches = calls.stream()
                 .filter(c -> String.join(" ", c).equals("switch story/47-x")).count();
-        assertThat(switches).isEqualTo(2);
+        assertThat(switches).isEqualTo(1);
     }
 
     // -- classify_worktree (non-throwing recovery routing) -------------------

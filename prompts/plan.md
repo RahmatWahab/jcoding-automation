@@ -19,6 +19,18 @@ repository actually require versus what you infer.
 
 PLAN ARTIFACTS (deterministic, per story)
 
+Also produce `plan.json`, schema version 1. Copy `story`, `requirements_hash`
+from the supplied goal contract, and `base_sha` from state.base_commit exactly.
+The `tasks` array is topologically ordered. Each task has a unique `id`, a
+`description`, `depends_on` (earlier task IDs), `criteria` (goal criterion IDs),
+and `checks` (IDs from goal.scope.checks). Every criterion must be covered.
+For a compound `goal_contract.intent_sequence`, each task also declares its
+registered `intent`; tasks follow the sequence order without interleaving.
+Commands are controller-owned: never invent check IDs or insert executable
+commands into this artifact. If the contract lacks criteria or check mappings,
+report BLOCKED with the missing information. A task's claimed status does not
+count as verification. Keep plan.md and ledger.md as human-readable companions.
+
 Resolve the plan on the current story branch as two files at the repository
 root: `plan.md` and `ledger.md` (a single plan per story — do not create
 per-task report files; the ledger note column carries per-task detail). Produce:
@@ -40,6 +52,12 @@ per-task report files; the ledger note column carries per-task detail). Produce:
     the Status column alone.
 
 RESUME RECONCILIATION (mandatory)
+
+If controller state contains `replan_request`, the prior task exhausted its
+bounded retry budget. Preserve the immutable goal, criteria and permission
+scope. Change the failing task's strategy in `plan.json` (a byte-identical plan
+will be rejected), retain unchanged verified tasks and their dependencies,
+and explain the revision in `plan.md`. Do not mark tasks verified yourself.
 
 If `plan.md`/`ledger.md` already exist for this story, do NOT blindly trust a
 `done` ledger. Re-validate the existing plan against the CURRENT acceptance

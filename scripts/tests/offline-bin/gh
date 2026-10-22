@@ -1,0 +1,3 @@
+#!/bin/sh
+printf '%s\n' 'OFFLINE_TEST_GUARD: GitHub CLI invocation is forbidden' >&2
+exit 125
