@@ -200,6 +200,10 @@ ALLOW_COMMENTS="$(ask_bool "Allow posting review-trigger & fix comments" true)"
 ALLOW_THREADS="$(ask_bool "Allow resolving review threads after a verified fix" true)"
 INTERNAL_REVIEW="$(ask_bool "Enable pre-commit specialist internal review" true)"
 DRY_RUN="$(ask_bool "Dry-run (no real GitHub mutations)" false)"
+if [[ "$DRY_RUN" == true ]]; then
+  warn "Dry-run only previews: no commit, push, PR or comment is made, so the canary story can"
+  warn "never pass CI/review and the canary receipt can NOT be earned. Turn dry-run off to reach autonomous."
+fi
 rule
 
 # 5. Safety-critical codex settings — defaulted to the only accepted values.
@@ -371,6 +375,18 @@ EOF
   return 1
 }
 
+canary_receipt_exists() { # read-only look at the durable state; true only if a canary receipt is recorded
+  local db="$ROOT/state/epic-$EPIC.sqlite3"
+  [[ -f "$db" ]] || return 1
+  python3 - "$db" <<'PY' 2>/dev/null
+import sqlite3, json, sys
+con = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
+row = con.execute("SELECT payload FROM workflow_state WHERE id = 1").fetchone()
+state = json.loads(row[0]) if row else {}
+sys.exit(0 if isinstance(state.get("canary_evidence"), dict) else 1)
+PY
+}
+
 # ---------------------------------------------------------------------------
 # Guided rollout sequence.
 bold "Next: the controller-enforced rollout sequence"
@@ -408,17 +424,24 @@ rule
 
 if [[ "$GOAL" == "autonomous" ]]; then
   bold "Step 4/4 — flip to autonomous"
-  echo "Only AFTER the canary receipt exists (the canary PR passed CI + review),"
-  echo "flip the mode and enable auto-merge. Flipping auto_merge does NOT invalidate"
-  echo "the receipt; changing checks/codex/repo/intent/automation WOULD."
-  if [[ "$(ask_bool "Flip deployment.mode=autonomous and workflow.auto_merge=true now?" false)" == true ]]; then
-    TMP="$(mktemp)"
-    jq '.deployment.mode = "autonomous" | .workflow.auto_merge = true' "$CONFIG" > "$TMP" && mv "$TMP" "$CONFIG"
-    echo "Flipped to autonomous + auto_merge. Verifying readiness..."
-    scripts/run_once.sh --readiness || warn "Readiness gaps remain — autonomous will block until resolved."
-    echo "From now on the controller is EPIC-driven and hands-off on each cron tick."
+  if ! canary_receipt_exists; then
+    warn "No canary receipt is recorded yet, so the flip is skipped."
+    warn "The receipt appears only after the canary story's PR passes verification, review"
+    warn "(and CI, if configured) with dry-run OFF. Cron ticks drive the canary; check progress with:"
+    warn "  tail -f logs/cron-system.log"
+    warn "Then re-run this script and answer 'y' here."
   else
-    echo "Left in canary mode. Re-run this script and choose 'flip' once the receipt is earned."
+    echo "Canary receipt found. Flipping does NOT invalidate it (auto_merge is excluded from the"
+    echo "fingerprint); changing checks/codex/repo/intent/automation WOULD."
+    if [[ "$(ask_bool "Flip deployment.mode=autonomous and workflow.auto_merge=true now?" false)" == true ]]; then
+      TMP="$(mktemp)"
+      jq '.deployment.mode = "autonomous" | .workflow.auto_merge = true' "$CONFIG" > "$TMP" && mv "$TMP" "$CONFIG"
+      echo "Flipped to autonomous + auto_merge. Verifying readiness..."
+      scripts/run_once.sh --readiness || warn "Readiness gaps remain — autonomous will block until resolved."
+      echo "From now on the controller is EPIC-driven and hands-off on each cron tick."
+    else
+      echo "Left in canary mode. Re-run this script and choose 'flip' when you are ready."
+    fi
   fi
 fi
 rule

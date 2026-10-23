@@ -33,6 +33,35 @@ class GitHubTest {
     }
 
     @Test
+    void epicChildrenAreReadWithoutGhSlurpAndAcrossPages() {
+        List<List<String>> calls = new ArrayList<>();
+        GitHub github = withRunner((command, timeout) -> {
+            calls.add(command);
+            String endpoint = command.get(command.size() - 1);
+            StringBuilder body = new StringBuilder("[");
+            if (endpoint.endsWith("page=1")) {
+                for (int i = 1; i <= 100; i++) body.append(i > 1 ? "," : "").append("{\"number\":").append(i).append("}");
+            } else {
+                body.append("{\"number\":101}");
+            }
+            return new GitHub.CommandResult(0, body.append("]").toString(), "");
+        });
+        List<Integer> children = github.childStoryNumbers(27);
+        assertThat(children).hasSize(101).startsWith(1, 2, 3).endsWith(100, 101);
+        assertThat(calls).hasSize(2);
+        // Old gh releases reject --slurp; the controller must not depend on it.
+        assertThat(calls.toString()).doesNotContain("--slurp", "--paginate");
+        assertThat(calls.get(1).getLast()).isEqualTo("repos/owner/repo/issues/27/sub_issues?per_page=100&page=2");
+    }
+
+    @Test
+    void emptyEpicAndMalformedPagedResponsesFailClosed() {
+        assertThat(withRunner((c, t) -> new GitHub.CommandResult(0, "[]", "")).childStoryNumbers(27)).isEmpty();
+        assertThatThrownBy(() -> withRunner((c, t) -> new GitHub.CommandResult(0, "{\"message\":\"Not Found\"}", ""))
+                .childStoryNumbers(27)).hasMessageContaining("Malformed paged response");
+    }
+
+    @Test
     void mergeAtomicallyRequiresExpectedHead() {
         List<List<String>> calls = new ArrayList<>();
         GitHub gh = withRunner((command, timeout) -> { calls.add(command); return new GitHub.CommandResult(0,"",""); });

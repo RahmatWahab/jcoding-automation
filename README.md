@@ -156,6 +156,15 @@ Things to know:
   safe, but changing the repository, codex, verification, workflow, intent, or
   automation settings requires a new canary. The receipt also expires after
   `deployment.canary_valid_hours`.
+- **Dry-run cannot earn the receipt.** A dry-run makes no commit, PR or comment, so
+  the canary story can never pass review. Turn `automation.dry_run` off for the
+  canary. The final "flip to autonomous" step is skipped until a receipt is
+  recorded, so you cannot enable auto-merge without one.
+- **Host prerequisites checked by the wizard.** On Ubuntu 23.10+/24.04 it detects
+  the AppArmor restriction that stops `bwrap` creating a private network namespace
+  and offers (with `sudo`, after confirmation) to install a profile allowing only
+  `/usr/bin/bwrap`. The GitHub CLI no longer needs `gh api --slurp`, so older
+  `gh` releases (such as 2.45.0 from Ubuntu) work.
 - **Before the canary story runs**, set `config/job-control.json` to
   `{ "job_start": true }` and provide `GH_TOKEN` and `OPENAI_API_KEY` (see
   below).

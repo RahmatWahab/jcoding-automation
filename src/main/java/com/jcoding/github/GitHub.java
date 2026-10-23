@@ -252,7 +252,25 @@ public class GitHub {
 
     /** Fetch issue conversation comments for idempotent recovery after a crash. */
     public Object issueComments(int number) {
-        return run("api", "--paginate", "--slurp", "repos/" + repo + "/issues/" + number + "/comments?per_page=100");
+        return pages("repos/" + repo + "/issues/" + number + "/comments");
+    }
+
+    /**
+     * Read every page of a list endpoint as a list of pages. Pages are requested explicitly
+     * instead of using {@code gh api --paginate --slurp}: {@code --slurp} is missing from older
+     * gh releases (for example 2.45.0 shipped by Ubuntu 24.04), which made every EPIC read fail.
+     * A short page ends the listing; an unexpected shape or exhausted budget fails closed.
+     */
+    private Object pages(String endpoint) {
+        final int pageSize = 100;
+        List<Object> result = new ArrayList<>();
+        for (int page = 1; page <= 100; page++) {
+            Object raw = run("api", endpoint + "?per_page=" + pageSize + "&page=" + page);
+            if (!(raw instanceof List<?> items)) throw new GitHubError("Malformed paged response from " + endpoint);
+            result.add(items);
+            if (items.size() < pageSize) return result;
+        }
+        throw new GitHubError("Paged read exceeded its page budget: " + endpoint);
     }
 
     @SuppressWarnings("unchecked")
@@ -283,7 +301,7 @@ public class GitHub {
 
     /** Native child relationships are authoritative; incidental body links are not. */
     public List<Integer> childStoryNumbers(int epic) {
-        Object raw = run("api", "--paginate", "--slurp", "repos/" + repo + "/issues/" + epic + "/sub_issues?per_page=100");
+        Object raw = pages("repos/" + repo + "/issues/" + epic + "/sub_issues");
         if (!(raw instanceof List<?> pages)) throw new GitHubError("Malformed sub-issue response");
         List<Integer> result = new ArrayList<>();
         for (Object page : pages) {
