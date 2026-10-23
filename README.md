@@ -107,9 +107,65 @@ The built launcher is at
 `build/install/jcoding-automation/bin/jcoding-automation`. The scripts under
 `scripts/` build it automatically on first run if it is missing.
 
+## Quick start: guided setup (`scripts/go-autonomous.sh`)
+
+The easiest way to configure and roll out the controller is the interactive
+wizard. It writes `config/config.json` for you (using `jq`), so you do not have
+to hand-edit the JSON or decode readiness errors.
+
+```bash
+scripts/go-autonomous.sh
+```
+
+On the first run it copies `config/config.json.example` to `config/config.json`.
+On later runs it updates the existing file and saves a timestamped backup
+(`config/config.json.bak-<UTC timestamp>`).
+
+It asks for:
+
+| Prompt | Notes |
+|--------|-------|
+| GitHub repository URL | `https://github.com/<owner>/<name>` (a `.git` suffix is accepted) |
+| Local checkout path and base branch | Must be a separate tree from this installation |
+| Goal: `canary` or `autonomous` | See below |
+| EPIC number | The EPIC the controller drives |
+| Canary story number | One story under the EPIC, used for the one-time canary |
+| Verification command and acceptance-criterion ID | e.g. `./gradlew test` / `AC-1` |
+| Required CI check name(s) | Exact GitHub check-run names, comma-separated (`gh pr checks --repo <owner>/<name> <pr>` lists them) |
+| Workflow flags (true/false) | push, PR creation, comments, thread resolution, internal review, dry-run |
+| Safety settings | `codex.approval_policy` and `codex.dangerously_bypass_sandbox` |
+
+Then it walks the rollout sequence: readiness check → provider canary → canary
+story → flip to autonomous. Every step after the readiness check asks for
+confirmation.
+
+Things to know:
+
+- **Autonomous always starts with a canary.** Autonomous mode refuses to run
+  without a canary receipt, and the receipt can only be earned in canary mode on
+  a real story (CI, review, and verification must pass). Choosing "autonomous"
+  therefore starts in `canary` with `auto_merge: false`. After the canary PR
+  passes, run the script again and answer yes to the final step; it sets
+  `deployment.mode: autonomous` and `workflow.auto_merge: true`. From then on the
+  controller selects stories from the EPIC by itself.
+- **Safety settings stay at their only accepted values.** The controller rejects
+  any `approval_policy` other than `never` and any
+  `dangerously_bypass_sandbox: true` (`BLOCKED_CONFIGURATION`). The wizard
+  warns and keeps the safe values if you try to change them.
+- **Changing config later can invalidate the receipt.** Flipping `auto_merge` is
+  safe, but changing the repository, codex, verification, workflow, intent, or
+  automation settings requires a new canary. The receipt also expires after
+  `deployment.canary_valid_hours`.
+- **Before the canary story runs**, set `config/job-control.json` to
+  `{ "job_start": true }` and provide `GH_TOKEN` and `OPENAI_API_KEY` (see
+  below).
+- The verification command and CI check names are specific to your repository;
+  the defaults are only suggestions.
+
 ## Configure
 
-All configuration is JSON.
+All configuration is JSON. The wizard above produces a valid file; the sections
+below describe each setting if you prefer to edit it by hand.
 
 1. Edit `config/config.json` — set the target repository, EPIC number, Codex
    model, budgets, and workflow flags. The example defaults to
@@ -555,6 +611,7 @@ manual merge gate.
 ## Operational scripts
 
 - `scripts/cron-launcher.sh` — loads secrets from the mode-600 env file and launches a run.
+- `scripts/go-autonomous.sh` — guided wizard that writes `config/config.json` and walks the readiness → provider canary → canary → autonomous rollout.
 - `scripts/run_once.sh` — one-shot execution under `setsid` with timestamped logs (`--verbose` for DEBUG, `--force-run` to bypass the job gate).
 - `scripts/install-cron.sh` — installs the marked crontab block from `cron-policy.json`.
 - `scripts/healthcheck.sh` — non-mutating operational health check.
