@@ -155,4 +155,48 @@ class AutonomyBusinessValueMockTest {
         assertThatThrownBy(() -> DeploymentPolicy.admit(config, state, 73))
                 .hasMessageContaining("provider canary");
     }
+
+    private Map<String, Object> rolloutConfig(Map<String, Object> workflow) {
+        Map<String, Object> config = new LinkedHashMap<>();
+        config.put("repository", Map.of("local_path", "/tmp/target", "owner", "example", "name", "target"));
+        config.put("codex", Map.of("isolation", "bubblewrap"));
+        config.put("verification", Map.of("required", true, "checks", List.of(Map.of(
+                "id", "business", "command", List.of("true"), "criteria", List.of("*")))));
+        config.put("automation", Map.of("enable_planning", true));
+        config.put("intent", Map.of("require_acceptance_criteria", true));
+        config.put("workflow", workflow);
+        config.put("deployment", Map.of("mode", "autonomous"));
+        return config;
+    }
+
+    @Test
+    void ciChecksAreOptionalOnlyThroughAnExplicitOptOut() {
+        assertThat(DeploymentPolicy.readiness(rolloutConfig(Map.of("required_checks", List.of(), "allow_no_checks", true))))
+                .isEmpty();
+        assertThat(DeploymentPolicy.readiness(rolloutConfig(Map.of("required_checks", List.of("build"), "allow_no_checks", false))))
+                .isEmpty();
+        // Silence is not consent: neither named checks nor the explicit opt-out fails closed.
+        assertThat(DeploymentPolicy.readiness(rolloutConfig(Map.of("required_checks", List.of()))))
+                .anyMatch(reason -> reason.contains("allow_no_checks"));
+        assertThat(DeploymentPolicy.readiness(rolloutConfig(Map.of("required_checks", List.of(), "allow_no_checks", false))))
+                .anyMatch(reason -> reason.contains("named CI checks"));
+    }
+
+    @Test
+    void canaryReceiptIsRecordedWithoutCiOnlyWhenOptedOut() {
+        Map<String, Object> pr = new LinkedHashMap<>(Map.of("headRefOid", "abc", "number", 7, "statusCheckRollup", List.of()));
+        Map<String, Object> optedOut = rolloutConfig(Map.of("required_checks", List.of(), "allow_no_checks", true));
+        optedOut.put("deployment", Map.of("mode", "canary"));
+        Map<String, Object> state = new LinkedHashMap<>(Map.of("validation_checkpoint", Map.of("delivered_head", "abc"),
+                "current_story", 1));
+        DeploymentPolicy.recordCanary(optedOut, state, pr);
+        assertThat(state).containsKey("canary_evidence");
+
+        Map<String, Object> strict = rolloutConfig(Map.of("required_checks", List.of("build"), "allow_no_checks", false));
+        strict.put("deployment", Map.of("mode", "canary"));
+        Map<String, Object> strictState = new LinkedHashMap<>(Map.of("validation_checkpoint", Map.of("delivered_head", "abc"),
+                "current_story", 1));
+        DeploymentPolicy.recordCanary(strict, strictState, pr);
+        assertThat(strictState).doesNotContainKey("canary_evidence");
+    }
 }

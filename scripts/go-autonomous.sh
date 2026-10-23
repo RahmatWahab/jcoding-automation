@@ -167,7 +167,7 @@ fi
 TEST_CMD="$(ask "Verification command" "${DETECTED_CMD:-./gradlew test}")"
 # The controller runs the command as an argv array in a sandbox with NO network:
 # build dependencies must already be cached locally (e.g. a prior ./gradlew test).
-TEST_CMD_JSON="$(printf '%s' "$TEST_CMD" | jq -R 'split(" ") | map(select(length>0))')"
+TEST_CMD_JSON="$(printf '%s\n' "$TEST_CMD" | jq -R 'split(" ") | map(select(length>0))')"
 [[ "$TEST_CMD_JSON" != "[]" ]] || { err "Verification command cannot be empty."; exit 1; }
 # '*' = this check covers every acceptance criterion in the story it verifies,
 # so you never need to match per-story AC-N ids. The check must still pass.
@@ -177,13 +177,19 @@ DETECTED_CI="$(detect_ci_checks)"
 if [[ -n "$DETECTED_CI" ]]; then
   echo "Detected CI check(s) for $OWNER/$NAME: $DETECTED_CI"
 else
-  warn "No CI checks detected for $OWNER/$NAME on '$BASE_BRANCH' (no workflow runs, or gh not authenticated)."
-  warn "Unattended auto-merge needs at least one named CI check. If the repo has no CI yet,"
-  warn "add a GitHub Actions workflow that runs your tests first, then re-run this script."
+  echo "No CI checks detected for $OWNER/$NAME on '$BASE_BRANCH' (no workflow runs, or gh not authenticated)."
 fi
-CI_CHECKS_RAW="$(ask "Required CI check name(s), comma-separated" "$DETECTED_CI")"
-[[ -n "$CI_CHECKS_RAW" ]] || { err "At least one CI check name is required for unattended rollout."; exit 1; }
-CI_CHECKS_JSON="$(printf '%s' "$CI_CHECKS_RAW" | jq -R 'split(",") | map(gsub("^\\s+|\\s+$";"")) | map(select(length>0))')"
+echo "CI checks are OPTIONAL. Leave blank to run without a CI gate."
+CI_CHECKS_RAW="$(ask "Required CI check name(s), comma-separated (blank = no CI gate)" "$DETECTED_CI")"
+CI_CHECKS_JSON="$(printf '%s\n' "$CI_CHECKS_RAW" | jq -R 'split(",") | map(gsub("^\\s+|\\s+$";"")) | map(select(length>0))')"
+if [[ "$CI_CHECKS_JSON" == "[]" ]]; then
+  ALLOW_NO_CHECKS="true"
+  warn "No CI gate: merges will rely only on the controller's own verification ($TEST_CMD),"
+  warn "Codex review, and unresolved-thread checks. Add CI later and re-run this script to tighten it."
+  CI_CHECKS_RAW="(none — CI gate disabled)"
+else
+  ALLOW_NO_CHECKS="false"
+fi
 rule
 
 # 4. Workflow permissions (true/false), with safe guidance.
@@ -236,6 +242,7 @@ jq \
   --argjson internal_review "$INTERNAL_REVIEW" \
   --argjson auto_merge "$INIT_AUTOMERGE" \
   --argjson ci_checks "$CI_CHECKS_JSON" \
+  --argjson allow_no_checks "$ALLOW_NO_CHECKS" \
   --argjson test_cmd "$TEST_CMD_JSON" \
   --argjson criteria "$CRITERIA_JSON" \
   --arg approval "$APPROVAL_POLICY" \
@@ -257,7 +264,7 @@ jq \
   | .workflow.allow_thread_resolution = $allow_threads
   | .workflow.internal_review = $internal_review
   | .workflow.auto_merge = $auto_merge
-  | .workflow.allow_no_checks = false
+  | .workflow.allow_no_checks = $allow_no_checks
   | .workflow.required_checks = $ci_checks
   | .intent.require_acceptance_criteria = true
   | .deployment.mode = $mode

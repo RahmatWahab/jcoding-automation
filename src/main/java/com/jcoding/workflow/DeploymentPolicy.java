@@ -39,8 +39,11 @@ final class DeploymentPolicy {
             if (!Config.isPositiveInt(deployment.get("canary_story"))) reasons.add("Canary requires one positive canary_story");
             if (Boolean.TRUE.equals(workflow.get("auto_merge"))) reasons.add("Canary cannot merge");
         }
-        if (Engine.asList(workflow.get("required_checks")).isEmpty()) reasons.add("Rollout requires named CI checks");
-        if (Boolean.TRUE.equals(workflow.get("allow_no_checks"))) reasons.add("Rollout cannot waive missing CI checks");
+        // CI is optional but must be an explicit decision: name the required checks, or
+        // set workflow.allow_no_checks=true to run on controller-side verification alone.
+        if (Engine.asList(workflow.get("required_checks")).isEmpty() && !Boolean.TRUE.equals(workflow.get("allow_no_checks"))) {
+            reasons.add("Rollout requires named CI checks (workflow.required_checks) or an explicit workflow.allow_no_checks=true");
+        }
         if (config.containsKey("_controller_root")) {
             java.nio.file.Path controller = java.nio.file.Path.of(config.get("_controller_root").toString()).toAbsolutePath().normalize();
             java.nio.file.Path target = java.nio.file.Path.of(Engine.asString(Config.section(config, "repository").get("local_path"))).toAbsolutePath().normalize();
@@ -92,8 +95,9 @@ final class DeploymentPolicy {
         if (!"canary".equals(mode(config))) return;
         if (!(state.get("validation_checkpoint") instanceof Map<?, ?> proof)
                 || !Engine.asString(pr.get("headRefOid")).equals(proof.get("delivered_head"))) return;
-        if (CiGate.evaluate(pr.get("statusCheckRollup"), Engine.asList(Config.section(config, "workflow").get("required_checks"))
-                .stream().map(String::valueOf).toList(), false) != CiGate.Verdict.PASSED) return;
+        Map<String, Object> workflow = Config.section(config, "workflow");
+        if (CiGate.evaluate(pr.get("statusCheckRollup"), Engine.asList(workflow.get("required_checks"))
+                .stream().map(String::valueOf).toList(), Boolean.TRUE.equals(workflow.get("allow_no_checks"))) != CiGate.Verdict.PASSED) return;
         if (!Engine.actionableFeedback(pr).isEmpty() || ReviewCoordinator.reviewGateOpen(pr)) return;
         state.put("canary_evidence", Map.of("configuration_hash", fingerprint(config), "head", pr.get("headRefOid"),
                 "story", state.get("current_story"), "pr", pr.get("number"), "verified_at", Instant.now().toString()));

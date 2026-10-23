@@ -131,7 +131,7 @@ It asks for:
 | EPIC number | The EPIC the controller drives |
 | Canary story number | One story under the EPIC, used for the one-time canary |
 | Verification command | Auto-detected from the checkout (Gradle, Maven, npm, Go, pytest, `make test`); press Enter to accept. Runs in a sandbox with **no network**, so dependencies must already be cached locally |
-| Required CI check name(s) | Auto-detected from the base branch's real GitHub check runs (fallback: job names in `.github/workflows`); press Enter to accept. If the repo has no CI, add a workflow first — unattended auto-merge needs at least one named check |
+| Required CI check name(s) | **Optional.** Auto-detected from the base branch's real GitHub check runs (fallback: job names in `.github/workflows`); press Enter to accept. Leave blank to run without a CI gate (`allow_no_checks: true`): merges then rely on the controller's own verification, Codex review, and unresolved-thread checks |
 | Workflow flags (true/false) | push, PR creation, comments, thread resolution, internal review, dry-run |
 | Safety settings | `codex.approval_policy` and `codex.dangerously_bypass_sandbox` |
 
