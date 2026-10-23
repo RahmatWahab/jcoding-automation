@@ -26,6 +26,30 @@ final class RuntimeVerifier {
     }
 
     /**
+     * codex_login mode puts the operator's login token inside the worker, so a model-driven change
+     * could write it into the repository for the controller to commit. Block delivery if any
+     * changed regular file contains the token (or a base64 form). Best effort, not a guarantee:
+     * other encodings are not detected. Fails closed when the login cannot be read or a file is
+     * too large to scan.
+     */
+    private static String leakedLoginMaterial(Path repo, List<String> paths) {
+        List<String> needles = CodexLogin.leakNeedles(CodexLogin.secretValues(CodexLogin.authFile()));
+        if (needles.isEmpty()) return "(login unreadable; cannot verify)";
+        for (String path : paths) {
+            Path file = repo.resolve(path);
+            try {
+                if (!java.nio.file.Files.isRegularFile(file, java.nio.file.LinkOption.NOFOLLOW_LINKS)) continue;
+                if (java.nio.file.Files.size(file) > 64L * 1024 * 1024) return path + " (too large to scan)";
+                String content = new String(java.nio.file.Files.readAllBytes(file), java.nio.charset.StandardCharsets.ISO_8859_1);
+                for (String needle : needles) if (content.contains(needle)) return path;
+            } catch (java.io.IOException exc) {
+                return path + " (unreadable; cannot verify)";
+            }
+        }
+        return null;
+    }
+
+    /**
      * Criterion IDs a check covers. The wildcard {@code "*"} means "every criterion in the
      * current story contract", so one suite-level check need not be edited per story. The
      * check must still execute and exit 0 for any criterion to be marked VERIFIED.
@@ -68,6 +92,10 @@ final class RuntimeVerifier {
             if (paths.size() > maxFiles) return fail(state, "Changed-file scope exceeds " + maxFiles);
             for (String path : paths) {
                 if (!matches(path, allowed) || matches(path, protectedPaths)) return fail(state, "Path outside authorized scope: " + path);
+            }
+            if (CodexLogin.enabled(Config.section(config, "codex"))) {
+                String leak = leakedLoginMaterial(repo, paths);
+                if (leak != null) return fail(state, "Delivery blocked: Codex login token material found in " + leak);
             }
             Set<String> requiredCriteria = new HashSet<>();
             if (state.get("goal_contract") instanceof Map<?, ?> goal) {

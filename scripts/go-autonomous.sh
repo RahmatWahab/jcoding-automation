@@ -219,6 +219,42 @@ fi
 echo "Using: approval_policy=$APPROVAL_POLICY, dangerously_bypass_sandbox=$BYPASS_SANDBOX, isolation=bubblewrap"
 rule
 
+# 5b. How the sandboxed Codex worker authenticates to the model.
+bold "Codex authentication"
+echo "  1) API key via isolated gateway (recommended). The worker never sees a credential and has"
+echo "     no network of its own. Needs OPENAI_API_KEY (platform.openai.com, billed separately)."
+echo "  2) Your Codex CLI login (no API key). The worker holds a COPY of your login token and the"
+echo "     Codex process has outbound network."
+AUTH_MODE=""
+while [[ -z "$AUTH_MODE" ]]; do
+  case "$(ask "Choose 1 (API key) or 2 (Codex login)" "1")" in
+    1|gateway) AUTH_MODE="gateway" ;;
+    2|login|codex_login) AUTH_MODE="codex_login" ;;
+    *) warn "Enter 1 or 2." ;;
+  esac
+done
+if [[ "$AUTH_MODE" == "codex_login" ]]; then
+  CODEX_BIN="$(jq -r '.codex.executable // "codex"' "$CONFIG")"
+  if ! command -v "$CODEX_BIN" >/dev/null 2>&1 || ! "$CODEX_BIN" login status >/dev/null 2>&1; then
+    err "'$CODEX_BIN login status' failed. Run '$CODEX_BIN login' as this user first, then re-run."
+    exit 1
+  fi
+  warn "Codex login mode weakens the isolation. Be aware that:"
+  warn "  - model-driven code in the worker can READ the login token (it cannot send it out from"
+  warn "    Codex's tool sandbox, but it could write it into a file the controller would commit);"
+  warn "  - the controller blocks delivery if a changed file contains the token (best effort: it"
+  warn "    checks the plain value and base64 forms only);"
+  warn "  - the Codex process has full outbound network, not just a gateway to one host;"
+  warn "  - unattended use of a ChatGPT-plan login may be subject to your plan's terms."
+  read -r -p "Type I ACCEPT to use your Codex login for unattended runs: " CONFIRM || true
+  if [[ "$CONFIRM" != "I ACCEPT" ]]; then
+    err "Not accepted. Re-run and choose 1 (API key), or type exactly: I ACCEPT"
+    exit 1
+  fi
+fi
+echo "Using auth mode: $AUTH_MODE"
+rule
+
 # ---------------------------------------------------------------------------
 # Compose config.json. Canary phase values first; autonomous flip comes after
 # the receipt is earned. In canary mode auto_merge MUST be false.
@@ -250,6 +286,7 @@ jq \
   --argjson test_cmd "$TEST_CMD_JSON" \
   --argjson criteria "$CRITERIA_JSON" \
   --arg approval "$APPROVAL_POLICY" \
+  --arg auth_mode "$AUTH_MODE" \
   --argjson bypass "$BYPASS_SANDBOX" \
   '
   .repository.local_path = $local_path
@@ -262,6 +299,7 @@ jq \
   | .codex.approval_policy = $approval
   | .codex.dangerously_bypass_sandbox = $bypass
   | .codex.isolation = "bubblewrap"
+  | .codex.auth = $auth_mode
   | .workflow.allow_push = $allow_push
   | .workflow.allow_pr_creation = $allow_pr
   | .workflow.allow_comments = $allow_comments
@@ -285,6 +323,7 @@ echo "  canary story  : #$CANARY_STORY"
 echo "  verify command: $TEST_CMD  (covers all story criteria)"
 echo "  CI checks     : $CI_CHECKS_RAW"
 echo "  goal          : $GOAL  (starting in canary to earn the receipt)"
+echo "  codex auth    : $AUTH_MODE"
 echo "  dry_run       : $DRY_RUN"
 rule
 
@@ -375,6 +414,69 @@ EOF
   return 1
 }
 
+# ---------------------------------------------------------------------------
+# Credentials for unattended (cron) runs. Cron does not inherit shell exports;
+# scripts/cron-launcher.sh reads ONLY this mode-600 file. Values are never printed.
+ENV_FILE="${CODEX_AUTOMATION_ENV_FILE:-$HOME/.config/jcoding-automation/env}"
+
+env_file_has() { [[ -f "$ENV_FILE" ]] && grep -qE "^$1=.+" "$ENV_FILE"; }
+
+save_env_value() { # $1 = variable name, $2 = value (never echoed)
+  local dir tmp; dir="$(dirname "$ENV_FILE")"
+  ( umask 077; mkdir -p "$dir"; touch "$ENV_FILE" )
+  chmod 600 "$ENV_FILE"
+  tmp="$(mktemp "$dir/.env.XXXXXX")"; chmod 600 "$tmp"
+  { grep -vE "^$1=" "$ENV_FILE" || true; printf '%s=%s\n' "$1" "$2"; } > "$tmp"
+  mv "$tmp" "$ENV_FILE"; chmod 600 "$ENV_FILE"
+}
+
+ensure_credentials() {
+  bold "Credentials for unattended (cron) runs"
+  echo "Cron cannot see your shell exports. It reads only: $ENV_FILE (mode 600)."
+  local gh_var key_var name value ok=0 names=()
+  gh_var="$(jq -r '.github.token_environment_variable // "GH_TOKEN"' "$CONFIG")"
+  key_var="$(jq -r '.codex.gateway.credential_environment_variable // "OPENAI_API_KEY"' "$CONFIG")"
+  names=("$gh_var")
+  if [[ "$(jq -r '.codex.auth // "gateway"' "$CONFIG")" == "codex_login" ]]; then
+    echo "  Codex worker auth: your Codex login ($(command -v codex >/dev/null 2>&1 && echo 'found' || echo 'codex not on PATH')); no API key needed."
+    key_var=""
+  else
+    names+=("$key_var")
+  fi
+  for name in "${names[@]}"; do
+    case "$name" in
+      GH_TOKEN|OPENAI_API_KEY|CODEX_API_KEY) ;;
+      *) warn "cron-launcher.sh only accepts GH_TOKEN, OPENAI_API_KEY, CODEX_API_KEY; '$name' would be rejected."; ok=1; continue ;;
+    esac
+    if env_file_has "$name"; then echo "  $name: present in env file"; continue; fi
+    warn "  $name: MISSING from the env file"
+    if [[ "$name" == "$key_var" ]]; then
+      echo "  Why: unattended workers run in a bubblewrap sandbox with an isolated home, so they"
+      echo "  cannot use your 'codex login'. The controller's gateway calls the OpenAI API with this"
+      echo "  API key and gives the worker only a short-lived token. It is an API key from"
+      echo "  platform.openai.com (billed separately from a ChatGPT plan)."
+    fi
+    value=""
+    if [[ -n "${!name:-}" ]]; then
+      if [[ "$(ask_bool "  Save $name from your current shell to the env file?" true)" == true ]]; then value="${!name}"; fi
+    elif [[ "$name" == "$gh_var" ]] && command -v gh >/dev/null 2>&1 && gh auth token >/dev/null 2>&1; then
+      if [[ "$(ask_bool "  Use the token from 'gh auth token'?" true)" == true ]]; then value="$(gh auth token)"; fi
+    fi
+    if [[ -z "$value" ]]; then
+      read -r -s -p "  Paste $name (input hidden, blank to skip): " value || true; echo
+    fi
+    value="${value//[$'\r\n ']/}"
+    if [[ -z "$value" ]]; then err "  $name not provided; the controller will block without it."; ok=1; continue; fi
+    save_env_value "$name" "$value"; echo "  $name saved to $ENV_FILE"
+  done
+  # Make this script's own runs see exactly what cron will see.
+  local k v
+  while IFS='=' read -r k v; do
+    case "$k" in GH_TOKEN|OPENAI_API_KEY|CODEX_API_KEY) export "$k=$v" ;; esac
+  done < <([[ -f "$ENV_FILE" ]] && cat "$ENV_FILE" || true)
+  return "$ok"
+}
+
 canary_receipt_exists() { # read-only look at the durable state; true only if a canary receipt is recorded
   local db="$ROOT/state/epic-$EPIC.sqlite3"
   [[ -f "$db" ]] || return 1
@@ -394,6 +496,8 @@ echo "This script will now check readiness. Each later step is OPT-IN so you"
 echo "stay in control; nothing merges during the canary."
 rule
 
+ensure_credentials || { err "Provide the missing credential(s) above, then re-run this script."; exit 1; }
+rule
 ensure_sandbox_ready || { err "Fix the sandbox issue above, then re-run this script."; exit 1; }
 rule
 

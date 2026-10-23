@@ -9,10 +9,68 @@ import java.util.Map;
 
 /** Minimal bubblewrap filesystem for production workers and executable verification. */
 final class WorkerIsolation implements AutoCloseable {
+    private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(WorkerIsolation.class);
     private final Path home;
     private Process gateway;
     private String runToken;
+    private boolean loginMode;
+    private Path loginSource;
+    private byte[] loginOriginal;
     private WorkerIsolation(Path home) { this.home = home; }
+
+    /** Throwaway worker home; exposed for tests. */
+    Path homeDirectory() { return home; }
+
+    /**
+     * Opt-in codex_login mode: place a copy of the operator's Codex login in the worker's
+     * isolated CODEX_HOME. No gateway or provider override is used; the sandbox shares the host
+     * network so Codex can reach its model endpoint. Callers must have accepted this trade-off.
+     */
+    void useCodexLogin() throws java.io.IOException {
+        Path source = CodexLogin.authFile();
+        if (!Files.isRegularFile(source)) {
+            throw new IllegalArgumentException("Codex login not found: " + source + " (run 'codex login' as the controller user)");
+        }
+        byte[] original = Files.readAllBytes(source);
+        if (!CodexLogin.plausible(original)) throw new IllegalArgumentException("Codex login file is invalid: " + source);
+        Path target = home.resolve(".codex").resolve("auth.json");
+        Files.write(target, original);
+        Files.setPosixFilePermissions(target, java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
+        loginMode = true;
+        loginSource = source;
+        loginOriginal = original;
+    }
+
+    /**
+     * Codex refreshes its token inside the worker's throwaway home. Persist a refreshed login back
+     * so the host login keeps working, but only if the host copy was not changed meanwhile.
+     */
+    private void persistRefreshedLogin() {
+        if (!loginMode || loginSource == null) return;
+        try {
+            Path current = home.resolve(".codex").resolve("auth.json");
+            if (!Files.isRegularFile(current)) return;
+            byte[] updated = Files.readAllBytes(current);
+            if (java.util.Arrays.equals(updated, loginOriginal) || !CodexLogin.plausible(updated)) return;
+            if (!java.util.Arrays.equals(Files.readAllBytes(loginSource), loginOriginal)) {
+                LOG.warn("CODEX LOGIN: host login changed during the run; not overwriting it with the worker's refreshed copy");
+                return;
+            }
+            Path temporary = Files.createTempFile(loginSource.getParent(), ".auth-", ".tmp");
+            try {
+                Files.write(temporary, updated);
+                Files.setPosixFilePermissions(temporary, java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
+                Files.move(temporary, loginSource, java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            } finally {
+                Files.deleteIfExists(temporary);
+            }
+            LOG.info("CODEX LOGIN: refreshed login persisted to the host login file");
+        } catch (java.io.IOException | RuntimeException exc) {
+            LOG.warn("CODEX LOGIN: could not persist the refreshed login ({}); re-run 'codex login' if it expires",
+                    exc.getClass().getSimpleName());
+        }
+    }
 
     static WorkerIsolation create(boolean model) throws java.io.IOException {
         Path home = Files.createTempDirectory("jcoding-worker-");
@@ -35,8 +93,11 @@ final class WorkerIsolation implements AutoCloseable {
     List<String> wrap(List<String> command, Path repo, Map<String, Object> options, boolean model, boolean readOnly) {
         List<String> args = new ArrayList<>(List.of("bwrap", "--die-with-parent", "--new-session",
                 "--unshare-all"));
-        // Every worker has a private network namespace. Model traffic crosses only
-        // the scoped Unix-socket gateway; there is no host network route.
+        // By default every worker has a private network namespace and model traffic crosses only
+        // the scoped Unix-socket gateway. In opt-in codex_login mode the model worker shares the
+        // host network so the Codex CLI can reach its endpoint directly (tool commands stay
+        // network-less through Codex's own sandbox policy).
+        if (model && loginMode) args.add("--share-net");
         for (String path : List.of("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc/ssl", "/etc/resolv.conf",
                 "/etc/hosts", "/etc/passwd", "/etc/group", "/etc/nsswitch.conf")) {
             if (Files.exists(Path.of(path))) args.addAll(List.of("--ro-bind", path, path));
@@ -59,7 +120,7 @@ final class WorkerIsolation implements AutoCloseable {
         if (Files.exists(git)) args.addAll(List.of("--ro-bind", git.toString(), git.toString()));
         args.addAll(List.of("--setenv", "HOME", "/home/worker", "--setenv", "CODEX_HOME", "/home/worker/.codex",
                 "--chdir", root, "--"));
-        if (model) {
+        if (model && !loginMode) {
             if (gateway == null || !gateway.isAlive()) throw new IllegalStateException("Model gateway is not running");
             args.addAll(List.of("/usr/bin/python3", "/home/worker/model_bridge.py"));
         }
@@ -109,10 +170,10 @@ final class WorkerIsolation implements AutoCloseable {
         throw new IllegalStateException("Worker executable is not available: " + command);
     }
 
-    /** Short-lived run token is the only credential passed to the sandbox. */
+    /** Short-lived run token is the only credential passed to the sandbox (gateway mode). */
     Map<String, String> modelEnvironment() {
         Map<String, String> values = environment(System.getenv(), false);
-        values.put("JCODING_RUN_TOKEN", runToken);
+        if (!loginMode) values.put("JCODING_RUN_TOKEN", runToken);
         return values;
     }
 
@@ -157,6 +218,7 @@ final class WorkerIsolation implements AutoCloseable {
     }
 
     @Override public void close() {
+        persistRefreshedLogin();
         if (gateway != null) {
             gateway.destroyForcibly();
             try { gateway.waitFor(2, java.util.concurrent.TimeUnit.SECONDS); }

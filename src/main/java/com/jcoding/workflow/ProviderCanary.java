@@ -22,7 +22,7 @@ final class ProviderCanary {
             codex.put("execution_timeout_seconds", 90);
             scoped.put("codex", codex);
             Path repo = Path.of(Engine.asString(Config.section(config, "repository").get("local_path")));
-            if (!probeStreamingGateway(repo, codex)) {
+            if (!CodexLogin.enabled(codex) && !probeStreamingGateway(repo, codex)) {
                 LOG.warn("PROVIDER CANARY: scoped gateway streaming or credential-isolation stage failed");
                 return false;
             }

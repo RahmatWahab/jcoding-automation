@@ -71,6 +71,8 @@ public class CodexRunner {
      * (and case-folding of every key) on every {@code redactSensitive} call.
      */
     private final List<String> sensitiveValues;
+    /** Login-token values to redact in codex_login mode; set per run before any output is read. */
+    private volatile List<String> loginSecrets = List.of();
 
     public CodexRunner() {
         this(System.getenv(), System::nanoTime);
@@ -107,6 +109,9 @@ public class CodexRunner {
         for (String value : sensitiveValues) {
             redacted = redacted.replace(value, "[REDACTED]");
         }
+        for (String value : loginSecrets) {
+            redacted = redacted.replace(value, "[REDACTED]");
+        }
         redacted = AUTH_BEARER.matcher(redacted).replaceAll("$1[REDACTED]");
         redacted = SECRET_ASSIGNMENT.matcher(redacted).replaceAll("$1[REDACTED]");
         return redacted;
@@ -138,7 +143,7 @@ public class CodexRunner {
         // sandbox policy; do not inherit a permissive user-level Codex setting.
         if (!readOnly) command.addAll(List.of("-c", "sandbox_workspace_write.network_access=false"));
         command.addAll(List.of("--ask-for-approval", "never"));
-        if ("bubblewrap".equals(codex.get("isolation"))) {
+        if ("bubblewrap".equals(codex.get("isolation")) && !CodexLogin.enabled(codex)) {
             command.addAll(List.of("-c", "model_provider=jcoding_scoped",
                     "-c", "model_providers.jcoding_scoped.name=Jcoding",
                     "-c", "model_providers.jcoding_scoped.base_url=http://127.0.0.1:18443/v1",
@@ -216,7 +221,12 @@ public class CodexRunner {
         try {
             if ("bubblewrap".equals(codex.get("isolation"))) {
                 isolation = WorkerIsolation.create(true);
-                isolation.startGateway(codex, timeout);
+                if (CodexLogin.enabled(codex)) {
+                    isolation.useCodexLogin();
+                    loginSecrets = CodexLogin.secretValues(CodexLogin.authFile());
+                } else {
+                    isolation.startGateway(codex, timeout);
+                }
                 command = isolation.wrap(command, repo, codex, true, Boolean.TRUE.equals(codex.get("diagnostic_read_only")));
             }
             // A regular-file stdin cannot block this thread on a child that never reads.

@@ -229,7 +229,47 @@ The cron launcher loads this file automatically. Use
 launcher only accepts the keys `GH_TOKEN`, `OPENAI_API_KEY`, and `CODEX_API_KEY`
 and refuses a file that is not mode `600`.
 
+### Worker authentication: API-key gateway or your Codex login (`codex.auth`)
+
+`codex.auth` selects how the sandboxed Codex worker reaches the model:
+
+| Value | Credential | Isolation |
+|-------|------------|-----------|
+| `gateway` (default, recommended) | `OPENAI_API_KEY`, held only by a controller-side gateway | Worker has a private network and never sees a credential |
+| `codex_login` (opt-in) | Your own `codex login` (`auth.json` in `CODEX_HOME`, default `~/.codex`); no API key | Weaker, see below |
+
+`codex_login` still runs the worker in Bubblewrap with an isolated home, no `GH_TOKEN`,
+resource limits and Codex's own no-network tool sandbox. What changes:
+
+- the worker gets a **copy** of your login token, and the Codex process has outbound network;
+- model-driven code could read the token. It cannot send it out from Codex's tool sandbox, but it
+  could write it into a file for the controller to commit. Verification therefore **blocks delivery**
+  if any changed file contains the token or its base64 form (best effort, other encodings are not
+  detected), and the token is redacted from worker output;
+- if Codex refreshes the token during a run, the refreshed login is written back to the host file
+  (never over a host login that changed in the meantime);
+- readiness checks the login file and `codex login status` instead of the API key, and the provider
+  canary makes one small model call through the sandbox;
+- unattended use of a ChatGPT-plan login may be subject to your plan's terms.
+
+Choose it in `scripts/go-autonomous.sh` (it requires typing `I ACCEPT`), or set
+`"auth": "codex_login"` with `"isolation": "bubblewrap"` by hand. Run `codex login` as the
+controller user first. It is covered by the canary receipt: changing `codex.auth` requires a new canary.
+
 ### Model provider key (OPENAI_API_KEY)
+
+**Why an API key and not `codex login`?** Unattended workers run inside a
+Bubblewrap sandbox with an isolated home (`HOME=/home/worker`), so they cannot see
+the credentials that `codex login` stores in your own `~/.codex`. The controller
+starts a gateway *outside* the sandbox that holds the API key, calls
+`api.openai.com`, and hands the worker only a short-lived token. This keeps the
+real credential away from model-driven code. It is an API key from
+platform.openai.com, billed separately from a ChatGPT plan. The `native`
+isolation mode that reused your CLI login is rejected for unattended runs.
+
+`scripts/go-autonomous.sh` checks the cron env file and saves the keys for you
+(hidden input, mode 600, never printed). Cron does **not** see shell exports, so a
+key that works in your terminal can still be "absent" under cron.
 
 The Codex worker reaches the model only through a controller-side gateway, and
 that gateway needs the provider key. Supply it to the **controller** environment

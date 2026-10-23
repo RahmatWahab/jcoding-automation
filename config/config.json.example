@@ -47,6 +47,7 @@
     "model": "gpt-5.6-luna",
     "reasoning_effort": "medium",
     "approval_policy": "never",
+    "auth": "gateway",
     "dangerously_bypass_sandbox": false,
     "execution_timeout_seconds": 3600,
     "progress_interval_seconds": 30,

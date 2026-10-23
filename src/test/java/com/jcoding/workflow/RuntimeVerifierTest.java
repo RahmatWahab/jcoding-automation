@@ -2,6 +2,7 @@ package com.jcoding.workflow;
 
 import static org.assertj.core.api.Assertions.*;
 import java.nio.file.Path;
+import java.nio.file.Files;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
@@ -70,6 +71,34 @@ class RuntimeVerifierTest {
         Map<String,Object> st = state();
         assertThat(verifier.verify(root, git(new String[]{" M src/Fix.java\n"}), st, cfg, ()->{}, ()->{})).isFalse();
         assertThat(st.get("verification_failure")).isEqualTo("Check maps unknown criterion: AC-9");
+    }
+    @Test void loginTokenInAChangedFileBlocksDeliveryEvenWhenReEncoded() throws Exception {
+        Path login = root.resolve("auth.json");
+        String token = "access-token-value-0123456789abcdef";
+        Files.writeString(login, "{\"tokens\":{\"access_token\":\"" + token + "\"}}");
+        System.setProperty(CodexLogin.FILE_PROPERTY, login.toString());
+        try {
+            Map<String,Object> cfg = Map.of("codex", Map.of("auth", "codex_login"),
+                    "verification", Map.of("checks", List.of(Map.of("id", "unit", "command", List.of("test-command"),
+                            "criteria", List.of("*"))), "protected_paths", List.of()), "automation", Map.of());
+            RuntimeVerifier passing = new RuntimeVerifier((cmd,repo,seconds,hb) -> new BoundedProcess.Result(0,"pass",false));
+            Files.createDirectories(root.resolve("src"));
+
+            Files.writeString(root.resolve("src/Fix.java"), "class Fix { }");
+            assertThat(passing.verify(root, git(new String[]{" M src/Fix.java\n"}), state(), cfg, ()->{}, ()->{})).isTrue();
+
+            for (String leaked : List.of(token, java.util.Base64.getEncoder().encodeToString(token.getBytes()))) {
+                Files.writeString(root.resolve("src/Fix.java"), "String t = \"" + leaked + "\";");
+                Map<String,Object> st = state();
+                assertThat(passing.verify(root, git(new String[]{" M src/Fix.java\n"}), st, cfg, ()->{}, ()->{})).isFalse();
+                assertThat((String) st.get("verification_failure")).contains("Codex login token material found in src/Fix.java")
+                        .doesNotContain(token);
+            }
+
+            Map<String,Object> gatewayCfg = Map.of("verification", cfg.get("verification"), "automation", Map.of());
+            Map<String,Object> st = state();
+            assertThat(passing.verify(root, git(new String[]{" M src/Fix.java\n"}), st, gatewayCfg, ()->{}, ()->{})).isTrue();
+        } finally { System.clearProperty(CodexLogin.FILE_PROPERTY); }
     }
     @Test void automaticMergeCannotOptOutOfExecutableVerification() {
         Map<String,Object> config=Map.of("verification",Map.of("required",false),"workflow",Map.of("auto_merge",true));

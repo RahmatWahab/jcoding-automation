@@ -179,6 +179,8 @@ public final class Config {
 
         if (Boolean.TRUE.equals(codex.get("dangerously_bypass_sandbox"))) missing.add("codex.dangerously_bypass_sandbox(must be false)");
         if (!Set.of("native", "bubblewrap").contains(codex.getOrDefault("isolation", "native"))) missing.add("codex.isolation(native|bubblewrap)");
+        if (codex.containsKey("auth") && !Set.of("gateway", CodexLogin.MODE).contains(codex.get("auth"))) missing.add("codex.auth(gateway|codex_login)");
+        if (CodexLogin.enabled(codex) && !"bubblewrap".equals(codex.get("isolation"))) missing.add("codex.auth(codex_login requires codex.isolation bubblewrap)");
         if (codex.containsKey("approval_policy") && !"never".equals(codex.get("approval_policy"))) missing.add("codex.approval_policy(never)");
         for (String key : List.of("max_story_worker_calls", "max_story_active_seconds", "max_wait_diagnoses", "wait_timeout_seconds",
                 "max_preflight_diagnoses", "preflight_diagnosis_seconds", "max_delivery_recovery_attempts")) {
