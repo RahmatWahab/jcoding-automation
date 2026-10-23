@@ -112,15 +112,77 @@ fi
 [[ "$CANARY_STORY" =~ ^[0-9]+$ && "$CANARY_STORY" -gt 0 ]] || { err "Canary story must be a positive integer."; exit 1; }
 rule
 
-# 3. Verification + CI checks (repo-specific; cannot be defaulted safely).
-bold "Verification & CI gates (required for unattended execution)"
-TEST_CMD="$(ask "Executable test/verify command for $NAME" "./gradlew test")"
-AC_ID="$(ask "Acceptance-criterion ID this check covers" "AC-1")"
-echo "Enter the EXACT GitHub check-run name(s) that must be green before merge."
-echo "Tip: list them with  gh pr checks --repo $OWNER/$NAME <open-pr-number>"
-CI_CHECKS_RAW="$(ask "CI check name(s), comma-separated")"
+# 3. Verification + CI checks. Both are auto-detected from the repository; press
+# Enter to accept the detected value. They are still REQUIRED by the controller
+# (auto-merge without proof would merge unverified AI-written code), but you
+# should not have to hand-type them.
+bold "Verification & CI gates (auto-detected — press Enter to accept)"
+
+detect_test_command() { # echoes a space-separated command, or nothing
+  local d="$1"
+  [[ -d "$d" ]] || return 0
+  if   [[ -x "$d/gradlew" ]];                  then echo "./gradlew test"
+  elif [[ -f "$d/pom.xml" ]];                  then echo "mvn -B test"
+  elif [[ -f "$d/package.json" ]] && grep -q '"test"' "$d/package.json"; then echo "npm test"
+  elif [[ -f "$d/go.mod" ]];                   then echo "go test ./..."
+  elif [[ -f "$d/pyproject.toml" || -f "$d/pytest.ini" || -f "$d/setup.py" ]]; then echo "python3 -m pytest"
+  elif [[ -f "$d/Makefile" ]] && grep -qE '^test:' "$d/Makefile"; then echo "make test"
+  fi
+}
+
+detect_ci_checks() { # echoes comma-separated check-run names, or nothing
+  local names=""
+  # 1) Real check-run names from the base branch head (exact match to what the gate compares).
+  names="$(gh api "repos/$OWNER/$NAME/commits/$BASE_BRANCH/check-runs?per_page=100" \
+            --jq '[.check_runs[].name] | unique | join(",")' 2>/dev/null || true)"
+  # 2) Fallback: job names declared in workflow files (needs python3 + PyYAML).
+  if [[ -z "$names" && -d "$LOCAL_PATH/.github/workflows" ]] && command -v python3 >/dev/null 2>&1; then
+    names="$(python3 - "$LOCAL_PATH/.github/workflows" <<'PY' 2>/dev/null || true
+import sys, glob, os
+try:
+    import yaml
+except ImportError:
+    sys.exit(0)
+out = []
+for f in sorted(glob.glob(os.path.join(sys.argv[1], "*.y*ml"))):
+    try:
+        doc = yaml.safe_load(open(f)) or {}
+    except Exception:
+        continue
+    for job_id, job in (doc.get("jobs") or {}).items():
+        out.append(str((job or {}).get("name") or job_id))
+print(",".join(dict.fromkeys(out)))
+PY
+)"
+  fi
+  printf '%s' "$names"
+}
+
+DETECTED_CMD="$(detect_test_command "$LOCAL_PATH")"
+if [[ -n "$DETECTED_CMD" ]]; then
+  echo "Detected test command from $LOCAL_PATH: $DETECTED_CMD"
+else
+  warn "Could not detect a test command in $LOCAL_PATH (path missing or unknown build tool)."
+fi
+TEST_CMD="$(ask "Verification command" "${DETECTED_CMD:-./gradlew test}")"
+# The controller runs the command as an argv array in a sandbox with NO network:
+# build dependencies must already be cached locally (e.g. a prior ./gradlew test).
+TEST_CMD_JSON="$(printf '%s' "$TEST_CMD" | jq -R 'split(" ") | map(select(length>0))')"
+[[ "$TEST_CMD_JSON" != "[]" ]] || { err "Verification command cannot be empty."; exit 1; }
+# '*' = this check covers every acceptance criterion in the story it verifies,
+# so you never need to match per-story AC-N ids. The check must still pass.
+CRITERIA_JSON='["*"]'
+
+DETECTED_CI="$(detect_ci_checks)"
+if [[ -n "$DETECTED_CI" ]]; then
+  echo "Detected CI check(s) for $OWNER/$NAME: $DETECTED_CI"
+else
+  warn "No CI checks detected for $OWNER/$NAME on '$BASE_BRANCH' (no workflow runs, or gh not authenticated)."
+  warn "Unattended auto-merge needs at least one named CI check. If the repo has no CI yet,"
+  warn "add a GitHub Actions workflow that runs your tests first, then re-run this script."
+fi
+CI_CHECKS_RAW="$(ask "Required CI check name(s), comma-separated" "$DETECTED_CI")"
 [[ -n "$CI_CHECKS_RAW" ]] || { err "At least one CI check name is required for unattended rollout."; exit 1; }
-# Build a JSON array from the comma-separated list.
 CI_CHECKS_JSON="$(printf '%s' "$CI_CHECKS_RAW" | jq -R 'split(",") | map(gsub("^\\s+|\\s+$";"")) | map(select(length>0))')"
 rule
 
@@ -174,8 +236,8 @@ jq \
   --argjson internal_review "$INTERNAL_REVIEW" \
   --argjson auto_merge "$INIT_AUTOMERGE" \
   --argjson ci_checks "$CI_CHECKS_JSON" \
-  --arg test_cmd "$TEST_CMD" \
-  --arg ac_id "$AC_ID" \
+  --argjson test_cmd "$TEST_CMD_JSON" \
+  --argjson criteria "$CRITERIA_JSON" \
   --arg approval "$APPROVAL_POLICY" \
   --argjson bypass "$BYPASS_SANDBOX" \
   '
@@ -201,7 +263,7 @@ jq \
   | .deployment.mode = $mode
   | .deployment.canary_story = $canary_story
   | .verification.required = true
-  | .verification.checks = [ { "id": "unit", "command": $test_cmd, "criteria": [ $ac_id ] } ]
+  | .verification.checks = [ { "id": "unit", "command": $test_cmd, "criteria": $criteria } ]
   ' "$CONFIG" > "$TMP"
 mv "$TMP" "$CONFIG"
 
@@ -209,7 +271,7 @@ bold "Wrote $CONFIG"
 echo "  repo          : $OWNER/$NAME ($LOCAL_PATH)"
 echo "  epic          : #$EPIC"
 echo "  canary story  : #$CANARY_STORY"
-echo "  verify command: $TEST_CMD  (criteria: $AC_ID)"
+echo "  verify command: $TEST_CMD  (covers all story criteria)"
 echo "  CI checks     : $CI_CHECKS_RAW"
 echo "  goal          : $GOAL  (starting in canary to earn the receipt)"
 echo "  dry_run       : $DRY_RUN"

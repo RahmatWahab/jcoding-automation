@@ -130,8 +130,8 @@ It asks for:
 | Goal: `canary` or `autonomous` | See below |
 | EPIC number | The EPIC the controller drives |
 | Canary story number | One story under the EPIC, used for the one-time canary |
-| Verification command and acceptance-criterion ID | e.g. `./gradlew test` / `AC-1` |
-| Required CI check name(s) | Exact GitHub check-run names, comma-separated (`gh pr checks --repo <owner>/<name> <pr>` lists them) |
+| Verification command | Auto-detected from the checkout (Gradle, Maven, npm, Go, pytest, `make test`); press Enter to accept. Runs in a sandbox with **no network**, so dependencies must already be cached locally |
+| Required CI check name(s) | Auto-detected from the base branch's real GitHub check runs (fallback: job names in `.github/workflows`); press Enter to accept. If the repo has no CI, add a workflow first — unattended auto-merge needs at least one named check |
 | Workflow flags (true/false) | push, PR creation, comments, thread resolution, internal review, dry-run |
 | Safety settings | `codex.approval_policy` and `codex.dangerously_bypass_sandbox` |
 
@@ -159,8 +159,10 @@ Things to know:
 - **Before the canary story runs**, set `config/job-control.json` to
   `{ "job_start": true }` and provide `GH_TOKEN` and `OPENAI_API_KEY` (see
   below).
-- The verification command and CI check names are specific to your repository;
-  the defaults are only suggestions.
+- The wizard writes the check's `criteria` as `["*"]`, meaning "this check covers
+  every acceptance criterion in the story being verified". The check must still
+  run and exit 0. List explicit IDs (`["AC-1","AC-2"]`) instead if you want
+  per-criterion checks; an ID the story does not define fails verification.
 
 ## Configure
 

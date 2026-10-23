@@ -49,6 +49,28 @@ class RuntimeVerifierTest {
         assertThat(verifier.verify(root,git(diff),state,config(),()->{},()->{})).isFalse();
         assertThat(state.get("verification_failure")).isEqualTo("Path outside authorized scope: verification/oracle.sh");
     }
+    @Test void wildcardCriteriaCoversEveryStoryCriterionButStillRequiresPassingCheck() {
+        Map<String,Object> cfg = Map.of("verification", Map.of("checks", List.of(Map.of("id", "unit",
+                "command", List.of("test-command"), "criteria", List.of("*"))), "protected_paths", List.of()), "automation", Map.of());
+        Map<String,Object> multi = new LinkedHashMap<>(Map.of("current_story", 42, "base_commit", "base", "goal_contract",
+                Map.of("requirements_hash", "req", "criteria", List.of(Map.of("id", "AC-1"), Map.of("id", "AC-2"), Map.of("id", "AC-3")))));
+        RuntimeVerifier passing = new RuntimeVerifier((cmd,repo,seconds,hb) -> new BoundedProcess.Result(0,"pass",false));
+        assertThat(passing.verify(root, git(new String[]{" M src/Fix.java\n"}), multi, cfg, ()->{}, ()->{})).isTrue();
+        assertThat(new TreeSet<Object>(((Map<?,?>) multi.get("criterion_evidence")).keySet())).containsExactly("AC-1", "AC-2", "AC-3");
+        Map<String,Object> failed = new LinkedHashMap<>(Map.of("current_story", 42, "base_commit", "base", "goal_contract",
+                Map.of("requirements_hash", "req", "criteria", List.of(Map.of("id", "AC-1"), Map.of("id", "AC-2")))));
+        RuntimeVerifier failing = new RuntimeVerifier((cmd,repo,seconds,hb) -> new BoundedProcess.Result(1,"boom",false));
+        assertThat(failing.verify(root, git(new String[]{" M src/Fix.java\n"}), failed, cfg, ()->{}, ()->{})).isFalse();
+        assertThat(failed).doesNotContainKey("validation_checkpoint");
+    }
+    @Test void explicitCriterionStillMustExistInStory() {
+        Map<String,Object> cfg = Map.of("verification", Map.of("checks", List.of(Map.of("id", "unit",
+                "command", List.of("test-command"), "criteria", List.of("AC-9"))), "protected_paths", List.of()), "automation", Map.of());
+        RuntimeVerifier verifier = new RuntimeVerifier((cmd,repo,seconds,hb) -> new BoundedProcess.Result(0,"pass",false));
+        Map<String,Object> st = state();
+        assertThat(verifier.verify(root, git(new String[]{" M src/Fix.java\n"}), st, cfg, ()->{}, ()->{})).isFalse();
+        assertThat(st.get("verification_failure")).isEqualTo("Check maps unknown criterion: AC-9");
+    }
     @Test void automaticMergeCannotOptOutOfExecutableVerification() {
         Map<String,Object> config=Map.of("verification",Map.of("required",false),"workflow",Map.of("auto_merge",true));
         RuntimeVerifier verifier=new RuntimeVerifier((c,r,t,h)->{throw new AssertionError();});

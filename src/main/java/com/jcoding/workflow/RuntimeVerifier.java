@@ -25,6 +25,20 @@ final class RuntimeVerifier {
         });
     }
 
+    /**
+     * Criterion IDs a check covers. The wildcard {@code "*"} means "every criterion in the
+     * current story contract", so one suite-level check need not be edited per story. The
+     * check must still execute and exit 0 for any criterion to be marked VERIFIED.
+     */
+    private static List<String> mappedCriteria(Map<?, ?> check, Set<String> requiredCriteria) {
+        List<String> declared = Engine.asList(check.get("criteria")).stream().map(String::valueOf).toList();
+        if (!declared.contains("*")) return declared;
+        List<String> expanded = new ArrayList<>(requiredCriteria);
+        java.util.Collections.sort(expanded);
+        for (String id : declared) if (!"*".equals(id) && !expanded.contains(id)) expanded.add(id);
+        return expanded;
+    }
+
     static boolean required(Map<String, Object> config) {
         return Boolean.TRUE.equals(Config.section(config, "workflow").get("auto_merge"))
                 || !Boolean.FALSE.equals(Config.section(config, "verification").get("required"));
@@ -85,8 +99,8 @@ final class RuntimeVerifier {
                         "output", output.substring(Math.max(0, output.length() - 12000)), "at", Controller.now()));
                 state.put("verification_evidence", evidence);
                 boolean passed = result.exitCode() == 0 && !result.truncated();
-                for (Object criterion : Engine.asList(check.get("criteria"))) {
-                    String criterionId = String.valueOf(criterion);
+                List<String> mapped = mappedCriteria(check, requiredCriteria);
+                for (String criterionId : mapped) {
                     if (!requiredCriteria.contains(criterionId)) return fail(state, "Check maps unknown criterion: " + criterionId);
                     criterionEvidence.put(criterionId, Map.of("status", passed ? "VERIFIED" : "FAILED",
                             "identity", identity, "source", snapshot, "requirements_hash", requirements,
@@ -95,7 +109,7 @@ final class RuntimeVerifier {
                 }
                 persist.run();
                 if (!passed) return fail(state, "Verification failed: " + id);
-                for (Object criterion : Engine.asList(check.get("criteria"))) covered.add(String.valueOf(criterion));
+                covered.addAll(mapped);
             }
             if (!covered.containsAll(requiredCriteria) || !criteriaPassed(state, identity))
                 return fail(state, "Executable checks do not cover every acceptance criterion");
