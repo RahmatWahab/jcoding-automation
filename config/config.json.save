@@ -1,0 +1,172 @@
+{
+  "repository": {
+    "local_path": "/local/cquant_platform",
+    "owner": "RahmatWahab",
+    "name": "cquant_platform",
+    "base_branch": "main"
+  },
+  "epic": {
+    "number": 27
+  },
+  "github": {
+    "token_environment_variable": "GH_TOKEN",
+    "host": "github.com",
+    "cli": "gh",
+    "timeout_seconds": 30
+  },
+  "automation": {
+    "dry_run": false,
+    "stale_lock_seconds": 900,
+    "quota_retry_seconds": 1800,
+    "watchdog_observations": 3,
+    "watchdog_grace_seconds": 10,
+    "delivery_verification_attempts": 5,
+    "delivery_verification_delay_seconds": 2,
+    "max_delivery_recovery_attempts": 4,
+    "max_preflight_diagnoses": 2,
+    "preflight_diagnosis_seconds": 120,
+    "max_story_worker_calls": 24,
+    "max_task_attempts": 3,
+    "max_plan_revisions": 2,
+    "max_story_active_seconds": 7200,
+    "max_story_tokens": 0,
+    "recovery_epoch": 0,
+    "max_feedback_attempts": 3,
+    "max_feedback_batch_size": 3,
+    "max_resume_attempts": 3,
+    "resume_loop_multiplier": 4,
+    "internal_review_max_fix_attempts": 2,
+    "wait_poll_seconds": 0,
+    "max_phase_attempts": 5,
+    "enable_planning": true,
+    "wait_timeout_seconds": 3600,
+    "max_wait_diagnoses": 2
+  },
+  "codex": {
+    "executable": "codex",
+    "model": "gpt-5.6-luna",
+    "reasoning_effort": "medium",
+    "approval_policy": "true",
+    "dangerously_bypass_sandbox": true,
+    "execution_timeout_seconds": 3600,
+    "progress_interval_seconds": 30,
+    "phase_overrides": {
+      "IDLE": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "medium"
+      },
+      "PLANNING": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "medium"
+      },
+      "IMPLEMENTING": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "medium"
+      },
+      "VERIFYING": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "medium"
+      },
+      "REVIEWING_CODE": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "medium"
+      },
+      "FIXING_FEEDBACK": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "medium"
+      },
+      "CHANGES_REQUESTED": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "medium"
+      },
+      "READY_TO_MERGE": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "medium"
+      },
+      "RECONCILING": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "medium"
+      },
+      "BLOCKED_REQUIREMENTS": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "medium"
+      },
+      "BLOCKED_REPOSITORY": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "medium"
+      },
+      "FAILED_RECOVERABLE": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "medium"
+      },
+      "CODEX_FAILURE": {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "medium"
+      }
+    },
+    "isolation": "bubblewrap",
+    "resource_limits": {
+      "address_space_bytes": 8589934592,
+      "cpu_seconds": 14400,
+      "file_size_bytes": 2147483648
+    },
+    "runtime_read_paths": [],
+    "gateway": {
+      "base_url": "https://api.openai.com/v1",
+      "allowed_hosts": ["api.openai.com"],
+      "credential_environment_variable": "OPENAI_API_KEY",
+      "max_requests": 200,
+      "max_output_tokens": 16384
+    }
+  },
+  "budgets": {
+    "implementing": 1800,
+    "verifying": 1800,
+    "reviewing_code": 1200,
+    "fixing_feedback": 1200,
+    "reconciling": 600,
+    "planning": 600
+  },
+  "workflow": {
+    "allow_push": true,
+    "allow_pr_creation": true,
+    "allow_comments": true,
+    "allow_thread_resolution": true,
+    "auto_merge": true,
+    "merge_method": "squash",
+    "terminal_policy": "park_and_advance",
+    "internal_review": true,
+    "required_checks": [],
+    "allow_no_checks": 
+  },
+  "intent": {
+    "require_acceptance_criteria": true
+  },
+  "deployment": {
+    "mode": "development",
+    "canary_valid_hours": 168,
+    "provider_canary_valid_hours": 24
+  },
+  "local_delivery": {
+    "mode": "artifact",
+    "cleanup_verified_worktree": false
+  },
+  "verification": {
+    "required": true,
+    "checks": [],
+    "allowed_paths": [
+      "**"
+    ],
+    "protected_paths": [
+      ".github/**",
+      "verification/**",
+      "src/test/**",
+      "tests/**",
+      "build.gradle",
+      "settings.gradle",
+      "gradlew"
+    ],
+    "max_changed_files": 100,
+    "runtime_read_paths": []
+  }
+}
