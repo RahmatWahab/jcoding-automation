@@ -48,15 +48,28 @@ final class HostReadiness {
         return false;
     }
 
+    /**
+     * Probe command mirroring the real sandbox's system mounts. Binding only /usr is not enough
+     * on merged-/usr distros (Ubuntu, Debian 12+): the dynamic loader lives at /lib64/..., so
+     * python3 would fail to exec with a misleading "No such file or directory".
+     */
+    static List<String> privateNetworkProbeCommand(java.util.function.Predicate<String> exists) {
+        List<String> command = new ArrayList<>(List.of("bwrap", "--die-with-parent", "--unshare-all"));
+        for (String path : List.of("/usr", "/bin", "/sbin", "/lib", "/lib64")) {
+            if (exists.test(path)) command.addAll(List.of("--ro-bind", path, path));
+        }
+        command.addAll(List.of("--dev", "/dev", "--proc", "/proc", "--",
+                "/usr/bin/python3", "-c", "import socket; s=socket.socket(); "
+                        + "s.bind(('127.0.0.1',0)); s.listen(1); c=socket.socket(); "
+                        + "c.connect(s.getsockname()); c.close(); s.close()"));
+        return command;
+    }
+
     private static boolean privateNetworkWorks() {
         // Probe the exact capability the sandbox bridge needs without contacting a network service.
         Process process = null;
         try {
-            process = new ProcessBuilder("bwrap", "--die-with-parent", "--unshare-all",
-                    "--ro-bind", "/usr", "/usr", "--dev", "/dev", "--proc", "/proc", "--",
-                    "/usr/bin/python3", "-c", "import socket; s=socket.socket(); "
-                            + "s.bind(('127.0.0.1',0)); s.listen(1); c=socket.socket(); "
-                            + "c.connect(s.getsockname()); c.close(); s.close()")
+            process = new ProcessBuilder(privateNetworkProbeCommand(path -> Files.exists(Path.of(path))))
                     .redirectError(ProcessBuilder.Redirect.DISCARD)
                     .redirectOutput(ProcessBuilder.Redirect.DISCARD).start();
             if (!process.waitFor(5, TimeUnit.SECONDS)) {

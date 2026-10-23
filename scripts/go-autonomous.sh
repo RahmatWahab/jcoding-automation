@@ -293,8 +293,14 @@ rule
 SYSCTL_ROOT="${JCODING_SYSCTL_ROOT:-/proc/sys}"
 APPARMOR_DIR="${JCODING_APPARMOR_DIR:-/etc/apparmor.d}"
 
-bwrap_probe() { # mirrors HostReadiness.privateNetworkWorks(); prints bwrap's own error
-  timeout 10 bwrap --die-with-parent --unshare-all --ro-bind /usr /usr --dev /dev --proc /proc -- \
+bwrap_probe() { # mirrors HostReadiness.privateNetworkProbeCommand(); prints bwrap's own error
+  # Bind the same system paths as the real sandbox. Binding only /usr fails on merged-/usr
+  # hosts (Ubuntu/Debian): the dynamic loader is /lib64/ld-linux-*, so python3 cannot exec.
+  local mounts=() p
+  for p in /usr /bin /sbin /lib /lib64; do
+    [[ -e "$p" ]] && mounts+=(--ro-bind "$p" "$p")
+  done
+  timeout 10 bwrap --die-with-parent --unshare-all "${mounts[@]}" --dev /dev --proc /proc -- \
     /usr/bin/python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(1); c=socket.socket(); c.connect(s.getsockname()); c.close(); s.close()" 2>&1
 }
 
