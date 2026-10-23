@@ -285,10 +285,94 @@ echo "  dry_run       : $DRY_RUN"
 rule
 
 # ---------------------------------------------------------------------------
+# Host preflight: the worker sandbox (bubblewrap with a private network
+# namespace and working loopback). On Ubuntu 23.10+/24.04 AppArmor strips the
+# capabilities of unprivileged user namespaces, which makes bwrap fail with
+# "loopback: Failed RTM_NEWADDR". The narrow fix is an AppArmor profile that
+# lets only /usr/bin/bwrap use user namespaces. It needs root, so we ask first.
+SYSCTL_ROOT="${JCODING_SYSCTL_ROOT:-/proc/sys}"
+APPARMOR_DIR="${JCODING_APPARMOR_DIR:-/etc/apparmor.d}"
+
+bwrap_probe() { # mirrors HostReadiness.privateNetworkWorks(); prints bwrap's own error
+  timeout 10 bwrap --die-with-parent --unshare-all --ro-bind /usr /usr --dev /dev --proc /proc -- \
+    /usr/bin/python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(1); c=socket.socket(); c.connect(s.getsockname()); c.close(); s.close()" 2>&1
+}
+
+ensure_sandbox_ready() {
+  bold "Host check: worker sandbox (bubblewrap)"
+  if ! command -v bwrap >/dev/null 2>&1; then
+    err "bwrap is not installed. Install it with:  sudo apt-get install -y bubblewrap"
+    return 1
+  fi
+  local out
+  if out="$(bwrap_probe)"; then
+    echo "Sandbox OK (private network namespace with working loopback)."
+    return 0
+  fi
+  warn "Sandbox probe failed: ${out:-no output}"
+
+  local restrict
+  restrict="$(cat "$SYSCTL_ROOT/kernel/apparmor_restrict_unprivileged_userns" 2>/dev/null || echo 0)"
+  if [[ "$restrict" != "1" ]] || ! grep -qiE 'RTM_NEWADDR|No permissions|Operation not permitted|Permission denied' <<<"$out" \
+      || ! command -v apparmor_parser >/dev/null 2>&1; then
+    err "This is not the known Ubuntu AppArmor restriction, so it cannot be fixed automatically."
+    err "Check: user.max_user_namespaces, kernel.unprivileged_userns_clone, and whether the VPS allows namespaces."
+    return 1
+  fi
+
+  echo "Cause: kernel.apparmor_restrict_unprivileged_userns=1 (Ubuntu) removes the capabilities bwrap needs."
+  echo "Fix  : install an AppArmor profile that lets ONLY /usr/bin/bwrap use user namespaces:"
+  echo "         $APPARMOR_DIR/bwrap   (then: apparmor_parser -r)"
+  echo "       Other programs stay restricted. Requires root (sudo)."
+  local profile="$APPARMOR_DIR/bwrap"
+  if [[ -e "$profile" ]]; then
+    err "$profile already exists; not overwriting it. Review it, make sure it has a 'userns,' rule, then re-run."
+    return 1
+  fi
+  local sudo_cmd="${JCODING_SUDO-sudo}"
+  [[ "$EUID" -eq 0 ]] && sudo_cmd=""
+  if [[ -n "$sudo_cmd" ]] && ! command -v "$sudo_cmd" >/dev/null 2>&1; then
+    err "sudo is not available. Run the two steps above as root, then re-run this script."
+    return 1
+  fi
+  if [[ "$(ask_bool "Install this AppArmor profile now?" false)" != true ]]; then
+    err "Not applied. The worker sandbox will not start until this is fixed."
+    return 1
+  fi
+
+  local tmp; tmp="$(mktemp)"
+  cat > "$tmp" <<'EOF'
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+
+  include if exists <local/bwrap>
+}
+EOF
+  # shellcheck disable=SC2086
+  if ! $sudo_cmd install -m 0644 "$tmp" "$profile" || ! $sudo_cmd apparmor_parser -r "$profile"; then
+    rm -f "$tmp"; err "Could not install/load the profile."; return 1
+  fi
+  rm -f "$tmp"
+  echo "Installed $profile. Re-checking the sandbox..."
+  if out="$(bwrap_probe)"; then
+    echo "Sandbox OK."
+    return 0
+  fi
+  err "Sandbox still failing: ${out:-no output}"
+  return 1
+}
+
+# ---------------------------------------------------------------------------
 # Guided rollout sequence.
 bold "Next: the controller-enforced rollout sequence"
 echo "This script will now check readiness. Each later step is OPT-IN so you"
 echo "stay in control; nothing merges during the canary."
+rule
+
+ensure_sandbox_ready || { err "Fix the sandbox issue above, then re-run this script."; exit 1; }
 rule
 
 echo "Step 1/4 — readiness check (read-only)"
